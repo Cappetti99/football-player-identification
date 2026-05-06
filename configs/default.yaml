@@ -1,0 +1,94 @@
+model_path: ../models/best_yolo26x_gsr_light.pt
+video_path: ../input_videos/08fd33_4.mp4
+output_path: output_videos/ft_output.mp4
+artifacts_dir: artifacts/ft_run
+roster_path: configs/roster.example.json
+max_frames: 300
+
+detection:
+  confidence: 0.05
+  ball_confidence: 0.002
+  ball_max_area_ratio: 0.0015
+  ball_size_penalty: 0.5
+
+tracking:
+  track_activation_threshold: 0.10
+  lost_track_buffer: 150
+  minimum_matching_threshold: 0.95
+  frame_rate: 25
+  minimum_consecutive_frames: 2
+
+linking:
+  enabled: true
+  max_gap: 90
+  max_distance: 160.0
+  min_frames: 4
+
+calibration:
+  enabled: true
+  path: null
+  auto: true
+  auto_frame: 50
+  auto_recalibrate_every: 0
+  pitch_length: 105.0
+  pitch_width: 68.0
+
+team:
+  enabled: true
+  max_seed_frames: 12
+  min_seed_colors: 8
+  min_cluster_separation: 30.0
+  min_classification_margin: 12.0
+  min_tracklet_colors: 3
+
+referee:
+  enabled: true
+  min_color_fraction: 0.22
+  min_tracklet_frames: 2
+  reclassify_player_candidates: true
+  player_candidate_min_color_fraction: 0.42
+  player_candidate_max_team_confidence: 0.50
+  require_palette_color: true
+
+jersey_ocr:
+  enabled: true
+  backend: easyocr
+  min_confidence: 0.25
+  max_crops_per_tracklet: 20
+  temporal_passes: 3
+  augment: true
+  min_crop_quality: 0.08
+  min_votes: 2
+  min_raw_confidence: 0.05
+  min_winner_margin: 0.15
+  easyocr_gpu: true
+  roster_aware: true
+  roster_filter_mode: degrade
+  roster_unknown_team_policy: keep
+  roster_degrade_confidence_scale: 0.60
+  promote_roster_candidate: true
+  min_promoted_candidate_confidence: 0.12
+  min_promoted_candidate_votes: 1
+  debug_crops: true
+
+identity:
+  unknown_threshold: 0.55
+  candidate_top_k: 8
+  enforce_unique_team_jersey: true
+  reliable_jersey_min_votes: 2
+  reliable_jersey_min_confidence: 0.5
+  goalkeeper_number_one_prior: true
+  number_one_goalkeeper_bonus: 0.08
+  number_one_non_goalkeeper_penalty: 0.08
+
+wandb:
+  enabled: false
+  project: football-tracking
+  entity: null
+  name: null
+  tags: []
+  notes: null
+  log_artifacts: true
+  log_video: false
+  alert_on_finish: true
+  alert_on_failure: true

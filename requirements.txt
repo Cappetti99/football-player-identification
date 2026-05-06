@@ -1,0 +1,9 @@
+numpy
+opencv-python
+pandas
+pyyaml
+scikit-learn
+scipy
+supervision
+ultralytics
+wandb

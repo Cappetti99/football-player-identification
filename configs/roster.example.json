@@ -1,0 +1,35 @@
+[
+  {
+    "player_id": "team1_07",
+    "name": "Team 1 Player 7",
+    "team_id": 1,
+    "jersey_number": 7,
+    "role": "player",
+    "position_prior": [35.0, 20.0]
+  },
+  {
+    "player_id": "team1_09",
+    "name": "Team 1 Player 9",
+    "team_id": 1,
+    "jersey_number": 9,
+    "role": "player",
+    "position_prior": [55.0, 34.0]
+  },
+  {
+    "player_id": "team2_07",
+    "name": "Team 2 Player 7",
+    "team_id": 2,
+    "jersey_number": 7,
+    "role": "player",
+    "position_prior": [70.0, 48.0]
+  },
+  {
+    "player_id": "team2_10",
+    "name": "Team 2 Player 10",
+    "team_id": 2,
+    "jersey_number": 10,
+    "role": "player",
+    "position_prior": [50.0, 34.0]
+  }
+]
+

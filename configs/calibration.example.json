@@ -1,0 +1,12 @@
+{
+  "description": "Manual homography calibration. Pixel points map to pitch meters.",
+  "pitch_length": 105.0,
+  "pitch_width": 68.0,
+  "point_correspondences": [
+    {"pixel": [320, 710], "pitch": [0.0, 0.0]},
+    {"pixel": [890, 640], "pitch": [16.5, 0.0]},
+    {"pixel": [1200, 520], "pitch": [16.5, 40.32]},
+    {"pixel": [520, 470], "pitch": [0.0, 40.32]}
+  ]
+}
+

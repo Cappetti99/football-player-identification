@@ -1,0 +1,26 @@
+[project]
+name = "ft"
+version = "0.1.0"
+description = "Modular football tracking and player identification pipeline"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "pandas",
+  "pyyaml",
+  "scikit-learn",
+  "scipy",
+  "supervision",
+  "ultralytics",
+]
+
+[project.optional-dependencies]
+ocr = ["easyocr", "pytesseract"]
+
+[project.scripts]
+ft = "ft.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
