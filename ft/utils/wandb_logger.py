@@ -28,8 +28,9 @@ class WandbLogger:
             tags=wandb_cfg.get("tags") or [],
             notes=wandb_cfg.get("notes") or None,
             config=safe_config(config),
+            settings=wandb.Settings(init_timeout=int(wandb_cfg.get("init_timeout", 180))),
         )
-        print(f"FT wandb: run={run.name} url={getattr(run, 'url', None)}")
+        print(f"FT wandb: run={run.name} url={getattr(run, 'url', None)}", flush=True)
         return cls(run=run, enabled=True, config=wandb_cfg, video_id=video_id)
 
     def log(self, payload):

@@ -10,8 +10,17 @@ REFEREE_COLOR_RANGES = {
     "yellow": [
         {"h_min": 22, "h_max": 38, "s_min": 70, "v_min": 120},
     ],
+    "fluorescent_yellow": [
+        {"h_min": 20, "h_max": 42, "s_min": 55, "v_min": 135},
+    ],
+    "orange": [
+        {"h_min": 6, "h_max": 24, "s_min": 70, "v_min": 105},
+    ],
     "light_blue": [
         {"h_min": 88, "h_max": 112, "s_min": 35, "v_min": 105},
+    ],
+    "blue": [
+        {"h_min": 100, "h_max": 128, "s_min": 45, "v_min": 65},
     ],
     "red": [
         {"h_min": 0, "h_max": 10, "s_min": 70, "v_min": 70},
@@ -36,6 +45,9 @@ class RefereeAppearanceAssigner:
         player_candidate_min_color_fraction=0.42,
         player_candidate_max_team_confidence=0.50,
         require_palette_color=True,
+        color_ranges=None,
+        trusted_color_min_fraction=0.50,
+        trusted_color_override_team_confidence=True,
     ):
         self.min_color_fraction = float(min_color_fraction)
         self.min_tracklet_frames = int(min_tracklet_frames)
@@ -43,9 +55,15 @@ class RefereeAppearanceAssigner:
         self.player_candidate_min_color_fraction = float(player_candidate_min_color_fraction)
         self.player_candidate_max_team_confidence = float(player_candidate_max_team_confidence)
         self.require_palette_color = bool(require_palette_color)
+        self.color_ranges = normalize_color_ranges(color_ranges) or REFEREE_COLOR_RANGES
+        self.trusted_color_ranges = bool(color_ranges)
+        self.trusted_color_min_fraction = float(trusted_color_min_fraction)
+        self.trusted_color_override_team_confidence = bool(trusted_color_override_team_confidence)
 
     def apply(self, frames, tracks):
         diagnostics = {
+            "color_ranges": sorted(self.color_ranges),
+            "trusted_color_ranges": self.trusted_color_ranges,
             "referees": self._apply_group(frames, tracks.get("referees", []), mark_referee=True),
             "players": self._apply_group(frames, tracks.get("players", []), mark_referee=False),
         }
@@ -57,7 +75,7 @@ class RefereeAppearanceAssigner:
             frame = frames[frame_num]
             for raw_id, track in frame_items.items():
                 display_id = int(track.get("display_track_id", raw_id))
-                sample = classify_referee_palette(frame, track["bbox"])
+                sample = classify_referee_palette(frame, track["bbox"], self.color_ranges)
                 track["referee_color_evidence"] = sample
                 track["referee_like_score"] = sample["score"]
                 track["referee_like_color"] = sample["color"]
@@ -95,18 +113,25 @@ class RefereeAppearanceAssigner:
         score = float(summary.get("score", 0.0))
         if score < self.player_candidate_min_color_fraction:
             return False
-        if self.require_palette_color and summary.get("color") not in REFEREE_COLOR_RANGES:
+        if self.require_palette_color and summary.get("color") not in self.color_ranges:
             return False
         if int(summary.get("num_samples", 0)) < self.min_tracklet_frames:
             return False
         team_confidence = float(track.get("team_confidence", 0.0) or 0.0)
         team_unknown = track.get("team") in (None, 0)
-        return team_unknown or team_confidence <= self.player_candidate_max_team_confidence
+        if team_unknown or team_confidence <= self.player_candidate_max_team_confidence:
+            return True
+        return (
+            self.trusted_color_ranges
+            and self.trusted_color_override_team_confidence
+            and score >= self.trusted_color_min_fraction
+        )
 
 
-def classify_referee_palette(frame, bbox):
+def classify_referee_palette(frame, bbox, color_ranges=None):
     import cv2
 
+    color_ranges = normalize_color_ranges(color_ranges) or REFEREE_COLOR_RANGES
     x1, y1, x2, y2 = [int(round(v)) for v in bbox]
     h, w = frame.shape[:2]
     x1 = max(0, min(w - 1, x1))
@@ -125,7 +150,7 @@ def classify_referee_palette(frame, bbox):
 
     scores = {
         name: palette_fraction(upper_hsv, ranges)
-        for name, ranges in REFEREE_COLOR_RANGES.items()
+        for name, ranges in color_ranges.items()
     }
     color, score = max(scores.items(), key=lambda item: item[1]) if scores else (None, 0.0)
     shorts_black_score = palette_fraction(lower_hsv, REFEREE_COLOR_RANGES["black"])
@@ -160,6 +185,87 @@ def palette_fraction(hsv, ranges):
             current &= v <= int(rule["v_max"])
         mask |= current
     return float(mask.mean()) if mask.size else 0.0
+
+
+def referee_color_ranges_from_roster(roster):
+    ranges = {}
+    for player in roster or []:
+        role = str(player.get("role") or "").lower()
+        metadata = player.get("metadata", {}) or {}
+        color = (
+            metadata.get("referee_color")
+            or metadata.get("kit_color")
+            or metadata.get("uniform_color")
+            or metadata.get("shirt_color")
+            or metadata.get("color")
+        )
+        if role not in {"referee", "official", "match_official", "referee_candidate"} and color is None:
+            continue
+        if role not in {"referee", "official", "match_official", "referee_candidate"}:
+            continue
+        if color is None:
+            continue
+        name = f"roster_{str(color).strip().lower().replace('#', '').replace(' ', '_')}"
+        ranges.update(color_to_ranges(color, name=name))
+    return ranges
+
+
+def normalize_color_ranges(color_ranges):
+    if not color_ranges:
+        return {}
+    normalized = {}
+    for name, ranges in color_ranges.items():
+        if isinstance(ranges, str):
+            normalized.update(color_to_ranges(ranges, name=name))
+        else:
+            normalized[str(name)] = list(ranges)
+    return normalized
+
+
+def color_to_ranges(color, name=None, h_tolerance=12, s_min=45, v_min=95):
+    if color is None:
+        return {}
+    if isinstance(color, str):
+        value = color.strip().lower()
+        if value in REFEREE_COLOR_RANGES:
+            return {name or value: REFEREE_COLOR_RANGES[value]}
+        rgb = parse_hex_color(value)
+    elif isinstance(color, (list, tuple)) and len(color) == 3:
+        rgb = tuple(int(v) for v in color)
+    else:
+        return {}
+    if rgb is None:
+        return {}
+
+    import cv2
+
+    r, g, b = rgb
+    hsv = cv2.cvtColor(np.asarray([[[b, g, r]]], dtype=np.uint8), cv2.COLOR_BGR2HSV)[0, 0]
+    hue = int(hsv[0])
+    h_min = hue - int(h_tolerance)
+    h_max = hue + int(h_tolerance)
+    rules = []
+    if h_min < 0:
+        rules.append({"h_min": 0, "h_max": h_max, "s_min": s_min, "v_min": v_min})
+        rules.append({"h_min": 180 + h_min, "h_max": 179, "s_min": s_min, "v_min": v_min})
+    elif h_max > 179:
+        rules.append({"h_min": h_min, "h_max": 179, "s_min": s_min, "v_min": v_min})
+        rules.append({"h_min": 0, "h_max": h_max - 180, "s_min": s_min, "v_min": v_min})
+    else:
+        rules.append({"h_min": h_min, "h_max": h_max, "s_min": s_min, "v_min": v_min})
+    return {name or "custom": rules}
+
+
+def parse_hex_color(value):
+    text = str(value).strip().lower()
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) != 6:
+        return None
+    try:
+        return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
+    except ValueError:
+        return None
 
 
 def summarize_samples(samples):

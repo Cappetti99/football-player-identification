@@ -13,6 +13,10 @@ def load_roster(roster_path):
     roster = []
     for row in payload:
         jersey_number = normalize_jersey_number(row.get("jersey_number"))
+        metadata = dict(row.get("metadata", {}) or {})
+        for key in ("kit_color", "uniform_color", "shirt_color", "referee_color", "color"):
+            if key in row and key not in metadata:
+                metadata[key] = row[key]
         roster.append(
             {
                 "player_id": str(row["player_id"]),
@@ -22,7 +26,7 @@ def load_roster(roster_path):
                 "role": row.get("role"),
                 "position_prior": normalize_point(row.get("position_prior")),
                 "visual_embedding": row.get("visual_embedding") or row.get("visual_profile"),
-                "metadata": row.get("metadata", {}),
+                "metadata": metadata,
             }
         )
     return roster
@@ -73,6 +77,20 @@ def roster_numbers_by_team(roster):
     for player in roster:
         team_id = player.get("team_id")
         jersey = player.get("jersey_number")
+        if team_id is None or jersey is None:
+            continue
+        numbers.setdefault(int(team_id), set()).add(int(jersey))
+    return numbers
+
+
+def goalkeeper_numbers_by_team(roster):
+    numbers = {}
+    for player in roster:
+        role = str(player.get("role") or "").lower()
+        team_id = player.get("team_id")
+        jersey = player.get("jersey_number")
+        if role not in {"goalkeeper", "keeper", "gk"}:
+            continue
         if team_id is None or jersey is None:
             continue
         numbers.setdefault(int(team_id), set()).add(int(jersey))

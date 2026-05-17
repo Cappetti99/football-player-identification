@@ -4,15 +4,18 @@ from ft.calibration.pitch_transform import PitchTransform
 from ft.config import load_config
 from ft.export.artifacts import ArtifactExporter, write_json, write_table
 from ft.features.groups import SemanticGroupAssigner
+from ft.features.goalkeeper import GoalkeeperAppearanceAssigner, goalkeeper_color_ranges_by_team_from_roster
 from ft.features.jersey_ocr import JerseyOCR
-from ft.features.referee import RefereeAppearanceAssigner
+from ft.features.referee import RefereeAppearanceAssigner, referee_color_ranges_from_roster
 from ft.features.roster_aware_ocr import RosterAwareOCRFilter
 from ft.features.team import TeamAssigner
 from ft.features.visual import VisualFeatureExtractor
+from ft.identity.constraints import enforce_identity_constraints
 from ft.identity.hungarian import HungarianPlayerIdentifier, apply_assignments
 from ft.identity.roster import load_roster, validate_unique_team_jersey
 from ft.linking.tracklet_linker import TrackletLinker
 from ft.tracking.yolo_bytetrack import YoloByteTracker
+from ft.tracking.yolo_strongsort import YoloStrongSortTracker
 from ft.utils.video import read_video, save_video
 from ft.utils.wandb_logger import WandbLogger
 from ft.visualization.overlay import draw_overlay
@@ -42,56 +45,73 @@ def _run_pipeline_impl(config):
     if config["identity"].get("enforce_unique_team_jersey", True):
         validate_unique_team_jersey(roster)
 
-    print(f"FT video: {video_path}")
-    print(f"FT model: {model_path}")
+    print(f"FT video: {video_path}", flush=True)
+    print(f"FT model: {model_path}", flush=True)
     frames = read_video(video_path, max_frames=config.get("max_frames"))
     if not frames:
         raise RuntimeError(f"No frames read from {video_path}")
+    print(f"FT video frames: {len(frames)}", flush=True)
 
-    tracker = YoloByteTracker(
-        model_path=model_path,
-        detection_confidence=config["detection"]["confidence"],
-        ball_confidence=config["detection"]["ball_confidence"],
-        ball_max_area_ratio=config["detection"]["ball_max_area_ratio"],
-        ball_size_penalty=config["detection"]["ball_size_penalty"],
-        **config["tracking"],
-    )
+    tracker = build_tracker(config, model_path)
     tracks = tracker.run(frames)
-
-    if config["linking"].get("enabled", True):
-        TrackletLinker(
-            max_gap=config["linking"]["max_gap"],
-            max_distance=config["linking"]["max_distance"],
-            min_frames=config["linking"]["min_frames"],
-        ).apply(tracks)
-    else:
-        TrackletLinker.ensure_display_ids(tracks)
 
     calibrator = PitchTransform.from_config(config["calibration"], frames)
     calibrator.apply_tracks(tracks)
-    print(f"FT calibration: {calibrator.source}")
+    print(f"FT calibration: {calibrator.source}", flush=True)
 
+    team_assignments = {}
     if config["team"].get("enabled", True):
         team_cfg = {k: v for k, v in config["team"].items() if k != "enabled"}
         team_assignments = TeamAssigner(**team_cfg).fit_apply(frames, tracks)
-    else:
-        team_assignments = {}
 
+    referee_diagnostics = {"enabled": False, "status": "disabled"}
     if config.get("referee", {}).get("enabled", True):
-        referee_cfg = {k: v for k, v in config["referee"].items() if k != "enabled"}
+        referee_cfg = referee_config(config, roster)
         referee_diagnostics = RefereeAppearanceAssigner(**referee_cfg).apply(frames, tracks)
         print(
             "FT referee colour:"
             f" referee_tracklets={len(referee_diagnostics.get('referees', {}))}"
-            f" player_tracklets={len(referee_diagnostics.get('players', {}))}"
+            f" player_tracklets={len(referee_diagnostics.get('players', {}))}",
+            flush=True,
         )
+
+    if config["linking"].get("enabled", True):
+        linking_cfg = {k: v for k, v in config["linking"].items() if k != "enabled"}
+        linker = TrackletLinker(**linking_cfg)
+        linker.apply(tracks, frames=frames)
+        linking_diagnostics = linker.diagnostics
     else:
-        referee_diagnostics = {"enabled": False, "status": "disabled"}
+        TrackletLinker.ensure_display_ids(tracks)
+        linking_diagnostics = {"enabled": False, "status": "disabled"}
+
+    if config["team"].get("enabled", True):
+        team_cfg = {k: v for k, v in config["team"].items() if k != "enabled"}
+        team_assignments = TeamAssigner(**team_cfg).fit_apply(frames, tracks)
+
+    if config.get("referee", {}).get("enabled", True):
+        referee_cfg = referee_config(config, roster)
+        referee_diagnostics = RefereeAppearanceAssigner(**referee_cfg).apply(frames, tracks)
+
+    goalkeeper_diagnostics = {"enabled": False, "status": "disabled"}
+    if config.get("goalkeeper", {}).get("enabled", True):
+        goalkeeper_cfg = goalkeeper_config(config, roster)
+        goalkeeper_diagnostics = GoalkeeperAppearanceAssigner(**goalkeeper_cfg).apply(frames, tracks)
+        print(
+            "FT goalkeeper colour:"
+            f" enabled={goalkeeper_diagnostics.get('enabled')}"
+            f" tracklets={len(goalkeeper_diagnostics.get('tracklets', {}))}",
+            flush=True,
+        )
 
     semantic_groups = SemanticGroupAssigner().apply(tracks)
 
-    exporter = ArtifactExporter(artifacts_dir, video_id)
-    rows = exporter.export_tracklets(frames, tracks)
+    exporter = ArtifactExporter(
+        artifacts_dir,
+        video_id,
+        progress_every=config.get("progress", {}).get("artifact_rows", 5000),
+        save_crops=config.get("export", {}).get("save_crops", True),
+    )
+    rows = exporter.export_tracklets(frames, tracks, stage="pre_identity")
 
     VisualFeatureExtractor().add_row_features(rows)
     _copy_row_features_to_tracks(rows, tracks)
@@ -114,6 +134,19 @@ def _run_pipeline_impl(config):
             min_winner_margin=config["jersey_ocr"].get("min_winner_margin", 0.15),
             easyocr_gpu=config["jersey_ocr"].get("easyocr_gpu", False),
             debug_dir=debug_dir,
+            template_matching=config["jersey_ocr"].get("template_matching", False),
+            template_font_image=config["jersey_ocr"].get("template_font_image"),
+            template_min_score=config["jersey_ocr"].get("template_min_score", 0.62),
+            template_weight=config["jersey_ocr"].get("template_weight", 0.25),
+            template_max_candidates=config["jersey_ocr"].get("template_max_candidates", 4),
+            aggregate_by_crop=config["jersey_ocr"].get("aggregate_by_crop", True),
+            max_candidates_per_crop=config["jersey_ocr"].get("max_candidates_per_crop", 3),
+            min_crop_candidate_ratio=config["jersey_ocr"].get("min_crop_candidate_ratio", 0.35),
+            mmocr_device=config["jersey_ocr"].get("mmocr_device"),
+            mmocr_det=config["jersey_ocr"].get("mmocr_det", "dbnet_resnet18_fpnc_1200e_icdar2015"),
+            mmocr_rec=config["jersey_ocr"].get("mmocr_rec", "SAR"),
+            mmocr_batch_size=config["jersey_ocr"].get("mmocr_batch_size", 8),
+            progress_every=config["jersey_ocr"].get("progress_every", 5),
         )
         jersey_assignments, jersey_diagnostics = ocr.recognize(rows)
         if config["jersey_ocr"].get("roster_aware", True):
@@ -133,12 +166,14 @@ def _run_pipeline_impl(config):
             "FT jersey OCR:"
             f" status={jersey_diagnostics.get('status')}"
             f" backend={jersey_diagnostics.get('backend')}"
-            f" assigned_tracklets={len(jersey_assignments)}"
+            f" template={jersey_diagnostics.get('template_matching', {}).get('status')}"
+            f" assigned_tracklets={len(jersey_assignments)}",
+            flush=True,
         )
     else:
         jersey_assignments = {}
         jersey_diagnostics = {"enabled": False, "status": "disabled"}
-        print("FT jersey OCR: disabled")
+        print("FT jersey OCR: disabled", flush=True)
 
     identifier = HungarianPlayerIdentifier(
         roster_path=config.get("roster_path"),
@@ -149,12 +184,29 @@ def _run_pipeline_impl(config):
         goalkeeper_number_one_prior=config["identity"].get("goalkeeper_number_one_prior", True),
         number_one_goalkeeper_bonus=config["identity"].get("number_one_goalkeeper_bonus", 0.08),
         number_one_non_goalkeeper_penalty=config["identity"].get("number_one_non_goalkeeper_penalty", 0.08),
+        position_prior_max_cost=config["identity"].get("position_prior_max_cost", 0.08),
+        position_prior_tiebreak_only=config["identity"].get("position_prior_tiebreak_only", True),
+        require_assignment_evidence=config["identity"].get("require_assignment_evidence", True),
+        reliable_jersey_min_candidate_score=config["identity"].get("reliable_jersey_min_candidate_score", 0.45),
+        strong_evidence_min_team_confidence=config["identity"].get("strong_evidence_min_team_confidence", 0.75),
+        strong_evidence_min_visual_similarity=config["identity"].get("strong_evidence_min_visual_similarity", 0.82),
+        strong_evidence_min_tracklet_frames=config["identity"].get("strong_evidence_min_tracklet_frames", 45),
+        strong_evidence_max_position_distance=config["identity"].get("strong_evidence_max_position_distance", 18.0),
     )
     summaries = identifier.summarize(rows)
     assignments, candidate_scores = identifier.assign(summaries)
     apply_assignments(tracks, assignments)
+    constraints_diagnostics = enforce_identity_constraints(
+        tracks,
+        roster,
+        frame_team_consistency=config["identity"].get("frame_team_consistency", True),
+        frame_team_min_confidence=config["identity"].get("frame_team_min_confidence", 0.70),
+        frame_team_split_enabled=config["identity"].get("frame_team_split_enabled", True),
+        frame_team_split_min_frames=config["identity"].get("frame_team_split_min_frames", 8),
+        frame_team_split_max_gap=config["identity"].get("frame_team_split_max_gap", 2),
+    )
 
-    final_rows = exporter.export_tracklets(frames, tracks)
+    final_rows = exporter.export_tracklets(frames, tracks, stage="final")
     write_json(
         {
             "calibration": {
@@ -162,28 +214,34 @@ def _run_pipeline_impl(config):
                 "source": calibrator.source,
                 "points": calibrator.calibration_points,
             },
+            "linking": linking_diagnostics,
             "team_assignments": {str(k): v for k, v in team_assignments.items()},
             "referee_colour": referee_diagnostics,
+            "goalkeeper_colour": goalkeeper_diagnostics,
             "semantic_groups": semantic_groups,
             "jersey_ocr": jersey_diagnostics,
+            "constraints": constraints_diagnostics,
             "tracklet_summaries": summaries,
             "assignments": {str(k): v for k, v in assignments.items()},
         },
         artifacts_dir / "metadata" / f"{video_id}_identity_assignments.json",
     )
+    write_json(linking_diagnostics, artifacts_dir / "metadata" / f"{video_id}_linking.json")
+    write_json(constraints_diagnostics, artifacts_dir / "metadata" / f"{video_id}_constraints.json")
     write_json(referee_diagnostics, artifacts_dir / "metadata" / f"{video_id}_referee_colour.json")
+    write_json(goalkeeper_diagnostics, artifacts_dir / "metadata" / f"{video_id}_goalkeeper_colour.json")
     write_table(summaries, artifacts_dir / "metadata" / f"{video_id}_tracklet_summaries.csv")
     write_table(candidate_scores, artifacts_dir / "metadata" / f"{video_id}_candidate_scores.csv")
     write_json(jersey_diagnostics, artifacts_dir / "metadata" / f"{video_id}_jersey_ocr.json")
 
-    output_frames = draw_overlay(frames, tracks)
+    output_frames = draw_overlay(frames, tracks, config=config.get("overlay", {}))
     save_video(output_frames, output_path, fps=config["tracking"].get("frame_rate", 25))
 
-    print(f"FT output video: {output_path}")
-    print(f"FT artifacts: {artifacts_dir}")
-    print(f"FT tracklet rows: {len(final_rows)}")
+    print(f"FT output video: {output_path}", flush=True)
+    print(f"FT artifacts: {artifacts_dir}", flush=True)
+    print(f"FT tracklet rows: {len(final_rows)}", flush=True)
     assigned = [row for row in final_rows if row.get("player_id") not in (None, "unknown")]
-    print(f"FT assigned row count: {len(assigned)}")
+    print(f"FT assigned row count: {len(assigned)}", flush=True)
     return {
         "output_path": output_path,
         "artifacts_dir": str(artifacts_dir),
@@ -197,6 +255,46 @@ def _run_pipeline_impl(config):
 
 def run_from_config(path):
     return run_pipeline(load_config(path))
+
+
+def referee_config(config, roster):
+    referee_cfg = {k: v for k, v in config.get("referee", {}).items() if k != "enabled"}
+    roster_color_ranges = referee_color_ranges_from_roster(roster)
+    if roster_color_ranges:
+        configured_ranges = referee_cfg.get("color_ranges") or {}
+        referee_cfg["color_ranges"] = {**configured_ranges, **roster_color_ranges}
+    return referee_cfg
+
+
+def goalkeeper_config(config, roster):
+    goalkeeper_cfg = {k: v for k, v in config.get("goalkeeper", {}).items() if k != "enabled"}
+    roster_color_ranges = goalkeeper_color_ranges_by_team_from_roster(roster)
+    if roster_color_ranges:
+        configured_ranges = goalkeeper_cfg.get("color_ranges_by_team") or {}
+        goalkeeper_cfg["color_ranges_by_team"] = {**configured_ranges, **roster_color_ranges}
+    return goalkeeper_cfg
+
+
+def build_tracker(config, model_path):
+    tracking_cfg = dict(config.get("tracking", {}))
+    backend = str(tracking_cfg.pop("backend", "bytetrack")).lower().replace("_", "")
+    strongsort_cfg = tracking_cfg.pop("strongsort", {}) or {}
+    common = {
+        "model_path": model_path,
+        "detection_confidence": config["detection"]["confidence"],
+        "ball_confidence": config["detection"]["ball_confidence"],
+        "ball_max_area_ratio": config["detection"]["ball_max_area_ratio"],
+        "ball_size_penalty": config["detection"]["ball_size_penalty"],
+    }
+    if backend in {"bytetrack", "byte"}:
+        print("FT tracking backend: bytetrack", flush=True)
+        return YoloByteTracker(**common, **tracking_cfg)
+    if backend in {"strongsort", "strong"}:
+        print("FT tracking backend: strongsort", flush=True)
+        strongsort_args = dict(tracking_cfg)
+        strongsort_args.update(strongsort_cfg)
+        return YoloStrongSortTracker(**common, **strongsort_args)
+    raise ValueError(f"Unknown tracking backend: {backend}")
 
 
 def _copy_row_features_to_tracks(rows, tracks):

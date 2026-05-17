@@ -12,7 +12,7 @@ detection:
   ball_size_penalty: 0.5
 
 tracking:
-  backend: bytetrack
+  backend: strongsort
   track_activation_threshold: 0.10
   lost_track_buffer: 150
   minimum_matching_threshold: 0.95
@@ -75,7 +75,7 @@ goalkeeper:
   enabled: true
   min_color_fraction: 0.20
   min_tracklet_frames: 2
-  assign_team_from_color: true
+  assign_team_from_color: false
   team_correction_min_score: 0.55
 
 jersey_ocr:

@@ -20,6 +20,14 @@ class HungarianPlayerIdentifier:
         goalkeeper_number_one_prior=True,
         number_one_goalkeeper_bonus=0.08,
         number_one_non_goalkeeper_penalty=0.08,
+        position_prior_max_cost=0.08,
+        position_prior_tiebreak_only=True,
+        require_assignment_evidence=True,
+        reliable_jersey_min_candidate_score=0.45,
+        strong_evidence_min_team_confidence=0.75,
+        strong_evidence_min_visual_similarity=0.82,
+        strong_evidence_min_tracklet_frames=45,
+        strong_evidence_max_position_distance=18.0,
     ):
         self.roster = load_roster(roster_path)
         self.unknown_threshold = float(unknown_threshold)
@@ -29,6 +37,14 @@ class HungarianPlayerIdentifier:
         self.goalkeeper_number_one_prior = bool(goalkeeper_number_one_prior)
         self.number_one_goalkeeper_bonus = float(number_one_goalkeeper_bonus)
         self.number_one_non_goalkeeper_penalty = float(number_one_non_goalkeeper_penalty)
+        self.position_prior_max_cost = float(position_prior_max_cost)
+        self.position_prior_tiebreak_only = bool(position_prior_tiebreak_only)
+        self.require_assignment_evidence = bool(require_assignment_evidence)
+        self.reliable_jersey_min_candidate_score = float(reliable_jersey_min_candidate_score)
+        self.strong_evidence_min_team_confidence = float(strong_evidence_min_team_confidence)
+        self.strong_evidence_min_visual_similarity = float(strong_evidence_min_visual_similarity)
+        self.strong_evidence_min_tracklet_frames = int(strong_evidence_min_tracklet_frames)
+        self.strong_evidence_max_position_distance = float(strong_evidence_max_position_distance)
         if self.enforce_unique_team_jersey:
             validate_unique_team_jersey(self.roster)
 
@@ -100,6 +116,7 @@ class HungarianPlayerIdentifier:
             details = self.cost_details(tracklet, player)
             confidence = details["confidence"]
             track_id = int(tracklet["track_id"])
+            assignment_gate = self.assignment_gate(tracklet, player, details)
             if confidence < self.unknown_threshold:
                 assignments[track_id]["confidence"] = confidence
                 assignments[track_id]["evidence"].update(
@@ -107,6 +124,19 @@ class HungarianPlayerIdentifier:
                         "best_candidate": player["player_id"],
                         "cost": details["cost"],
                         "feature_costs": details["components"],
+                        "assignment_gate": assignment_gate,
+                    }
+                )
+                continue
+            if not assignment_gate["pass"]:
+                assignments[track_id]["confidence"] = confidence
+                assignments[track_id]["evidence"].update(
+                    {
+                        "best_candidate": player["player_id"],
+                        "cost": details["cost"],
+                        "feature_costs": details["components"],
+                        "assignment_gate": assignment_gate,
+                        "status": "insufficient_assignment_evidence",
                     }
                 )
                 continue
@@ -122,6 +152,7 @@ class HungarianPlayerIdentifier:
                     "feature_costs": details["components"],
                     "jersey_observed": tracklet.get("jersey_number"),
                     "team_match": tracklet.get("team_id") == player.get("team_id"),
+                    "assignment_gate": assignment_gate,
                 },
             }
         return assignments, scores
@@ -149,6 +180,9 @@ class HungarianPlayerIdentifier:
                         "tracklet_frames": tracklet.get("num_frames"),
                         "mean_crop_quality": tracklet.get("mean_crop_quality"),
                         "mean_pitch_position": tracklet.get("mean_pitch_position"),
+                        "position_prior_distance": details["position_prior_distance"],
+                        "visual_similarity": details["visual_similarity"],
+                        "assignment_gate": self.assignment_gate(tracklet, player, details),
                         "cost": details["cost"],
                         "confidence": details["confidence"],
                         "components": details["components"],
@@ -201,12 +235,22 @@ class HungarianPlayerIdentifier:
         elif expected is not None:
             components["jersey"] = 0.35
 
+        position_prior_distance = None
         if tracklet.get("mean_pitch_position") is not None and player.get("position_prior") is not None:
-            dist = np.linalg.norm(np.asarray(tracklet["mean_pitch_position"]) - np.asarray(player["position_prior"]))
-            components["position_prior"] = min(0.25, float(dist) / 120.0)
+            dist = float(
+                np.linalg.norm(np.asarray(tracklet["mean_pitch_position"]) - np.asarray(player["position_prior"]))
+            )
+            position_prior_distance = dist
+            if self.position_prior_tiebreak_only:
+                scaled = dist / 120.0 * self.position_prior_max_cost
+                components["position_prior"] = min(self.position_prior_max_cost, scaled)
+            else:
+                components["position_prior"] = min(max(0.25, self.position_prior_max_cost), dist / 120.0)
 
         visual_cost = visual_distance(tracklet.get("visual_embedding"), player.get("visual_embedding") or player.get("visual_profile"))
+        visual_similarity = None
         if visual_cost is not None:
+            visual_similarity = 1.0 - 2.0 * visual_cost
             components["visual"] = min(0.30, 0.30 * visual_cost)
 
         if tracklet.get("num_frames", 0) < 10:
@@ -220,6 +264,8 @@ class HungarianPlayerIdentifier:
             "raw_cost": raw_cost,
             "confidence": clamp(1.0 - cost, 0.0, 1.0),
             "components": {key: float(value) for key, value in components.items()},
+            "position_prior_distance": position_prior_distance,
+            "visual_similarity": visual_similarity,
         }
 
     def _has_reliable_jersey(self, tracklet):
@@ -229,6 +275,54 @@ class HungarianPlayerIdentifier:
             and float(tracklet.get("jersey_confidence") or 0.0) >= self.reliable_jersey_min_confidence
         )
 
+    def assignment_gate(self, tracklet, player, details):
+        if not self.require_assignment_evidence:
+            return {"pass": True, "reason": "gate_disabled"}
+
+        reliable_jersey = self._has_reliable_jersey_match(tracklet, player)
+        team_match = same_team(tracklet, player)
+        team_confidence = float(tracklet.get("mean_team_confidence", 0.0) or 0.0)
+        visual_similarity = details.get("visual_similarity")
+        position_distance = details.get("position_prior_distance")
+        tracklet_frames = int(tracklet.get("num_frames") or 0)
+        strong_combined = (
+            team_match
+            and team_confidence >= self.strong_evidence_min_team_confidence
+            and visual_similarity is not None
+            and visual_similarity >= self.strong_evidence_min_visual_similarity
+            and tracklet_frames >= self.strong_evidence_min_tracklet_frames
+            and position_distance is not None
+            and position_distance <= self.strong_evidence_max_position_distance
+        )
+
+        if reliable_jersey:
+            reason = "reliable_jersey"
+        elif strong_combined:
+            reason = "strong_team_visual_trajectory"
+        else:
+            reason = "insufficient_assignment_evidence"
+        return {
+            "pass": bool(reliable_jersey or strong_combined),
+            "reason": reason,
+            "reliable_jersey": bool(reliable_jersey),
+            "strong_combined": bool(strong_combined),
+            "team_match": bool(team_match),
+            "team_confidence": float(team_confidence),
+            "visual_similarity": visual_similarity,
+            "position_prior_distance": position_distance,
+            "tracklet_frames": int(tracklet_frames),
+        }
+
+    def _has_reliable_jersey_match(self, tracklet, player):
+        expected = player.get("jersey_number")
+        if expected is None:
+            return False
+        candidate_score = jersey_candidate_score(tracklet, expected)
+        if candidate_score is not None and candidate_score >= self.reliable_jersey_min_candidate_score:
+            return True
+        observed = tracklet.get("jersey_number")
+        return observed is not None and int(observed) == int(expected) and self._has_reliable_jersey(tracklet)
+
 
 def is_non_player_tracklet(items):
     roles = [str(row.get("role_detection") or "").lower() for row in items]
@@ -236,6 +330,14 @@ def is_non_player_tracklet(items):
         return False
     referee_like = sum(role in {"referee", "referee_candidate"} for role in roles)
     return referee_like / len(roles) >= 0.5
+
+
+def same_team(tracklet, player):
+    return (
+        tracklet.get("team_id") is not None
+        and player.get("team_id") is not None
+        and int(tracklet["team_id"]) == int(player["team_id"])
+    )
 
 
 def unknown_assignments(summaries, status):

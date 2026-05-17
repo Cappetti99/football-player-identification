@@ -41,7 +41,8 @@ class TeamAssigner:
                 break
         self._fit(seed_colors)
         assignments = self._assign_tracklets(frames, tracks)
-        self._apply(assignments, tracks)
+        frame_assignments = self._assign_frames(frames, tracks)
+        self._apply(assignments, frame_assignments, tracks)
         return assignments
 
     def _fit(self, colors):
@@ -98,16 +99,51 @@ class TeamAssigner:
             "mean_margin": float(np.mean(margins)) if margins else 0.0,
         }
 
-    def _apply(self, assignments, tracks):
-        for frame_tracks in tracks.get("players", []):
+    def _assign_frames(self, frames, tracks):
+        frame_assignments = []
+        for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
+            frame = frames[frame_num]
+            frame_row = {}
+            for raw_id, track in frame_tracks.items():
+                color = self.player_color(frame, track["bbox"])
+                frame_row[int(raw_id)] = self._classify_color(color)
+            frame_assignments.append(frame_row)
+        return frame_assignments
+
+    def _classify_color(self, color):
+        if self.kmeans is None or color is None:
+            return {"team": None, "confidence": 0.0, "margin": 0.0, "distances": {}}
+        distances = self.kmeans.transform(np.asarray([color], dtype=np.float32))[0]
+        order = np.argsort(distances)
+        margin = float(distances[order[1]] - distances[order[0]])
+        if margin < self.min_classification_margin:
+            team = None
+            confidence = 0.0
+        else:
+            team = int(order[0]) + 1
+            confidence = min(1.0, margin / max(1.0, self.min_classification_margin * 2.0))
+        return {
+            "team": team,
+            "confidence": float(confidence),
+            "margin": float(margin),
+            "distances": {int(index) + 1: float(value) for index, value in enumerate(distances)},
+        }
+
+    def _apply(self, assignments, frame_assignments, tracks):
+        for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
             for raw_id, track in frame_tracks.items():
                 display_id = int(track.get("display_track_id", raw_id))
                 assignment = assignments.get(display_id, {})
+                frame_assignment = frame_assignments[frame_num].get(int(raw_id), {})
                 team = assignment.get("team")
                 track["team"] = team
                 track["team_confidence"] = float(assignment.get("confidence", 0.0))
                 track["team_color"] = self.team_colors.get(team, (160, 160, 160))
                 track["team_evidence"] = assignment
+                track["frame_team"] = frame_assignment.get("team")
+                track["frame_team_confidence"] = float(frame_assignment.get("confidence", 0.0))
+                track["frame_team_margin"] = float(frame_assignment.get("margin", 0.0))
+                track["frame_team_evidence"] = frame_assignment
 
     @staticmethod
     def player_color(frame, bbox):
@@ -140,4 +176,3 @@ def torso_crop(frame, bbox):
     left = x1 + int(box_w * 0.15)
     right = x2 - int(box_w * 0.15)
     return frame[top:max(top + 1, bottom), left:max(left + 1, right)]
-

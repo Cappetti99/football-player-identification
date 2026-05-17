@@ -3,7 +3,7 @@ video_path: ../input_videos/08fd33_4.mp4
 output_path: output_videos/ft_output.mp4
 artifacts_dir: artifacts/ft_run
 roster_path: configs/roster.example.json
-max_frames: 300
+max_frames: 600
 
 detection:
   confidence: 0.05
@@ -12,13 +12,13 @@ detection:
   ball_size_penalty: 0.5
 
 tracking:
-  backend: bytetrack
+  backend: strongsort
   track_activation_threshold: 0.10
   lost_track_buffer: 150
   minimum_matching_threshold: 0.95
   frame_rate: 25
   minimum_consecutive_frames: 2
-  progress_every: 250
+  progress_every: 50
   strongsort:
     max_age: 150
     min_hits: 2
@@ -30,18 +30,10 @@ tracking:
     appearance_min_similarity: 0.15
     appearance_ema: 0.85
     class_gate: true
-    progress_every: 250
+    progress_every: 50
 
 linking:
-  enabled: true
-  max_gap: 90
-  max_distance: 160.0
-  min_frames: 4
-  team_gate_enabled: true
-  team_gate_min_confidence: 0.65
-  appearance_gate_enabled: true
-  appearance_min_similarity: 0.72
-  max_rejection_records: 5000
+  enabled: false
 
 calibration:
   enabled: true
@@ -75,42 +67,13 @@ goalkeeper:
   enabled: true
   min_color_fraction: 0.20
   min_tracklet_frames: 2
-  assign_team_from_color: true
+  assign_team_from_color: false
   team_correction_min_score: 0.55
 
 jersey_ocr:
-  enabled: true
+  enabled: false
   backend: mmocr_easyocr
-  min_confidence: 0.25
-  max_crops_per_tracklet: 20
-  temporal_passes: 3
-  augment: true
-  min_crop_quality: 0.08
-  min_votes: 2
-  min_raw_confidence: 0.05
-  min_winner_margin: 0.15
-  easyocr_gpu: true
-  roster_aware: true
-  roster_filter_mode: drop
-  roster_unknown_team_policy: keep
-  roster_degrade_confidence_scale: 0.60
-  promote_roster_candidate: true
-  min_promoted_candidate_confidence: 0.12
-  min_promoted_candidate_votes: 1
-  debug_crops: true
-  template_matching: true
-  template_font_image: docs/numberFont.jpg
-  template_min_score: 0.62
-  template_weight: 0.10
-  template_max_candidates: 4
-  aggregate_by_crop: true
-  max_candidates_per_crop: 3
-  min_crop_candidate_ratio: 0.35
-  mmocr_device: cuda:0
-  mmocr_det: dbnet_resnet18_fpnc_1200e_icdar2015
-  mmocr_rec: SAR
-  mmocr_batch_size: 8
-  progress_every: 5
+  debug_crops: false
 
 identity:
   unknown_threshold: 0.55
@@ -137,34 +100,27 @@ identity:
 
 overlay:
   show_display_id: true
-  show_jersey: true
-  show_jersey_winner: true
-  show_jersey_min_confidence: 0.55
-  show_jersey_min_votes: 2
-  show_jersey_min_stable_votes: 20
-  show_jersey_min_winner_margin: 0.20
-  show_jersey_min_head_votes: 8
-  show_jersey_min_head_confidence: 0.70
+  show_jersey: false
+  show_jersey_winner: false
   require_ocr_jersey_evidence: true
   show_player_id: false
-  show_player_id_min_confidence: 0.80
   show_identity_confidence: false
 
 wandb:
-  enabled: true
+  enabled: false
   project: football-tracking
   entity: null
   name: null
   init_timeout: 180
   tags: []
   notes: null
-  log_artifacts: true
+  log_artifacts: false
   log_video: false
-  alert_on_finish: true
-  alert_on_failure: true
+  alert_on_finish: false
+  alert_on_failure: false
 
 progress:
-  artifact_rows: 5000
+  artifact_rows: 1000
 
 export:
-  save_crops: true
+  save_crops: false

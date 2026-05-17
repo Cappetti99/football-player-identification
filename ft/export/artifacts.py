@@ -11,17 +11,24 @@ from ft.utils.geometry import bbox_height, clip_bbox
 class ArtifactExporter:
     """Persist crops and metadata rows used by downstream identification."""
 
-    def __init__(self, artifacts_dir, video_id):
+    def __init__(self, artifacts_dir, video_id, progress_every=5000, save_crops=True):
         self.artifacts_dir = Path(artifacts_dir)
         self.video_id = video_id
+        self.progress_every = int(progress_every or 0)
+        self.save_crops = bool(save_crops)
         self.metadata_dir = self.artifacts_dir / "metadata"
         self.crops_dir = self.artifacts_dir / "crops" / video_id
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         self.crops_dir.mkdir(parents=True, exist_ok=True)
 
-    def export_tracklets(self, frames, tracks):
+    def export_tracklets(self, frames, tracks, stage="tracklets"):
         rows = []
-        for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
+        frame_groups = tracks.get("players", [])
+        print(
+            f"FT export {stage}: start frames={len(frame_groups)}",
+            flush=True,
+        )
+        for frame_num, frame_tracks in enumerate(frame_groups):
             frame = frames[frame_num]
             for raw_track_id, track in sorted(frame_tracks.items()):
                 bbox = clip_bbox(track["bbox"], frame)
@@ -31,12 +38,18 @@ class ArtifactExporter:
                     "frame": int(frame_num),
                     "track_id": int(raw_track_id),
                     "raw_track_id": int(track.get("raw_track_id", raw_track_id)),
+                    "previous_display_track_id": track.get("previous_display_track_id"),
                     "display_track_id": int(track.get("display_track_id", raw_track_id)),
                     "bbox": bbox,
                     "role_detection": track.get("role_detection"),
                     "team_id": track.get("team"),
                     "team_confidence": float(track.get("team_confidence", 0.0)),
                     "team_evidence": track.get("team_evidence", {}),
+                    "frame_team_conflict": bool(track.get("frame_team_conflict", False)),
+                    "display_split": track.get("display_split"),
+                    "frame_team_id": track.get("frame_team"),
+                    "frame_team_confidence": float(track.get("frame_team_confidence", 0.0)),
+                    "frame_team_margin": float(track.get("frame_team_margin", 0.0)),
                     "semantic_group_id": track.get("semantic_group_id"),
                     "semantic_group": track.get("semantic_group"),
                     "position_image": to_float_list(track.get("position")),
@@ -50,6 +63,7 @@ class ArtifactExporter:
                     "jersey_candidates": track.get("jersey_candidates"),
                     "jersey_distribution": track.get("jersey_distribution"),
                     "jersey_roster_mass": float(track.get("jersey_roster_mass", 0.0)),
+                    "jersey_constraint": track.get("jersey_constraint"),
                     "visual_embedding": track.get("visual_embedding"),
                     "player_id": track.get("player_id", "unknown"),
                     "player_name": track.get("player_name", "unknown"),
@@ -58,13 +72,26 @@ class ArtifactExporter:
                     "referee_like_score": float(track.get("referee_like_score", 0.0)),
                     "referee_like_color": track.get("referee_like_color"),
                     "referee_palette_match": bool(track.get("referee_palette_match", False)),
+                    "goalkeeper_like_score": float(track.get("goalkeeper_like_score", 0.0)),
+                    "goalkeeper_like_team": track.get("goalkeeper_like_team"),
+                    "goalkeeper_like_color": track.get("goalkeeper_like_color"),
+                    "goalkeeper_palette_match": bool(track.get("goalkeeper_palette_match", False)),
                 }
                 rows.append(row)
+                if self.progress_every > 0 and len(rows) % self.progress_every == 0:
+                    print(
+                        f"FT export {stage}: rows={len(rows)} frame={frame_num + 1}/{len(frame_groups)}",
+                        flush=True,
+                    )
+        print(f"FT export {stage}: writing metadata rows={len(rows)}", flush=True)
         self.write_json(rows, self.metadata_dir / f"{self.video_id}_tracklets.json")
         self.write_csv(rows, self.metadata_dir / f"{self.video_id}_tracklets.csv")
+        print(f"FT export {stage}: done rows={len(rows)}", flush=True)
         return rows
 
     def _save_crop(self, frame, frame_num, track_id, bbox):
+        if not self.save_crops:
+            return None
         x1, y1, x2, y2 = map(int, bbox)
         if x2 <= x1 or y2 <= y1:
             return None

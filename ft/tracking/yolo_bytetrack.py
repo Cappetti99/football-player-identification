@@ -40,6 +40,7 @@ class YoloByteTracker:
         minimum_matching_threshold=0.95,
         frame_rate=25,
         minimum_consecutive_frames=2,
+        progress_every=250,
     ):
         if YOLO is None:
             raise ImportError("Missing ultralytics. Install FT requirements first.")
@@ -59,6 +60,7 @@ class YoloByteTracker:
             frame_rate,
             minimum_consecutive_frames,
         )
+        self.progress_every = int(progress_every or 0)
 
     @staticmethod
     def _build_tracker(
@@ -95,6 +97,12 @@ class YoloByteTracker:
                 frame_tracks = self._process_frame(result)
                 for key in tracks:
                     tracks[key].append(frame_tracks[key])
+                if self.progress_every > 0 and (frame_num + 1) % self.progress_every == 0:
+                    print(
+                        "FT bytetrack:"
+                        f" processed_frames={frame_num + 1}/{len(frames)}",
+                        flush=True,
+                    )
         self.add_positions(tracks)
         tracks["ball"] = self.interpolate_ball(tracks["ball"])
         self.add_positions(tracks)
@@ -202,4 +210,3 @@ class YoloByteTracker:
             ({1: {"bbox": row.tolist(), "interpolated": True}} if not row.isna().any() else {})
             for _, row in df.iterrows()
         ]
-
