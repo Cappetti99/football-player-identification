@@ -8,7 +8,12 @@ from ft.identity.roster import load_roster, validate_unique_team_jersey
 
 
 class HungarianPlayerIdentifier:
-    """Assign display tracklets to roster players with a transparent cost matrix."""
+    """Assign display tracklets to roster players with a transparent cost matrix.
+
+    The solver gives the globally best one-to-one assignment, but it is not
+    trusted blindly: a separate assignment gate below blocks weak matches and
+    leaves them as unknown.
+    """
 
     def __init__(
         self,
@@ -49,6 +54,7 @@ class HungarianPlayerIdentifier:
             validate_unique_team_jersey(self.roster)
 
     def summarize(self, rows):
+        """Collapse per-frame rows into the evidence unit used by Hungarian."""
         grouped = defaultdict(list)
         for row in rows:
             grouped[int(row.get("display_track_id", row["track_id"]))].append(row)
@@ -118,6 +124,8 @@ class HungarianPlayerIdentifier:
             track_id = int(tracklet["track_id"])
             assignment_gate = self.assignment_gate(tracklet, player, details)
             if confidence < self.unknown_threshold:
+                # Keep the best rejected candidate in diagnostics. It is useful
+                # when tuning thresholds, but it must not become a real identity.
                 assignments[track_id]["confidence"] = confidence
                 assignments[track_id]["evidence"].update(
                     {
@@ -129,6 +137,8 @@ class HungarianPlayerIdentifier:
                 )
                 continue
             if not assignment_gate["pass"]:
+                # Low cost alone is not enough. Without reliable jersey evidence
+                # or strong combined cues, the conservative outcome is unknown.
                 assignments[track_id]["confidence"] = confidence
                 assignments[track_id]["evidence"].update(
                     {
@@ -192,6 +202,7 @@ class HungarianPlayerIdentifier:
         return rows
 
     def cost_details(self, tracklet, player):
+        """Return total cost and each feature contribution for one candidate."""
         components = {
             "base": 0.25,
             "team": 0.0,
@@ -212,6 +223,8 @@ class HungarianPlayerIdentifier:
         expected = player.get("jersey_number")
         jersey_score = jersey_candidate_score(tracklet, expected)
         if expected is not None and jersey_score is not None:
+            # Candidate distributions let a lower-ranked but roster-valid OCR
+            # number still influence the assignment.
             components["jersey"] = -0.45 * jersey_score
         elif observed is not None and expected is not None:
             reliability = jersey_reliability(tracklet)
@@ -233,6 +246,8 @@ class HungarianPlayerIdentifier:
                 elif role:
                     components["goalkeeper_number_one_prior"] = self.number_one_non_goalkeeper_penalty * reliability
         elif expected is not None:
+            # Missing jersey is a weak penalty, not a blocker. Many broadcast
+            # crops never expose a readable back number.
             components["jersey"] = 0.35
 
         position_prior_distance = None
@@ -276,6 +291,7 @@ class HungarianPlayerIdentifier:
         )
 
     def assignment_gate(self, tracklet, player, details):
+        """Decide whether a low-cost match has enough evidence to be trusted."""
         if not self.require_assignment_evidence:
             return {"pass": True, "reason": "gate_disabled"}
 
@@ -400,6 +416,7 @@ def mean_position(values):
 
 
 def aggregate_jersey_distribution(items):
+    """Merge OCR candidate distributions across the frames of one tracklet."""
     scores = defaultdict(float)
     votes = defaultdict(int)
     for row in items:

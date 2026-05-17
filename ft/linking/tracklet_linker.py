@@ -5,7 +5,12 @@ from ft.utils.geometry import distance
 
 
 class TrackletLinker:
-    """Link fragmented raw tracks into stable display_track_id values."""
+    """Link fragmented raw tracks into stable display_track_id values.
+
+    The linker is deliberately conservative. It only merges non-overlapping raw
+    tracks when motion, team and appearance are compatible, because a bad merge
+    is more damaging to identity assignment than leaving two shorter tracklets.
+    """
 
     def __init__(
         self,
@@ -51,6 +56,9 @@ class TrackletLinker:
                     self._record_rejection(rejected, current, previous, "gap", gap=gap)
                     continue
                 if self._cluster_conflict(current, previous, summaries, display_id_by_track, tracks_by_display):
+                    # A display_track_id cannot contain two raw tracks visible in
+                    # the same frame; that would create duplicate bodies under
+                    # one identity before Hungarian even runs.
                     self._record_rejection(rejected, current, previous, "overlap", gap=gap)
                     continue
                 dist = tracklet_distance(previous, current)
@@ -74,6 +82,8 @@ class TrackletLinker:
                         visual_similarity=gate.get("visual_similarity"),
                     )
                     continue
+                # Distance is the main link score; gap is a small tie-breaker so
+                # a nearby continuation is preferred over a long disappearance.
                 score = dist + gap * 0.5
                 if best_score is None or score < best_score:
                     best_score = score
@@ -169,6 +179,7 @@ class TrackletLinker:
         return False
 
     def _gate(self, current, previous):
+        """Reject links that look plausible geometrically but not semantically."""
         team_gate_pass = True
         if self.team_gate_enabled:
             current_team = current.get("team_id")

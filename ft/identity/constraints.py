@@ -13,7 +13,13 @@ def enforce_identity_constraints(
     frame_team_split_min_frames=8,
     frame_team_split_max_gap=2,
 ):
-    """Apply hard consistency constraints to final per-frame identities."""
+    """Apply hard consistency constraints to final per-frame identities.
+
+    Hungarian works at tracklet level, while several mistakes only become clear
+    frame-by-frame: two players sharing an ID, a jersey on the wrong team, or a
+    display ID drifting onto the opponent after contact. This pass prefers to
+    clear identity/jersey evidence rather than preserve a suspicious assignment.
+    """
     numbers_by_team = roster_numbers_by_team(roster)
     goalkeeper_numbers = goalkeeper_numbers_by_team(roster)
     diagnostics = {
@@ -32,6 +38,8 @@ def enforce_identity_constraints(
 
     player_roster = {str(player["player_id"]): player for player in roster}
     for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
+        # Ordering matters: first remove team contradictions, then apply roster
+        # and uniqueness constraints using the corrected per-frame state.
         if frame_team_consistency:
             _apply_frame_team_consistency(frame_num, frame_tracks, frame_team_min_confidence, diagnostics)
         _clear_invalid_team_jerseys(frame_num, frame_tracks, numbers_by_team, diagnostics)
@@ -79,6 +87,9 @@ def _apply_frame_team_consistency(frame_num, frame_tracks, min_confidence, diagn
         confidence = float(track.get("frame_team_confidence", 0.0) or 0.0)
         if team == frame_team or confidence < float(min_confidence):
             continue
+        # Tracklet-level team is a majority vote; frame_team is the local colour
+        # evidence. A confident disagreement usually means an ID switch or an
+        # occlusion, so identity evidence is cleared for that frame.
         diagnostics["frame_team_conflicts"].append(
             {
                 "frame": int(frame_num),
@@ -143,6 +154,9 @@ def _split_persistent_frame_team_conflicts(tracks, min_frames, max_gap, diagnost
         for run in runs:
             if len(run) < min_frames:
                 continue
+            # A long run of frame_team_conflict is treated as a new display ID.
+            # This keeps the original player identity from leaking onto a
+            # different body after a collision or camera-side ambiguity.
             new_display_id = next_display_id
             next_display_id += 1
             frame_team_counts = defaultdict(int)
@@ -166,6 +180,9 @@ def _split_persistent_frame_team_conflicts(tracks, min_frames, max_gap, diagnost
                     "num_frames": int(len(run)),
                 }
                 if is_bridge:
+                    # Bridge frames are short non-conflict interruptions inside
+                    # a larger conflict run. They are too ambiguous to keep the
+                    # old jersey/player_id, even if their local colour flips back.
                     if track.get("jersey_number") not in (None, "", "None", -1):
                         _clear_jersey(
                             track,
@@ -201,6 +218,7 @@ def _split_persistent_frame_team_conflicts(tracks, min_frames, max_gap, diagnost
 
 
 def conflict_runs(items, max_gap):
+    """Return conflict segments, optionally joining short ambiguous bridges."""
     runs = []
     current = []
     bridge = []

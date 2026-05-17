@@ -6,7 +6,12 @@ from sklearn.cluster import KMeans
 
 
 class TeamAssigner:
-    """Conservative team assignment from torso color aggregated by tracklet."""
+    """Conservative team assignment from torso color aggregated by tracklet.
+
+    Two labels are exported: a tracklet-level team majority and a per-frame
+    frame_team. The second one is intentionally local and is later used to catch
+    ID switches when a tracklet suddenly looks like the opponent.
+    """
 
     def __init__(
         self,
@@ -52,6 +57,8 @@ class TeamAssigner:
         model = KMeans(n_clusters=2, random_state=0, n_init=10).fit(x)
         centers = model.cluster_centers_
         if np.linalg.norm(centers[0] - centers[1]) < self.min_cluster_separation:
+            # If the first frames do not separate into two kit colours, it is
+            # safer to leave team unknown than to build a noisy classifier.
             return
         self.kmeans = model
         self.team_colors = {
@@ -83,6 +90,8 @@ class TeamAssigner:
             order = np.argsort(row)
             margins.append(float(row[order[1]] - row[order[0]]))
             if margins[-1] >= self.min_classification_margin:
+                # Low-margin colours are ignored rather than forced into a team.
+                # This matters for referees, goalkeepers and heavy occlusions.
                 votes.append(int(order[0]) + 1)
         if not votes:
             return {"team": None, "confidence": 0.0, "num_colors": len(colors)}
@@ -141,6 +150,8 @@ class TeamAssigner:
                 track["team_color"] = self.team_colors.get(team, (160, 160, 160))
                 track["team_evidence"] = assignment
                 track["frame_team"] = frame_assignment.get("team")
+                # frame_team is not used as the main team label. It is a local
+                # consistency check consumed later by identity constraints.
                 track["frame_team_confidence"] = float(frame_assignment.get("confidence", 0.0))
                 track["frame_team_margin"] = float(frame_assignment.get("margin", 0.0))
                 track["frame_team_evidence"] = frame_assignment

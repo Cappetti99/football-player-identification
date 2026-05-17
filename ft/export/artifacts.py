@@ -33,6 +33,9 @@ class ArtifactExporter:
             for raw_track_id, track in sorted(frame_tracks.items()):
                 bbox = clip_bbox(track["bbox"], frame)
                 crop_path = self._save_crop(frame, frame_num, raw_track_id, bbox)
+                # Keep both raw and display IDs: raw_track_id is useful for
+                # tracker debugging, while display_track_id is the semantic
+                # identity surface after linking/splitting.
                 row = {
                     "video_id": self.video_id,
                     "frame": int(frame_num),
@@ -121,6 +124,8 @@ class ArtifactExporter:
                 out = {}
                 for key, value in row.items():
                     if isinstance(value, (dict, list)):
+                        # CSV stays spreadsheet-friendly while preserving rich
+                        # diagnostics as JSON strings for later inspection.
                         out[key] = json.dumps(value)
                     else:
                         out[key] = value
@@ -131,6 +136,8 @@ def crop_quality(bbox, frame):
     height, width = frame.shape[:2]
     bw = max(0, bbox[2] - bbox[0])
     bh = max(0, bbox[3] - bbox[1])
+    # This score ranks crops for OCR sampling. It favors visible, non-border
+    # players without pretending to be a learned image-quality model.
     area_score = min(1.0, (bw * bh) / float(width * height) / 0.02)
     border_penalty = 0.4 if bbox[0] <= 1 or bbox[1] <= 1 or bbox[2] >= width - 1 else 0.0
     height_bonus = min(0.2, bbox_height(bbox) / 500.0)

@@ -84,6 +84,9 @@ class RefereeAppearanceAssigner:
         assignments = {}
         for display_id, samples in sorted(by_tracklet.items()):
             summary = summarize_samples(samples)
+            # The decision is made after aggregating the whole display_track_id.
+            # A single yellow/blue frame is too easy to get from boards, boots or
+            # occlusion, so sample count is part of the criterion.
             summary["is_referee_palette"] = (
                 summary["score"] >= self.min_color_fraction
                 and summary["num_samples"] >= self.min_tracklet_frames
@@ -121,6 +124,9 @@ class RefereeAppearanceAssigner:
         team_unknown = track.get("team") in (None, 0)
         if team_unknown or team_confidence <= self.player_candidate_max_team_confidence:
             return True
+        # Roster-provided official colours are stronger than the built-in generic
+        # palette, so they may override a confident team colour when the score is
+        # high enough.
         return (
             self.trusted_color_ranges
             and self.trusted_color_override_team_confidence
@@ -206,6 +212,8 @@ def referee_color_ranges_from_roster(roster):
         if color is None:
             continue
         name = f"roster_{str(color).strip().lower().replace('#', '').replace(' ', '_')}"
+        # The roster decides which official colours are trusted for this match.
+        # This avoids hard-coding "yellow referee" across competitions.
         ranges.update(color_to_ranges(color, name=name))
     return ranges
 

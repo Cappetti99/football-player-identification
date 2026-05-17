@@ -4,7 +4,12 @@ import numpy as np
 
 
 class JerseyTemplateMatcher:
-    """Weak jersey-number scorer based on digit silhouettes from a font sheet."""
+    """Weak jersey-number scorer based on digit silhouettes from a font sheet.
+
+    This complements OCR rather than replacing it. It is useful when the jersey
+    font is known and EasyOCR/MMOCR confuse a digit shape, but its output still
+    goes through the same conservative voting and roster checks.
+    """
 
     def __init__(
         self,
@@ -60,6 +65,8 @@ def extract_digit_templates(image, template_size=(48, 72)):
 
     gray = ensure_gray_uint8(image)
     h, w = gray.shape[:2]
+    # The supplied sheet contains extra visual context; the digit rows are the
+    # stable source, so extraction deliberately focuses on the central band.
     top = int(h * 0.34)
     bottom = int(h * 0.75)
     zone = gray[top:bottom, :]
@@ -157,6 +164,8 @@ def score_components(components, templates, template_size=(48, 72), polarity=Non
             )
 
     ordered = sorted(normalized, key=lambda item: item["x"])
+    # A two-digit jersey is scored as a pair, not as two independent winners:
+    # spacing and vertical alignment help reject accidental blobs on the kit.
     for left_index, left in enumerate(ordered):
         for right in ordered[left_index + 1 :]:
             if not plausible_digit_pair(left, right):
@@ -273,6 +282,8 @@ def dedupe_candidates(candidates, max_candidates):
 
 
 def prefer_two_digit_candidates(candidates):
+    # Broadcast crops often expose only one digit, but if a plausible two-digit
+    # number exists it is usually more useful for roster identity than singles.
     two_digit = [candidate for candidate in candidates if int(candidate["jersey_number"]) >= 10]
     return two_digit if two_digit else candidates
 
@@ -280,6 +291,8 @@ def prefer_two_digit_candidates(candidates):
 def threshold_polarities(gray):
     import cv2
 
+    # Kits differ by contrast: Roma red/yellow, Verona white/blue, goalkeeper
+    # black, etc. Running both polarities avoids hard-coding "dark on light".
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     _, bright = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     dark = cv2.bitwise_not(bright)
@@ -323,6 +336,8 @@ def normalize_mask(mask, template_size=(48, 72)):
     canvas = np.zeros((target_h, target_w), dtype=bool)
     if len(xs) == 0 or len(ys) == 0:
         return canvas
+    # Centering the tight digit crop makes IoU compare shape rather than the
+    # detector's exact crop coordinates.
     crop = mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
     h, w = crop.shape[:2]
     scale = min((target_w - 4) / max(w, 1), (target_h - 4) / max(h, 1))

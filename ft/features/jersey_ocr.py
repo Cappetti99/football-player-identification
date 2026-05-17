@@ -8,7 +8,11 @@ from ft.features.jersey_template import JerseyTemplateMatcher
 
 
 class JerseyOCR:
-    """Optional OCR over player crops, aggregated by display_track_id."""
+    """Optional OCR over player crops, aggregated by display_track_id.
+
+    OCR backends are used as proposal generators. The final jersey number comes
+    from crop-level aggregation and tracklet voting, not from a single OCR call.
+    """
 
     def __init__(
         self,
@@ -96,6 +100,9 @@ class JerseyOCR:
             selected = []
             detections = []
             for pass_index in range(self.temporal_passes):
+                # Each pass samples a different temporal offset. This gives long
+                # tracklets several chances to expose the jersey without reading
+                # every crop in a long broadcast sequence.
                 pass_rows = select_spread_crops(
                     usable_items,
                     self.max_crops_per_tracklet,
@@ -169,6 +176,9 @@ class JerseyOCR:
     def _voting_detections(self, detections):
         if not self.aggregate_by_crop:
             return detections
+        # Multiple variants of the same crop often produce duplicate OCR hits.
+        # Collapsing them first prevents one good frame from dominating the
+        # whole tracklet vote just because it had many preprocessing variants.
         return aggregate_detections_by_crop(
             detections,
             min_raw_confidence=self.min_raw_confidence,
@@ -182,6 +192,8 @@ class JerseyOCR:
         for backend in requested:
             if backend == "mmocr":
                 try:
+                    # In mmocr_easyocr mode, failure here is not fatal: the loop
+                    # continues to EasyOCR so the pipeline remains usable.
                     self.backend_name = "mmocr"
                     return MMOCRBackend(
                         device=self.mmocr_device or ("cuda:0" if self.easyocr_gpu else "cpu"),
@@ -237,6 +249,8 @@ class JerseyOCR:
             Path.cwd() / path,
             Path(__file__).resolve().parents[2] / path,
         ]
+        # Runs can start from the repository root or from an installed package.
+        # Both locations are checked to avoid fragile relative paths on SSH.
         for candidate in candidates:
             if candidate.exists():
                 return candidate

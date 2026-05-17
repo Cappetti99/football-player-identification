@@ -22,6 +22,12 @@ from ft.visualization.overlay import draw_overlay
 
 
 def run_pipeline(config):
+    """Run the full pipeline and let the W&B helper record success/failure.
+
+    The implementation below deliberately keeps W&B outside the core logic so
+    the same pipeline can run locally, on SSH, or in tests without changing the
+    identity code.
+    """
     video_id = Path(config["video_path"]).stem
     wandb_logger = WandbLogger.from_config(config, video_id)
     try:
@@ -59,6 +65,9 @@ def _run_pipeline_impl(config):
     calibrator.apply_tracks(tracks)
     print(f"FT calibration: {calibrator.source}", flush=True)
 
+    # First colour pass: gives the linker early team/role context. These labels
+    # are allowed to be imperfect because a second pass runs after display IDs
+    # have been stabilized.
     team_assignments = {}
     if config["team"].get("enabled", True):
         team_cfg = {k: v for k, v in config["team"].items() if k != "enabled"}
@@ -84,6 +93,8 @@ def _run_pipeline_impl(config):
         TrackletLinker.ensure_display_ids(tracks)
         linking_diagnostics = {"enabled": False, "status": "disabled"}
 
+    # Second colour pass: linking can merge raw IDs into a display_track_id, so
+    # team/referee votes are recomputed on the final tracklet grouping.
     if config["team"].get("enabled", True):
         team_cfg = {k: v for k, v in config["team"].items() if k != "enabled"}
         team_assignments = TeamAssigner(**team_cfg).fit_apply(frames, tracks)
@@ -105,6 +116,8 @@ def _run_pipeline_impl(config):
 
     semantic_groups = SemanticGroupAssigner().apply(tracks)
 
+    # Export before identity so OCR and visual features operate on the exact
+    # crops and per-frame metadata that will later be auditable in artifacts.
     exporter = ArtifactExporter(
         artifacts_dir,
         video_id,
@@ -150,6 +163,8 @@ def _run_pipeline_impl(config):
         )
         jersey_assignments, jersey_diagnostics = ocr.recognize(rows)
         if config["jersey_ocr"].get("roster_aware", True):
+            # OCR is intentionally treated as a noisy proposal generator. The
+            # roster filter removes impossible numbers before identity sees them.
             roster_filter = RosterAwareOCRFilter(
                 roster,
                 mode=config["jersey_ocr"].get("roster_filter_mode", "degrade"),
@@ -196,6 +211,8 @@ def _run_pipeline_impl(config):
     summaries = identifier.summarize(rows)
     assignments, candidate_scores = identifier.assign(summaries)
     apply_assignments(tracks, assignments)
+    # Hard constraints run after Hungarian because they can invalidate otherwise
+    # plausible assignments when per-frame evidence exposes a contradiction.
     constraints_diagnostics = enforce_identity_constraints(
         tracks,
         roster,

@@ -49,6 +49,8 @@ def extract_from_crop(crop):
         return None
     import cv2
 
+    # HSV histograms are intentionally simple and deterministic. They are used
+    # as weak continuity evidence, not as a replacement for a proper ReID model.
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     hist_h = cv2.calcHist([hsv], [0], None, [12], [0, 180]).flatten()
     hist_s = cv2.calcHist([hsv], [1], None, [8], [0, 256]).flatten()
@@ -70,6 +72,8 @@ def mean_embedding(values):
     norm = np.linalg.norm(mean)
     if norm <= 0:
         return None
+    # Re-normalize after averaging so cosine similarity stays comparable across
+    # short and long tracklets.
     return (mean / norm).astype(float).tolist()
 
 

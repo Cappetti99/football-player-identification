@@ -25,7 +25,9 @@ class YoloByteTracker:
     """YOLO detector plus ByteTrack association.
 
     Output format is a plain dictionary so downstream modules stay independent
-    from Ultralytics and Supervision internals.
+    from Ultralytics and Supervision internals. The tracker produces only weak
+    roles from detector classes; later modules are responsible for semantic
+    corrections such as referee and goalkeeper kit colours.
     """
 
     def __init__(
@@ -87,6 +89,8 @@ class YoloByteTracker:
     def run(self, frames, batch_size=20):
         tracks = {"players": [], "referees": [], "ball": []}
         for start in range(0, len(frames), batch_size):
+            # Detection is batched for GPU throughput, but ByteTrack still
+            # receives frames in order so its temporal state remains valid.
             results = self.model.predict(
                 frames[start : start + batch_size],
                 conf=self.ball_confidence,
@@ -123,7 +127,9 @@ class YoloByteTracker:
                 keep.append(float(confidence) >= threshold)
             detections = detections[np.asarray(keep, dtype=bool)]
 
-        # ByteTrack follows athletes/referees. Ball is selected separately.
+        # ByteTrack follows athletes/referees. Ball detections are too small and
+        # intermittent for the same association logic, so they are selected
+        # separately and interpolated after the pass.
         tracked_input = detections
         if len(tracked_input) > 0:
             keep_track = [
@@ -167,6 +173,8 @@ class YoloByteTracker:
             area_ratio = (width * height) / frame_area if frame_area > 0 else 1.0
             if area_ratio > self.ball_max_area_ratio:
                 continue
+            # Low ball confidence is tolerated, but large false positives are
+            # strongly penalized because logos/boots can otherwise win.
             size_penalty = (
                 area_ratio / self.ball_max_area_ratio
                 if self.ball_max_area_ratio > 0
@@ -205,6 +213,8 @@ class YoloByteTracker:
             for value in values
         ]
         df = pd.DataFrame(values, columns=["x1", "y1", "x2", "y2"])
+        # Ball position is only a contextual cue for visualization/analysis;
+        # interpolation should not feed back into player identity.
         df = df.interpolate().bfill().ffill()
         return [
             ({1: {"bbox": row.tolist(), "interpolated": True}} if not row.isna().any() else {})

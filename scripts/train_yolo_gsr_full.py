@@ -76,6 +76,9 @@ def prepare_dataset(args, output_dir):
         raise FileNotFoundError(f"No Labels-GameState.json files found under {gsr_dir}")
 
     class_names = CLASS_NAMES[args.mode]
+    # The same SoccerNet-GSR annotations can be collapsed into different class
+    # spaces. For the thesis runs, person_ball keeps detection robust and leaves
+    # role recovery to the semantic pipeline.
     stats = {
         "mode": args.mode,
         "class_names": class_names,
@@ -139,6 +142,8 @@ def export_sequence(args, label_path, output_dir, class_names):
         role = resolve_role(annotation, categories_by_id)
         class_id = map_role_to_class_id(role, args.mode, include_other=args.include_other_as_person)
         if class_id is None:
+            # Keep skipped-role counts in the summary so dataset conversions are
+            # auditable when changing class mappings.
             skipped_rows.append({"skipped_role": role or "unknown"})
             continue
 
@@ -250,6 +255,8 @@ def bbox_to_yolo(bbox, image_width, image_height, min_box_area):
 
 def manifest_row(label_path, frame_name, image, annotation, role, class_id, class_name):
     attributes = annotation.get("attributes") or {}
+    # The manifest is not consumed by YOLO. It keeps semantic labels available
+    # for later OCR/ReID/evaluation experiments without re-parsing GSR JSON.
     return {
         "sequence": label_path.parent.name,
         "split": infer_split(label_path),
@@ -313,6 +320,8 @@ def link_or_copy(source, destination, copy_images):
     if copy_images:
         shutil.copy2(source, destination)
     else:
+        # Symlinks keep the prepared dataset small; pass --copy-images only when
+        # the training machine cannot see the original SoccerNet-GSR tree.
         destination.symlink_to(source.resolve())
 
 

@@ -6,7 +6,11 @@ from ft.features.referee import color_to_ranges, normalize_color_ranges, palette
 
 
 class GoalkeeperAppearanceAssigner:
-    """Assign goalkeeper role from roster-provided kit colors."""
+    """Assign goalkeeper role from roster-provided kit colors.
+
+    With a person/ball detector, goalkeeper is not a detector class. This module
+    recovers the role as a semantic cue from roster kit colours.
+    """
 
     def __init__(
         self,
@@ -46,6 +50,8 @@ class GoalkeeperAppearanceAssigner:
         summaries = {}
         for display_id, samples in sorted(by_tracklet.items()):
             summary = summarize_goalkeeper_samples(samples)
+            # Goalkeeper colours are evaluated at tracklet level. This prevents
+            # one bright frame from turning a regular player into a goalkeeper.
             summary["is_goalkeeper_palette"] = (
                 summary["team_id"] is not None
                 and summary["score"] >= self.min_color_fraction
@@ -80,6 +86,9 @@ class GoalkeeperAppearanceAssigner:
         previous_team = track.get("team")
         if previous_team == team_id:
             return
+        # This is intentionally gated by team_correction_min_score. It fixes
+        # cases where the team classifier assigns the goalkeeper to the opponent,
+        # without letting weak colour matches rewrite player teams.
         track["team"] = int(team_id)
         track["team_confidence"] = max(float(track.get("team_confidence", 0.0) or 0.0), score)
         track["team_evidence"] = {
@@ -110,6 +119,8 @@ def goalkeeper_color_ranges_by_team_from_roster(roster):
             continue
         team_id = int(team_id)
         name = f"team{team_id}_goalkeeper_{str(color).strip().lower().replace('#', '').replace(' ', '_')}"
+        # Ranges are stored per team because the same colour can mean different
+        # things across matches, and only the roster knows the intended keeper.
         ranges_by_team.setdefault(team_id, {}).update(color_to_ranges(color, name=name))
     return ranges_by_team
 
