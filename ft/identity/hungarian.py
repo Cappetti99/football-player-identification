@@ -20,8 +20,10 @@ class HungarianPlayerIdentifier:
         roster_path=None,
         unknown_threshold=0.55,
         enforce_unique_team_jersey=True,
-        reliable_jersey_min_votes=2,
-        reliable_jersey_min_confidence=0.5,
+        reliable_jersey_min_votes=5,
+        reliable_jersey_min_confidence=0.20,
+        reliable_jersey_min_head_confidence=0.55,
+        reliable_jersey_min_winner_margin=0.10,
         goalkeeper_number_one_prior=True,
         number_one_goalkeeper_bonus=0.08,
         number_one_non_goalkeeper_penalty=0.08,
@@ -33,12 +35,17 @@ class HungarianPlayerIdentifier:
         strong_evidence_min_visual_similarity=0.82,
         strong_evidence_min_tracklet_frames=45,
         strong_evidence_max_position_distance=18.0,
+        goalkeeper_singleton_gate=True,
+        goalkeeper_singleton_min_team_confidence=0.75,
+        goalkeeper_singleton_min_tracklet_frames=30,
     ):
         self.roster = load_roster(roster_path)
         self.unknown_threshold = float(unknown_threshold)
         self.enforce_unique_team_jersey = bool(enforce_unique_team_jersey)
         self.reliable_jersey_min_votes = int(reliable_jersey_min_votes)
         self.reliable_jersey_min_confidence = float(reliable_jersey_min_confidence)
+        self.reliable_jersey_min_head_confidence = float(reliable_jersey_min_head_confidence)
+        self.reliable_jersey_min_winner_margin = float(reliable_jersey_min_winner_margin)
         self.goalkeeper_number_one_prior = bool(goalkeeper_number_one_prior)
         self.number_one_goalkeeper_bonus = float(number_one_goalkeeper_bonus)
         self.number_one_non_goalkeeper_penalty = float(number_one_non_goalkeeper_penalty)
@@ -50,6 +57,9 @@ class HungarianPlayerIdentifier:
         self.strong_evidence_min_visual_similarity = float(strong_evidence_min_visual_similarity)
         self.strong_evidence_min_tracklet_frames = int(strong_evidence_min_tracklet_frames)
         self.strong_evidence_max_position_distance = float(strong_evidence_max_position_distance)
+        self.goalkeeper_singleton_gate = bool(goalkeeper_singleton_gate)
+        self.goalkeeper_singleton_min_team_confidence = float(goalkeeper_singleton_min_team_confidence)
+        self.goalkeeper_singleton_min_tracklet_frames = int(goalkeeper_singleton_min_tracklet_frames)
         if self.enforce_unique_team_jersey:
             validate_unique_team_jersey(self.roster)
 
@@ -67,16 +77,28 @@ class HungarianPlayerIdentifier:
             jerseys = [row.get("jersey_number") for row in items if row.get("jersey_number") not in (None, -1)]
             jersey_number = mode(jerseys)
             jersey_distribution = aggregate_jersey_distribution(items)
+            jersey_raw_candidates = aggregate_jersey_distribution(items, fields=("jersey_candidates",))
             positions = [row.get("position_pitch") for row in items if row.get("position_pitch") is not None]
             visual_values = [row.get("visual_embedding") for row in items if row.get("visual_embedding") is not None]
+            roles = [row.get("role_detection") for row in items if row.get("role_detection")]
+            semantic_groups = [row.get("semantic_group_id") for row in items if row.get("semantic_group_id") is not None]
+            goalkeeper_matches = [bool(row.get("goalkeeper_palette_match", False)) for row in items]
+            goalkeeper_scores = [row.get("goalkeeper_like_score", 0.0) for row in items if row.get("goalkeeper_like_score") is not None]
+            goalkeeper_teams = [row.get("goalkeeper_like_team") for row in items if row.get("goalkeeper_like_team") is not None]
             summary = {
                 "track_id": int(track_id),
                 "raw_track_ids": sorted({int(row.get("raw_track_id", row["track_id"])) for row in items}),
+                "role_detection": mode(roles),
+                "semantic_group_id": mode(semantic_groups),
                 "team_id": mode(team_ids),
                 "team_votes": count_mode(team_ids)[1],
                 "mean_team_confidence": mean([row.get("team_confidence", 0.0) for row in items if row.get("team_id") is not None]),
+                "goalkeeper_palette_match": mean(goalkeeper_matches) >= 0.5 if goalkeeper_matches else False,
+                "goalkeeper_like_score": mean(goalkeeper_scores),
+                "goalkeeper_like_team": mode(goalkeeper_teams),
                 "jersey_number": jersey_number,
                 "jersey_distribution": jersey_distribution,
+                "jersey_raw_candidates": jersey_raw_candidates,
                 "jersey_roster_mass": mean(
                     row.get("jersey_roster_mass", 0.0)
                     for row in items
@@ -89,6 +111,16 @@ class HungarianPlayerIdentifier:
                 ),
                 "jersey_confidence": mean(
                     row.get("jersey_confidence", 0.0)
+                    for row in items
+                    if row.get("jersey_number") == jersey_number
+                ),
+                "jersey_head_confidence": mean(
+                    row.get("jersey_head_confidence", 0.0)
+                    for row in items
+                    if row.get("jersey_number") == jersey_number
+                ),
+                "jersey_winner_margin": mean(
+                    row.get("jersey_winner_margin", 0.0)
                     for row in items
                     if row.get("jersey_number") == jersey_number
                 ),
@@ -186,6 +218,7 @@ class HungarianPlayerIdentifier:
                         "tracklet_jersey_confidence": tracklet.get("jersey_confidence"),
                         "tracklet_jersey_votes": tracklet.get("jersey_votes"),
                         "tracklet_jersey_distribution": tracklet.get("jersey_distribution"),
+                        "tracklet_jersey_raw_candidates": tracklet.get("jersey_raw_candidates"),
                         "tracklet_jersey_roster_mass": tracklet.get("jersey_roster_mass"),
                         "tracklet_frames": tracklet.get("num_frames"),
                         "mean_crop_quality": tracklet.get("mean_crop_quality"),
@@ -211,6 +244,7 @@ class HungarianPlayerIdentifier:
             "goalkeeper_number_one_prior": 0.0,
             "position_prior": 0.0,
             "visual": 0.0,
+            "goalkeeper_role": 0.0,
             "tracklet_length": 0.0,
             "crop_quality": 0.0,
         }
@@ -268,6 +302,12 @@ class HungarianPlayerIdentifier:
             visual_similarity = 1.0 - 2.0 * visual_cost
             components["visual"] = min(0.30, 0.30 * visual_cost)
 
+        if has_goalkeeper_tracklet_evidence(tracklet):
+            if is_goalkeeper_player(player) and same_team(tracklet, player):
+                components["goalkeeper_role"] = -0.10
+            elif same_team(tracklet, player):
+                components["goalkeeper_role"] = 0.12
+
         if tracklet.get("num_frames", 0) < 10:
             components["tracklet_length"] = 0.15
         components["crop_quality"] = -0.15 * clamp(tracklet.get("mean_crop_quality", 0.0), 0.0, 1.0)
@@ -284,11 +324,19 @@ class HungarianPlayerIdentifier:
         }
 
     def _has_reliable_jersey(self, tracklet):
-        return (
-            tracklet.get("jersey_number") is not None
-            and int(tracklet.get("jersey_votes") or 0) >= self.reliable_jersey_min_votes
-            and float(tracklet.get("jersey_confidence") or 0.0) >= self.reliable_jersey_min_confidence
-        )
+        if tracklet.get("jersey_number") is None:
+            return False
+        if int(tracklet.get("jersey_votes") or 0) < self.reliable_jersey_min_votes:
+            return False
+        if float(tracklet.get("jersey_confidence") or 0.0) < self.reliable_jersey_min_confidence:
+            return False
+        head_confidence = tracklet.get("jersey_head_confidence")
+        if head_confidence is not None and float(head_confidence or 0.0) < self.reliable_jersey_min_head_confidence:
+            return False
+        winner_margin = tracklet.get("jersey_winner_margin")
+        if winner_margin is not None and float(winner_margin or 0.0) < self.reliable_jersey_min_winner_margin:
+            return False
+        return True
 
     def assignment_gate(self, tracklet, player, details):
         """Decide whether a low-cost match has enough evidence to be trusted."""
@@ -296,6 +344,7 @@ class HungarianPlayerIdentifier:
             return {"pass": True, "reason": "gate_disabled"}
 
         reliable_jersey = self._has_reliable_jersey_match(tracklet, player)
+        goalkeeper_singleton = self._has_goalkeeper_singleton_match(tracklet, player)
         team_match = same_team(tracklet, player)
         team_confidence = float(tracklet.get("mean_team_confidence", 0.0) or 0.0)
         visual_similarity = details.get("visual_similarity")
@@ -313,14 +362,17 @@ class HungarianPlayerIdentifier:
 
         if reliable_jersey:
             reason = "reliable_jersey"
+        elif goalkeeper_singleton:
+            reason = "goalkeeper_roster_singleton"
         elif strong_combined:
             reason = "strong_team_visual_trajectory"
         else:
             reason = "insufficient_assignment_evidence"
         return {
-            "pass": bool(reliable_jersey or strong_combined),
+            "pass": bool(reliable_jersey or goalkeeper_singleton or strong_combined),
             "reason": reason,
             "reliable_jersey": bool(reliable_jersey),
+            "goalkeeper_singleton": bool(goalkeeper_singleton),
             "strong_combined": bool(strong_combined),
             "team_match": bool(team_match),
             "team_confidence": float(team_confidence),
@@ -333,11 +385,47 @@ class HungarianPlayerIdentifier:
         expected = player.get("jersey_number")
         if expected is None:
             return False
+        raw_candidates = tracklet.get("jersey_raw_candidates") or []
+        candidate_score = jersey_candidate_score(tracklet, expected, field="jersey_raw_candidates")
+        if raw_candidates:
+            # Roster filtering can promote a valid alternative after dropping
+            # impossible numbers. The gate should still look at the raw OCR
+            # strength, otherwise weak second-place candidates become identities.
+            return candidate_score is not None and candidate_score >= self.reliable_jersey_min_candidate_score
         candidate_score = jersey_candidate_score(tracklet, expected)
         if candidate_score is not None and candidate_score >= self.reliable_jersey_min_candidate_score:
             return True
         observed = tracklet.get("jersey_number")
         return observed is not None and int(observed) == int(expected) and self._has_reliable_jersey(tracklet)
+
+    def _has_goalkeeper_singleton_match(self, tracklet, player):
+        if not self.goalkeeper_singleton_gate:
+            return False
+        if not same_team(tracklet, player):
+            return False
+        if not is_goalkeeper_player(player):
+            return False
+        if not has_goalkeeper_tracklet_evidence(tracklet):
+            return False
+        team_id = player.get("team_id")
+        if team_id is None:
+            return False
+        if int(tracklet.get("num_frames") or 0) < self.goalkeeper_singleton_min_tracklet_frames:
+            return False
+        team_confidence = float(tracklet.get("mean_team_confidence") or 0.0)
+        if team_confidence < self.goalkeeper_singleton_min_team_confidence:
+            return False
+        goalkeeper_like_team = tracklet.get("goalkeeper_like_team")
+        if goalkeeper_like_team is not None and int(goalkeeper_like_team) != int(team_id):
+            return False
+        goalkeepers = [
+            candidate
+            for candidate in self.roster
+            if is_goalkeeper_player(candidate)
+            and candidate.get("team_id") is not None
+            and int(candidate["team_id"]) == int(team_id)
+        ]
+        return len(goalkeepers) == 1 and goalkeepers[0].get("player_id") == player.get("player_id")
 
 
 def is_non_player_tracklet(items):
@@ -354,6 +442,22 @@ def same_team(tracklet, player):
         and player.get("team_id") is not None
         and int(tracklet["team_id"]) == int(player["team_id"])
     )
+
+
+def is_goalkeeper_player(player):
+    role = str((player or {}).get("role") or "").lower()
+    return role in {"goalkeeper", "keeper", "gk"}
+
+
+def has_goalkeeper_tracklet_evidence(tracklet):
+    role = str(tracklet.get("role_detection") or "").lower()
+    if role in {"goalkeeper", "keeper", "gk"}:
+        return True
+    if tracklet.get("semantic_group_id") in {3, 4}:
+        return True
+    if bool(tracklet.get("goalkeeper_palette_match", False)):
+        return True
+    return float(tracklet.get("goalkeeper_like_score") or 0.0) >= 0.20
 
 
 def unknown_assignments(summaries, status):
@@ -415,12 +519,16 @@ def mean_position(values):
     return np.asarray(values, dtype=float).mean(axis=0).tolist()
 
 
-def aggregate_jersey_distribution(items):
+def aggregate_jersey_distribution(items, fields=("jersey_distribution", "jersey_candidates")):
     """Merge OCR candidate distributions across the frames of one tracklet."""
     scores = defaultdict(float)
     votes = defaultdict(int)
     for row in items:
-        distribution = row.get("jersey_distribution") or row.get("jersey_candidates") or []
+        distribution = []
+        for field in fields:
+            distribution = row.get(field) or []
+            if distribution:
+                break
         if isinstance(distribution, str):
             try:
                 import json
@@ -448,10 +556,10 @@ def aggregate_jersey_distribution(items):
     ]
 
 
-def jersey_candidate_score(tracklet, expected):
+def jersey_candidate_score(tracklet, expected, field="jersey_distribution"):
     if expected is None:
         return None
-    for candidate in tracklet.get("jersey_distribution") or []:
+    for candidate in tracklet.get(field) or []:
         if int(candidate.get("jersey_number")) == int(expected):
             confidence = clamp(candidate.get("confidence", 0.0), 0.0, 1.0)
             votes = int(candidate.get("votes", 0) or 0)

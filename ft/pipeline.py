@@ -8,11 +8,12 @@ from ft.features.goalkeeper import GoalkeeperAppearanceAssigner, goalkeeper_colo
 from ft.features.jersey_ocr import JerseyOCR
 from ft.features.referee import RefereeAppearanceAssigner, referee_color_ranges_from_roster
 from ft.features.roster_aware_ocr import RosterAwareOCRFilter
-from ft.features.team import TeamAssigner
+from ft.features.team import TeamAssigner, team_color_ranges_by_team_from_roster
 from ft.features.visual import VisualFeatureExtractor
 from ft.identity.constraints import enforce_identity_constraints
 from ft.identity.hungarian import HungarianPlayerIdentifier, apply_assignments
 from ft.identity.roster import load_roster, validate_unique_team_jersey
+from ft.linking.jersey_identity_linker import JerseyIdentityLinker
 from ft.linking.tracklet_linker import TrackletLinker
 from ft.tracking.yolo_bytetrack import YoloByteTracker
 from ft.tracking.yolo_strongsort import YoloStrongSortTracker
@@ -70,7 +71,7 @@ def _run_pipeline_impl(config):
     # have been stabilized.
     team_assignments = {}
     if config["team"].get("enabled", True):
-        team_cfg = {k: v for k, v in config["team"].items() if k != "enabled"}
+        team_cfg = team_config(config, roster)
         team_assignments = TeamAssigner(**team_cfg).fit_apply(frames, tracks)
 
     referee_diagnostics = {"enabled": False, "status": "disabled"}
@@ -96,7 +97,7 @@ def _run_pipeline_impl(config):
     # Second colour pass: linking can merge raw IDs into a display_track_id, so
     # team/referee votes are recomputed on the final tracklet grouping.
     if config["team"].get("enabled", True):
-        team_cfg = {k: v for k, v in config["team"].items() if k != "enabled"}
+        team_cfg = team_config(config, roster)
         team_assignments = TeamAssigner(**team_cfg).fit_apply(frames, tracks)
 
     if config.get("referee", {}).get("enabled", True):
@@ -150,7 +151,7 @@ def _run_pipeline_impl(config):
             template_matching=config["jersey_ocr"].get("template_matching", False),
             template_font_image=config["jersey_ocr"].get("template_font_image"),
             template_min_score=config["jersey_ocr"].get("template_min_score", 0.62),
-            template_weight=config["jersey_ocr"].get("template_weight", 0.25),
+            template_weight=config["jersey_ocr"].get("template_weight", 0.03),
             template_max_candidates=config["jersey_ocr"].get("template_max_candidates", 4),
             aggregate_by_crop=config["jersey_ocr"].get("aggregate_by_crop", True),
             max_candidates_per_crop=config["jersey_ocr"].get("max_candidates_per_crop", 3),
@@ -177,6 +178,7 @@ def _run_pipeline_impl(config):
             jersey_assignments, roster_filter_diagnostics = roster_filter.apply(jersey_assignments, rows)
             jersey_diagnostics["roster_filter"] = roster_filter_diagnostics
         _apply_jersey(jersey_assignments, rows, tracks)
+        jersey_linking_diagnostics = apply_jersey_identity_linking(config, tracks, rows)
         print(
             "FT jersey OCR:"
             f" status={jersey_diagnostics.get('status')}"
@@ -188,6 +190,7 @@ def _run_pipeline_impl(config):
     else:
         jersey_assignments = {}
         jersey_diagnostics = {"enabled": False, "status": "disabled"}
+        jersey_linking_diagnostics = {"enabled": False, "status": "jersey_ocr_disabled"}
         print("FT jersey OCR: disabled", flush=True)
 
     identifier = HungarianPlayerIdentifier(
@@ -196,6 +199,8 @@ def _run_pipeline_impl(config):
         enforce_unique_team_jersey=config["identity"].get("enforce_unique_team_jersey", True),
         reliable_jersey_min_votes=config["identity"].get("reliable_jersey_min_votes", 2),
         reliable_jersey_min_confidence=config["identity"].get("reliable_jersey_min_confidence", 0.5),
+        reliable_jersey_min_head_confidence=config["identity"].get("reliable_jersey_min_head_confidence", 0.60),
+        reliable_jersey_min_winner_margin=config["identity"].get("reliable_jersey_min_winner_margin", 0.10),
         goalkeeper_number_one_prior=config["identity"].get("goalkeeper_number_one_prior", True),
         number_one_goalkeeper_bonus=config["identity"].get("number_one_goalkeeper_bonus", 0.08),
         number_one_non_goalkeeper_penalty=config["identity"].get("number_one_non_goalkeeper_penalty", 0.08),
@@ -207,6 +212,9 @@ def _run_pipeline_impl(config):
         strong_evidence_min_visual_similarity=config["identity"].get("strong_evidence_min_visual_similarity", 0.82),
         strong_evidence_min_tracklet_frames=config["identity"].get("strong_evidence_min_tracklet_frames", 45),
         strong_evidence_max_position_distance=config["identity"].get("strong_evidence_max_position_distance", 18.0),
+        goalkeeper_singleton_gate=config["identity"].get("goalkeeper_singleton_gate", True),
+        goalkeeper_singleton_min_team_confidence=config["identity"].get("goalkeeper_singleton_min_team_confidence", 0.75),
+        goalkeeper_singleton_min_tracklet_frames=config["identity"].get("goalkeeper_singleton_min_tracklet_frames", 30),
     )
     summaries = identifier.summarize(rows)
     assignments, candidate_scores = identifier.assign(summaries)
@@ -221,6 +229,7 @@ def _run_pipeline_impl(config):
         frame_team_split_enabled=config["identity"].get("frame_team_split_enabled", True),
         frame_team_split_min_frames=config["identity"].get("frame_team_split_min_frames", 8),
         frame_team_split_max_gap=config["identity"].get("frame_team_split_max_gap", 2),
+        global_team_jersey_owner=config["identity"].get("global_team_jersey_owner", True),
     )
 
     final_rows = exporter.export_tracklets(frames, tracks, stage="final")
@@ -237,6 +246,7 @@ def _run_pipeline_impl(config):
             "goalkeeper_colour": goalkeeper_diagnostics,
             "semantic_groups": semantic_groups,
             "jersey_ocr": jersey_diagnostics,
+            "jersey_identity_linking": jersey_linking_diagnostics,
             "constraints": constraints_diagnostics,
             "tracklet_summaries": summaries,
             "assignments": {str(k): v for k, v in assignments.items()},
@@ -247,6 +257,7 @@ def _run_pipeline_impl(config):
     write_json(constraints_diagnostics, artifacts_dir / "metadata" / f"{video_id}_constraints.json")
     write_json(referee_diagnostics, artifacts_dir / "metadata" / f"{video_id}_referee_colour.json")
     write_json(goalkeeper_diagnostics, artifacts_dir / "metadata" / f"{video_id}_goalkeeper_colour.json")
+    write_json(jersey_linking_diagnostics, artifacts_dir / "metadata" / f"{video_id}_jersey_identity_linking.json")
     write_table(summaries, artifacts_dir / "metadata" / f"{video_id}_tracklet_summaries.csv")
     write_table(candidate_scores, artifacts_dir / "metadata" / f"{video_id}_candidate_scores.csv")
     write_json(jersey_diagnostics, artifacts_dir / "metadata" / f"{video_id}_jersey_ocr.json")
@@ -274,6 +285,15 @@ def run_from_config(path):
     return run_pipeline(load_config(path))
 
 
+def team_config(config, roster):
+    team_cfg = {k: v for k, v in config.get("team", {}).items() if k != "enabled"}
+    roster_color_ranges = team_color_ranges_by_team_from_roster(roster)
+    if roster_color_ranges:
+        configured_ranges = team_cfg.get("color_ranges_by_team") or {}
+        team_cfg["color_ranges_by_team"] = {**configured_ranges, **roster_color_ranges}
+    return team_cfg
+
+
 def referee_config(config, roster):
     referee_cfg = {k: v for k, v in config.get("referee", {}).items() if k != "enabled"}
     roster_color_ranges = referee_color_ranges_from_roster(roster)
@@ -290,6 +310,21 @@ def goalkeeper_config(config, roster):
         configured_ranges = goalkeeper_cfg.get("color_ranges_by_team") or {}
         goalkeeper_cfg["color_ranges_by_team"] = {**configured_ranges, **roster_color_ranges}
     return goalkeeper_cfg
+
+
+def apply_jersey_identity_linking(config, tracks, rows):
+    cfg = config.get("jersey_identity_linking", {})
+    if not cfg.get("enabled", True):
+        return {"enabled": False, "status": "disabled"}
+    linker_cfg = {key: value for key, value in cfg.items() if key != "enabled"}
+    diagnostics = JerseyIdentityLinker(**linker_cfg).apply(tracks, rows=rows)
+    print(
+        "FT jersey identity linking:"
+        f" links={len(diagnostics.get('accepted_links', []))}"
+        f" changed_rows={diagnostics.get('changed_rows', 0)}",
+        flush=True,
+    )
+    return diagnostics
 
 
 def build_tracker(config, model_path):
@@ -334,6 +369,9 @@ def _apply_jersey(jersey_assignments, rows, tracks):
             continue
         row["jersey_number"] = assignment["jersey_number"]
         row["jersey_confidence"] = assignment["confidence"]
+        row["jersey_head_confidence"] = assignment.get("head_confidence")
+        row["jersey_winner_margin"] = assignment.get("winner_margin")
+        row["jersey_winner_score_ratio"] = assignment.get("winner_score_ratio")
         row["jersey_votes"] = assignment["votes"]
         row["jersey_roster_filter"] = assignment.get("roster_filter")
         row["jersey_candidates"] = assignment.get("candidates")
@@ -347,6 +385,9 @@ def _apply_jersey(jersey_assignments, rows, tracks):
                 continue
             track["jersey_number"] = assignment["jersey_number"]
             track["jersey_confidence"] = assignment["confidence"]
+            track["jersey_head_confidence"] = assignment.get("head_confidence")
+            track["jersey_winner_margin"] = assignment.get("winner_margin")
+            track["jersey_winner_score_ratio"] = assignment.get("winner_score_ratio")
             track["jersey_votes"] = assignment["votes"]
             track["jersey_evidence"] = assignment
             track["jersey_roster_filter"] = assignment.get("roster_filter")

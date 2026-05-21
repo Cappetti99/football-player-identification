@@ -12,6 +12,7 @@ def enforce_identity_constraints(
     frame_team_split_enabled=True,
     frame_team_split_min_frames=8,
     frame_team_split_max_gap=2,
+    global_team_jersey_owner=True,
 ):
     """Apply hard consistency constraints to final per-frame identities.
 
@@ -32,6 +33,7 @@ def enforce_identity_constraints(
         "goalkeeper_only_jersey": [],
         "frame_team_conflicts": [],
         "display_track_splits": [],
+        "global_team_jersey_owners": [],
     }
     if not tracks.get("players"):
         return diagnostics
@@ -55,8 +57,11 @@ def enforce_identity_constraints(
             max_gap=frame_team_split_max_gap,
             diagnostics=diagnostics,
         )
+    if global_team_jersey_owner:
+        _enforce_global_team_jersey_owners(tracks, diagnostics)
     diagnostics["invalid_team_jersey_count"] = len(diagnostics["invalid_team_jersey"])
     diagnostics["duplicate_team_jersey_count"] = len(diagnostics["duplicate_team_jersey"])
+    diagnostics["global_team_jersey_owner_count"] = len(diagnostics["global_team_jersey_owners"])
     diagnostics["duplicate_player_id_count"] = len(diagnostics["duplicate_player_id"])
     diagnostics["duplicate_player_frame_count"] = len(diagnostics["duplicate_player_id"])
     diagnostics["semantic_group_correction_count"] = len(diagnostics["semantic_group_corrections"])
@@ -105,11 +110,14 @@ def _apply_frame_team_consistency(frame_num, frame_tracks, min_confidence, diagn
         )
         track["frame_team_conflict"] = True
         previous_team = track.get("team")
+        previous_team_evidence = track.get("team_evidence")
+        track["previous_team_evidence"] = previous_team_evidence
         track["team"] = int(frame_team)
         track["team_confidence"] = max(float(track.get("team_confidence", 0.0) or 0.0), confidence)
         track["team_evidence"] = {
             "source": "frame_team_consistency",
             "previous_team": previous_team,
+            "previous_team_evidence": previous_team_evidence,
             "frame_team": int(frame_team),
             "confidence": float(confidence),
             "margin": float(track.get("frame_team_margin", 0.0) or 0.0),
@@ -349,6 +357,10 @@ def _clear_duplicate_team_jerseys(frame_num, frame_tracks, diagnostics):
                     "kept_raw_track_id": int(keep_raw_id),
                     "cleared_display_track_id": int(track.get("display_track_id", raw_id)),
                     "kept_display_track_id": int(keep_track.get("display_track_id", keep_raw_id)),
+                    "cleared_player_id": track.get("player_id", "unknown"),
+                    "kept_player_id": keep_track.get("player_id", "unknown"),
+                    "cleared_rank": jersey_rank(track),
+                    "kept_rank": jersey_rank(keep_track),
                 }
             )
             _clear_jersey(
@@ -372,6 +384,79 @@ def _clear_duplicate_team_jerseys(frame_num, frame_tracks, diagnostics):
                         "kept_raw_track_id": int(keep_raw_id),
                     },
                 )
+
+
+def _enforce_global_team_jersey_owners(tracks, diagnostics):
+    """Keep one final owner for each team/jersey pair across the whole video."""
+    by_team_jersey = defaultdict(lambda: defaultdict(list))
+    for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
+        for raw_id, track in frame_tracks.items():
+            team = track.get("team")
+            jersey = track.get("jersey_number")
+            if team in (None, "", "None") or jersey in (None, "", "None", -1):
+                continue
+            try:
+                team = int(team)
+                jersey = int(jersey)
+                display_id = int(track.get("display_track_id", raw_id))
+            except (TypeError, ValueError):
+                continue
+            by_team_jersey[(team, jersey)][display_id].append((frame_num, raw_id, track))
+
+    for (team, jersey), by_display in sorted(by_team_jersey.items()):
+        if len(by_display) <= 1:
+            continue
+        keep_display_id, keep_items = max(
+            by_display.items(),
+            key=lambda item: global_jersey_owner_rank(item[1]),
+        )
+        kept_rank = global_jersey_owner_rank(keep_items)
+        for display_id, items in sorted(by_display.items()):
+            if display_id == keep_display_id:
+                continue
+            cleared_rank = global_jersey_owner_rank(items)
+            diagnostics["global_team_jersey_owners"].append(
+                {
+                    "reason": "global_duplicate_team_jersey_owner",
+                    "team_id": int(team),
+                    "jersey_number": int(jersey),
+                    "cleared_display_track_id": int(display_id),
+                    "kept_display_track_id": int(keep_display_id),
+                    "cleared_player_id": first_non_unknown_player_id(items),
+                    "kept_player_id": first_non_unknown_player_id(keep_items),
+                    "cleared_num_rows": int(len(items)),
+                    "kept_num_rows": int(len(keep_items)),
+                    "cleared_frame_span": frame_span(items),
+                    "kept_frame_span": frame_span(keep_items),
+                    "cleared_rank": cleared_rank,
+                    "kept_rank": kept_rank,
+                }
+            )
+            for _frame_num, _raw_id, track in items:
+                if track.get("jersey_number") not in (None, "", "None", -1):
+                    _clear_jersey(
+                        track,
+                        {
+                            "status": "cleared",
+                            "reason": "global_duplicate_team_jersey_owner",
+                            "team_id": int(team),
+                            "jersey_number": int(jersey),
+                            "cleared_display_track_id": int(display_id),
+                            "kept_display_track_id": int(keep_display_id),
+                        },
+                    )
+                if track.get("player_id") not in (None, "unknown"):
+                    _clear_identity(
+                        track,
+                        {
+                            "status": "cleared",
+                            "reason": "global_duplicate_team_jersey_owner",
+                            "team_id": int(team),
+                            "jersey_number": int(jersey),
+                            "cleared_display_track_id": int(display_id),
+                            "kept_display_track_id": int(keep_display_id),
+                        },
+                    )
 
 
 def _clear_duplicate_player_ids(frame_num, frame_tracks, player_roster, diagnostics):
@@ -435,17 +520,92 @@ def jersey_rank(track):
     area = 0.0
     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
         area = max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+    # Duplicate jersey resolution should be driven by jersey evidence first.
+    # Identity confidence is often downstream of OCR/roster matching, so putting
+    # it first can let a weak promoted number steal a stronger visible jersey.
     return (
         ref_penalty,
-        identity_confidence,
         goalkeeper_bonus,
         confidence,
         head_confidence,
-        votes,
         winner_margin,
+        votes,
+        identity_confidence,
         crop_quality,
         area,
     )
+
+
+def global_jersey_owner_rank(items):
+    tracks = [track for _frame_num, _raw_id, track in items]
+    ranks = [jersey_rank(track) for track in tracks]
+    best_rank = max(ranks) if ranks else tuple()
+    confidences = [jersey_confidence_value(track) for track in tracks]
+    head_confidences = [jersey_head_confidence_value(track) for track in tracks]
+    margins = [jersey_winner_margin_value(track) for track in tracks]
+    votes = [int(track.get("jersey_votes", 0) or 0) for track in tracks]
+    identity_confidences = [float(track.get("identity_confidence", 0.0) or 0.0) for track in tracks]
+    team_confidences = [float(track.get("team_confidence", 0.0) or 0.0) for track in tracks]
+    identity_rows = sum(1 for track in tracks if track.get("player_id") not in (None, "unknown"))
+    # Evidence quality comes before duration: a long weak OCR promotion should
+    # not keep a number over a shorter tracklet with clearer jersey evidence.
+    return best_rank + (
+        average(confidences),
+        average(head_confidences),
+        average(margins),
+        max(votes) if votes else 0,
+        average(votes),
+        int(identity_rows),
+        average(identity_confidences),
+        average(team_confidences),
+        int(len(items)),
+    )
+
+
+def jersey_confidence_value(track):
+    evidence = track.get("jersey_evidence") or {}
+    return float(evidence.get("confidence", track.get("jersey_confidence", 0.0)) or 0.0)
+
+
+def jersey_head_confidence_value(track):
+    evidence = track.get("jersey_evidence") or {}
+    return float(
+        evidence.get(
+            "head_confidence",
+            track.get("jersey_head_confidence", 0.0),
+        )
+        or 0.0
+    )
+
+
+def jersey_winner_margin_value(track):
+    evidence = track.get("jersey_evidence") or {}
+    return float(
+        evidence.get(
+            "winner_margin",
+            track.get("jersey_winner_margin", 0.0),
+        )
+        or 0.0
+    )
+
+
+def average(values):
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def first_non_unknown_player_id(items):
+    for _frame_num, _raw_id, track in items:
+        player_id = track.get("player_id")
+        if player_id not in (None, "unknown"):
+            return player_id
+    return "unknown"
+
+
+def frame_span(items):
+    frames = [int(frame_num) for frame_num, _raw_id, _track in items]
+    if not frames:
+        return None
+    return {"first": min(frames), "last": max(frames)}
 
 
 def _enforce_semantic_groups(frame_num, frame_tracks, player_roster, diagnostics):

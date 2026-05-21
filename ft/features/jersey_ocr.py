@@ -30,7 +30,7 @@ class JerseyOCR:
         template_matching=False,
         template_font_image=None,
         template_min_score=0.62,
-        template_weight=0.25,
+        template_weight=0.03,
         template_max_candidates=4,
         aggregate_by_crop=True,
         max_candidates_per_crop=3,
@@ -41,6 +41,7 @@ class JerseyOCR:
         mmocr_batch_size=8,
         progress_every=5,
     ):
+        self.requested_backend_name = backend
         self.backend_name = backend
         self.min_confidence = float(min_confidence)
         self.max_crops_per_tracklet = int(max_crops_per_tracklet)
@@ -65,20 +66,26 @@ class JerseyOCR:
         self.mmocr_rec = str(mmocr_rec)
         self.mmocr_batch_size = int(mmocr_batch_size)
         self.progress_every = int(progress_every or 0)
+        self.backends = []
         self.backend = None
         self.message = None
+        self.backend_attempts = []
         self.template_matcher = None
         self.template_message = None
 
     def recognize(self, rows):
-        self.backend = self._load_backend()
+        self.backends = self._load_backends()
+        self.backend = self.backends[0]["reader"] if self.backends else None
         self.template_matcher = self._load_template_matcher()
-        if self.backend is None and self.template_matcher is None:
+        if not self.backends and self.template_matcher is None:
             return {}, {
                 "enabled": True,
                 "status": "missing_backend",
                 "backend": self.backend_name,
+                "backends": [],
+                "requested_backend": self.requested_backend_name,
                 "message": self.message,
+                "backend_attempts": self.backend_attempts,
                 "template_matching": self._template_diagnostics(),
                 "tracklets": {},
             }
@@ -147,8 +154,11 @@ class JerseyOCR:
                 )
         return assignments, {
             "enabled": True,
-            "status": "ok" if self.backend is not None else "template_only",
-            "backend": self.backend_name if self.backend is not None else None,
+            "status": "ok" if self.backends else "template_only",
+            "requested_backend": self.requested_backend_name,
+            "backend": self.backend_name if self.backends else None,
+            "backends": [item["name"] for item in self.backends],
+            "backend_attempts": self.backend_attempts,
             "min_confidence": self.min_confidence,
             "max_crops_per_tracklet": self.max_crops_per_tracklet,
             "temporal_passes": self.temporal_passes,
@@ -186,43 +196,52 @@ class JerseyOCR:
             min_candidate_ratio=self.min_crop_candidate_ratio,
         )
 
-    def _load_backend(self):
-        requested = requested_backends(self.backend_name)
+    def _load_backends(self):
+        requested = requested_backends(self.requested_backend_name)
+        mode = backend_load_mode(self.requested_backend_name)
+        loaded_backends = []
         errors = []
         for backend in requested:
-            if backend == "mmocr":
-                try:
-                    # In mmocr_easyocr mode, failure here is not fatal: the loop
-                    # continues to EasyOCR so the pipeline remains usable.
-                    self.backend_name = "mmocr"
-                    return MMOCRBackend(
-                        device=self.mmocr_device or ("cuda:0" if self.easyocr_gpu else "cpu"),
-                        det=self.mmocr_det,
-                        rec=self.mmocr_rec,
-                        batch_size=self.mmocr_batch_size,
-                    )
-                except Exception as exc:
-                    errors.append(f"mmocr: {type(exc).__name__}: {exc}")
-            elif backend == "easyocr":
-                try:
-                    import easyocr
+            try:
+                loaded = self._load_backend_instance(backend)
+            except Exception as exc:
+                message = f"{backend}: {type(exc).__name__}: {exc}"
+                errors.append(message)
+                self.backend_attempts.append(
+                    {"backend": backend, "status": "failed", "message": message}
+                )
+                continue
+            loaded_backends.append({"name": backend, "reader": loaded})
+            self.backend_attempts.append({"backend": backend, "status": "ok"})
+            if mode == "fallback":
+                break
+        self.message = "; ".join(errors) if errors else None
+        self.backend_name = "+".join(item["name"] for item in loaded_backends) if loaded_backends else str(self.requested_backend_name)
+        return loaded_backends
 
-                    self.backend_name = "easyocr"
-                    return EasyOCRBackend(easyocr.Reader(["en"], gpu=self.easyocr_gpu), gpu=self.easyocr_gpu)
-                except Exception as exc:
-                    errors.append(f"easyocr: {type(exc).__name__}: {exc}")
-            elif backend == "pytesseract":
-                try:
-                    import pytesseract
+    def _load_backend_instance(self, backend):
+        if backend == "mmocr":
+            return MMOCRBackend(
+                device=self.mmocr_device or ("cuda:0" if self.easyocr_gpu else "cpu"),
+                det=self.mmocr_det,
+                rec=self.mmocr_rec,
+                batch_size=self.mmocr_batch_size,
+            )
+        if backend == "mmocr_rec":
+            return MMOCRRecognitionBackend(
+                device=self.mmocr_device or ("cuda:0" if self.easyocr_gpu else "cpu"),
+                rec=self.mmocr_rec,
+                batch_size=self.mmocr_batch_size,
+            )
+        if backend == "easyocr":
+            import easyocr
 
-                    self.backend_name = "pytesseract"
-                    return TesseractBackend(pytesseract)
-                except Exception as exc:
-                    errors.append(f"pytesseract: {type(exc).__name__}: {exc}")
-            else:
-                errors.append(f"{backend}: unsupported backend")
-        self.message = "; ".join(errors)
-        return None
+            return EasyOCRBackend(easyocr.Reader(["en"], gpu=self.easyocr_gpu), gpu=self.easyocr_gpu)
+        if backend == "pytesseract":
+            import pytesseract
+
+            return TesseractBackend(pytesseract)
+        raise ValueError("unsupported backend")
 
     def _load_template_matcher(self):
         if not self.template_matching:
@@ -278,19 +297,39 @@ class JerseyOCR:
 
     def _recognize_row(self, row, track_id, pass_index=0):
         detections = []
-        if self.backend is not None:
-            if getattr(self.backend, "uses_text_detection", False):
+        for backend in self.backends:
+            reader = backend["reader"]
+            backend_name = backend["name"]
+            if getattr(reader, "uses_text_detection", False):
                 variants = preprocess_text_detection_variants(row["crop_path"])
             else:
                 variants = preprocess_variants(row["crop_path"], augment=self.augment)
-            detections.extend(self._recognize_backend_variants(row, track_id, pass_index, variants))
+            detections.extend(
+                self._recognize_backend_variants(
+                    row,
+                    track_id,
+                    pass_index,
+                    backend_name,
+                    reader,
+                    variants,
+                )
+            )
 
         if self.template_matcher is not None:
+            backend_numbers = {
+                int(item["number"])
+                for item in detections
+                if item.get("number") is not None
+                and item.get("source") != "template"
+                and float(item.get("confidence", 0.0) or 0.0) >= self.min_raw_confidence
+            }
             for name, image in preprocess_variants(row["crop_path"], augment=self.augment):
                 self._write_debug(track_id, row, name, image, pass_index)
                 if not is_template_variant(name):
                     continue
                 for candidate in self.template_matcher.match(image, variant_name=name):
+                    if not template_candidate_allowed(candidate, backend_numbers):
+                        continue
                     detections.append(
                         {
                             "source": "template",
@@ -307,16 +346,16 @@ class JerseyOCR:
                     )
         return detections
 
-    def _recognize_backend_variants(self, row, track_id, pass_index, variants):
+    def _recognize_backend_variants(self, row, track_id, pass_index, backend_name, backend, variants):
         detections = []
         for name, image in variants:
             self._write_debug(track_id, row, name, image, pass_index)
             try:
-                raw = self.backend.read(image)
+                raw = backend.read(image)
             except Exception as exc:
                 detections.append(
                     {
-                        "source": self.backend_name,
+                        "source": backend_name,
                         "pass": pass_index,
                         "crop_path": row.get("crop_path"),
                         "frame": row.get("frame"),
@@ -330,7 +369,7 @@ class JerseyOCR:
             for text, confidence in raw:
                 detections.append(
                     {
-                        "source": self.backend_name,
+                        "source": backend_name,
                         "pass": pass_index,
                         "crop_path": row.get("crop_path"),
                         "frame": row.get("frame"),
@@ -388,18 +427,29 @@ class MMOCRBackend:
     uses_text_detection = True
 
     def __init__(self, device="cuda:0", det="dbnet_resnet18_fpnc_1200e_icdar2015", rec="SAR", batch_size=8):
-        from mmocr.apis import TextDetInferencer, TextRecInferencer
-        from mmocr.utils import bbox2poly, crop_img, poly2bbox
-
         self.device = device
-        self.det = det
-        self.rec = rec
+        self.det = normalize_mmocr_model_name(det, task="det")
+        self.rec = normalize_mmocr_model_name(rec, task="rec")
         self.batch_size = int(batch_size)
-        self.textdetinferencer = TextDetInferencer(det, device=device)
-        self.textrecinferencer = TextRecInferencer(rec, device=device)
-        self.bbox2poly = bbox2poly
-        self.crop_img = crop_img
-        self.poly2bbox = poly2bbox
+        self.mode = "mmocr_inferencer"
+        try:
+            from mmocr.apis import MMOCRInferencer
+
+            # The high-level inferencer is the most stable public API for
+            # end-to-end text detection + recognition in MMOCR 1.x. It also
+            # returns serializable rec_texts/rec_scores, which keeps our OCR
+            # diagnostics independent from MMOCR's internal datasample objects.
+            self.inferencer = MMOCRInferencer(det=self.det, rec=self.rec, device=device)
+        except Exception:
+            self.mode = "standard_inferencers"
+            from mmocr.apis import TextDetInferencer, TextRecInferencer
+            from mmocr.utils import bbox2poly, crop_img, poly2bbox
+
+            self.textdetinferencer = TextDetInferencer(self.det, device=device)
+            self.textrecinferencer = TextRecInferencer(self.rec, device=device)
+            self.bbox2poly = bbox2poly
+            self.crop_img = crop_img
+            self.poly2bbox = poly2bbox
 
     def read(self, image):
         image = np.asarray(image)
@@ -407,7 +457,35 @@ class MMOCRBackend:
             image = np.repeat(image[:, :, None], 3, axis=2)
         if image.dtype != np.uint8:
             image = np.clip(image, 0, 255).astype(np.uint8)
+        if self.mode == "mmocr_inferencer":
+            return self._read_with_mmocr_inferencer(image)
+        return self._read_with_standard_inferencers(image)
 
+    def _read_with_mmocr_inferencer(self, image):
+        result = self.inferencer(
+            [image],
+            batch_size=1,
+            det_batch_size=1,
+            rec_batch_size=self.batch_size,
+            out_dir="",
+            return_vis=False,
+            save_vis=False,
+            save_pred=False,
+            print_result=False,
+        )
+        predictions = result.get("predictions", []) if isinstance(result, dict) else []
+        rows = []
+        for prediction in predictions:
+            texts, scores = mmocr_prediction_text_scores(prediction)
+            det_scores = prediction.get("det_scores", []) if isinstance(prediction, dict) else []
+            for index, text in enumerate(texts):
+                rec_score = scores[index] if index < len(scores) else None
+                det_score = det_scores[index] if index < len(det_scores) else None
+                confidence = combine_mmocr_scores(rec_score, det_score)
+                rows.append((text, confidence))
+        return rows
+
+    def _read_with_standard_inferencers(self, image):
         det_data = self.textdetinferencer(
             [image],
             return_datasamples=True,
@@ -439,17 +517,95 @@ class MMOCRBackend:
         return rows
 
 
+class MMOCRRecognitionBackend:
+    uses_text_detection = False
+
+    def __init__(self, device="cuda:0", rec="SAR", batch_size=8):
+        self.device = device
+        self.rec = normalize_mmocr_model_name(rec, task="rec")
+        self.batch_size = int(batch_size)
+        try:
+            from mmocr.apis import MMOCRInferencer
+
+            self.mode = "mmocr_inferencer"
+            self.inferencer = MMOCRInferencer(rec=self.rec, device=device)
+        except Exception:
+            self.mode = "standard_inferencer"
+            from mmocr.apis import TextRecInferencer
+
+            self.textrecinferencer = TextRecInferencer(self.rec, device=device)
+
+    def read(self, image):
+        image = np.asarray(image)
+        if image.ndim == 2:
+            image = np.repeat(image[:, :, None], 3, axis=2)
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        if self.mode == "mmocr_inferencer":
+            result = self.inferencer(
+                [image],
+                batch_size=1,
+                rec_batch_size=self.batch_size,
+                out_dir="",
+                return_vis=False,
+                save_vis=False,
+                save_pred=False,
+                print_result=False,
+            )
+            predictions = result.get("predictions", []) if isinstance(result, dict) else []
+            rows = []
+            for prediction in predictions:
+                texts, scores = mmocr_prediction_text_scores(prediction)
+                for index, text in enumerate(texts):
+                    rows.append((text, mmocr_score(scores[index] if index < len(scores) else None)))
+            return rows
+
+        predictions = self.textrecinferencer(
+            [image],
+            return_datasamples=True,
+            batch_size=1,
+            progress_bar=False,
+        )["predictions"]
+        rows = []
+        for prediction in predictions:
+            result = self.textrecinferencer.pred2dict(prediction)
+            rows.append((result.get("text"), mmocr_score(result.get("scores"))))
+        return rows
+
+
 def requested_backends(backend_name):
     name = str(backend_name or "auto").strip().lower()
     if name in ("auto", "default"):
         return ["easyocr", "pytesseract"]
-    if name in ("mmocr_easyocr", "mmocr+easyocr", "mmocr-fallback", "mmocr_auto"):
+    if name in ("mmocr_easyocr", "mmocr+easyocr", "mmocr_auto"):
+        return ["mmocr", "easyocr", "pytesseract"]
+    if name in ("mmocr_rec", "mmocr-rec", "mmocr_recognition"):
+        return ["mmocr_rec"]
+    if name in ("mmocr_rec_easyocr", "mmocr-rec-easyocr"):
+        return ["mmocr_rec", "easyocr", "pytesseract"]
+    if name in ("mmocr-fallback", "mmocr_fallback"):
         return ["mmocr", "easyocr", "pytesseract"]
     if "," in name:
-        return [part.strip() for part in name.split(",") if part.strip()]
+        return [normalize_backend_name(part.strip()) for part in name.split(",") if part.strip()]
     if "+" in name:
-        return [part.strip() for part in name.split("+") if part.strip()]
-    return [name]
+        return [normalize_backend_name(part.strip()) for part in name.split("+") if part.strip()]
+    return [normalize_backend_name(name)]
+
+
+def backend_load_mode(backend_name):
+    name = str(backend_name or "auto").strip().lower()
+    if "," in name or "+" in name:
+        return "combine"
+    if name in ("mmocr_easyocr", "mmocr+easyocr", "mmocr_auto", "mmocr_rec_easyocr", "mmocr-rec-easyocr"):
+        return "combine"
+    return "fallback"
+
+
+def normalize_backend_name(name):
+    normalized = str(name or "").strip().lower().replace("-", "_")
+    if normalized in {"mmocr_recognition", "mmocrrec"}:
+        return "mmocr_rec"
+    return normalized
 
 
 def pred_instance_polygons(pred_instances):
@@ -463,6 +619,54 @@ def pred_instance_polygons(pred_instances):
         return pred_instances.get("polygons", [])
     except Exception:
         return getattr(pred_instances, "polygons", [])
+
+
+def normalize_mmocr_model_name(model_name, task):
+    value = str(model_name or "").strip()
+    if not value:
+        return None
+    path_like = "/" in value or "\\" in value or value.endswith((".py", ".pth", ".pt"))
+    if path_like:
+        return value
+    key = value.lower()
+    det_aliases = {
+        "dbnet": "DBNet",
+    }
+    rec_aliases = {
+        "sar": "SAR",
+        "satrn": "SATRN",
+        "crnn": "CRNN",
+        "nrtr": "NRTR",
+        "robustscanner": "RobustScanner",
+    }
+    aliases = det_aliases if task == "det" else rec_aliases
+    return aliases.get(key, value)
+
+
+def mmocr_prediction_text_scores(prediction):
+    if not isinstance(prediction, dict):
+        return [], []
+    if "rec_texts" in prediction:
+        texts = prediction.get("rec_texts") or []
+        scores = prediction.get("rec_scores") or []
+        return list(texts), list(scores)
+    text = prediction.get("rec_text", prediction.get("text"))
+    if text is None:
+        return [], []
+    score = prediction.get("rec_score", prediction.get("scores"))
+    return [text], [score]
+
+
+def combine_mmocr_scores(rec_score, det_score=None):
+    rec = mmocr_score(rec_score)
+    if det_score is None:
+        return rec
+    det = mmocr_score(det_score)
+    if det <= 0:
+        return rec
+    # Recognition confidence should dominate; detection confidence only nudges
+    # the score down when MMOCR localized uncertain text on a noisy jersey crop.
+    return float(max(0.0, min(1.0, rec * (0.75 + 0.25 * det))))
 
 
 def mmocr_score(scores):
@@ -635,10 +839,14 @@ def is_ocr_player_row(row):
 def parse_number(text):
     if text is None:
         return None
-    match = re.search(r"(?<!\d)\d{1,2}(?!\d)", str(text))
+    # MMOCR's SoccerNet baseline keeps digit characters and truncates to two
+    # digits because football jersey numbers are bounded to 1..99. Doing the
+    # same here lets reads like "17I" still contribute "17" without accepting
+    # zero or impossible jersey values.
+    match = re.search(r"\d+", str(text))
     if not match:
         return None
-    value = int(match.group(0))
+    value = int(match.group(0)[:2])
     if value < 1 or value > 99:
         return None
     return value
@@ -772,6 +980,19 @@ def filter_crop_candidates(candidates, max_candidates_per_crop, min_candidate_ra
         if float(candidate.get("confidence", 0.0) or 0.0) >= best_score * float(min_candidate_ratio)
     ]
     return filtered[:max_candidates_per_crop]
+
+
+def template_candidate_allowed(candidate, backend_numbers):
+    number = int(candidate.get("jersey_number"))
+    if number in backend_numbers:
+        return True
+    # SoccerNet-GSR eval exposed many template-only false positives on "1":
+    # thin limbs, shirt folds and pitch lines often resemble a vertical digit.
+    # Let templates introduce standalone evidence only for strong two-digit
+    # shapes; single digits need OCR agreement.
+    if number < 10:
+        return False
+    return float(candidate.get("confidence", 0.0) or 0.0) >= 0.78
 
 
 def is_template_variant(name):

@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ocr = ["easyocr", "pytesseract"]
+mmocr = ["mmocr==1.0.1", "mmdet~=3.1.0", "openmim==0.3.9"]
 
 [project.scripts]
 ft = "ft.cli:main"
@@ -23,4 +24,3 @@ ft = "ft.cli:main"
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
-

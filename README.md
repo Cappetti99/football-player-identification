@@ -65,8 +65,9 @@ The pipeline separates the two real teams from richer semantic groups.
 - Jersey OCR with:
   - multi-pass crop sampling;
   - EasyOCR backend;
-  - optional MMOCR backend with EasyOCR fallback;
-  - jersey font template matching using `docs/numberFont.jpg`;
+  - optional MMOCR backend;
+  - combined MMOCR + EasyOCR proposal voting when OpenMMLab is available;
+  - optional jersey font template matching using `docs/numberFont.jpg`;
   - crop-level aggregation before tracklet voting.
 - Roster-aware OCR filtering:
   - removes or degrades jersey numbers that do not exist in the roster for that team;
@@ -103,6 +104,9 @@ configs/
 docs/
   numberFont.jpg            jersey-number font reference for template matching
 
+evaluation/
+  gsr_jersey_ocr/           controlled SoccerNet-GSR OCR evaluation
+
 scripts/
   train_yolo_gsr_full.py    SoccerNet-GSR conversion and YOLO training
   run_costume_videos.sh     helper for custom videos
@@ -131,7 +135,12 @@ OCR extras:
 python3 -m pip install easyocr pytesseract
 ```
 
-On the thesis server:
+MMOCR is optional and should normally live in a separate environment because
+the OpenMMLab stack has strict `torch` / `mmcv` / `mmdet` compatibility
+requirements. If MMOCR is unavailable, `mmocr_easyocr` records the failed import
+and falls back to EasyOCR where possible.
+
+On the thesis server, the lightweight environment is:
 
 ```bash
 cd /home/cappetti/FT
@@ -140,7 +149,7 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
 
-MMOCR is optional. If unavailable, the configured `mmocr_easyocr` mode falls back to EasyOCR where possible.
+The MMOCR experiments were run from a dedicated `mmocr` conda environment.
 
 ## Required Inputs
 
@@ -311,6 +320,32 @@ jq '{
 }' artifacts/costume-video/<run_name>/metadata/<video_id>_constraints.json
 ```
 
+## Controlled OCR Evaluation
+
+The `evaluation/gsr_jersey_ocr/` suite evaluates jersey-number recognition on
+SoccerNet-GSR using ground-truth boxes and track IDs. This isolates OCR from
+detection, tracking and Hungarian assignment.
+
+```bash
+python3 evaluation/gsr_jersey_ocr/run_eval.py \
+  --gsr-dir /media/data-lie/cappetti/dataset/SoccerNet-GSR \
+  --output-dir evaluation_outputs/gsr_jersey_ocr/easyocr_val \
+  --split val \
+  --max-sequences 10 \
+  --max-tracklets 1000 \
+  --backend easyocr \
+  --easyocr-gpu
+```
+
+The main outputs are `metrics.json`, `predictions.csv`, `confusion.csv`,
+`threshold_sweep.csv` and `ocr_diagnostics.json`.
+
+Current thesis results are summarized in
+[`docs/evaluation_results.md`](docs/evaluation_results.md). The key finding is
+that MMOCR alone is high precision but low coverage, while MMOCR + EasyOCR
+improves the controlled OCR evaluation and increases identity coverage on
+custom videos where MMOCR is available.
+
 ## Training YOLO On SoccerNet-GSR
 
 The training helper can convert SoccerNet-GSR into a YOLO dataset and train one of three label modes:
@@ -353,6 +388,10 @@ python3 -m ft.cli run --help
 - Long videos should be evaluated by action segment or scene cut when possible.
 - The StrongSORT wrapper is experimental and currently not the recommended tracker.
 - OCR remains sensitive to crop quality, pose, motion blur and occlusion.
+- MMOCR improves OCR evidence when installed, but it adds a heavy dependency
+  stack and should be kept separate from the lightweight runtime environment.
+- The single-font template matcher is disabled by default because it did not
+  improve the controlled SoccerNet-GSR evaluation and can over-predict `1`.
 - Pitch calibration has an automatic fallback but is not a full metric field-keypoint model.
 
 ## Thesis Direction

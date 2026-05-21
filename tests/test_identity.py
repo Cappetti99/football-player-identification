@@ -1,7 +1,12 @@
+import numpy as np
+
+from ft.features.team import TeamAssigner, team_color_ranges_by_team_from_roster
 from ft.features.jersey_ocr import (
     aggregate_detections_by_crop,
+    backend_load_mode,
     is_ocr_player_row,
     mmocr_score,
+    normalize_mmocr_model_name,
     parse_number,
     requested_backends,
     vote_numbers,
@@ -10,16 +15,17 @@ from ft.features.referee import referee_color_ranges_from_roster
 from ft.features.goalkeeper import GoalkeeperAppearanceAssigner, goalkeeper_color_ranges_by_team_from_roster
 from ft.features.jersey_template import prefer_two_digit_candidates
 from ft.features.roster_aware_ocr import RosterAwareOCRFilter
-from ft.identity.constraints import enforce_identity_constraints
+from ft.identity.constraints import enforce_identity_constraints, jersey_rank
 from ft.identity.hungarian import (
     HungarianPlayerIdentifier,
     is_non_player_tracklet,
     validate_unique_team_jersey,
 )
 from ft.identity.roster import normalize_jersey_number
+from ft.linking.jersey_identity_linker import JerseyIdentityLinker
 from ft.linking.tracklet_linker import TrackletLinker
 from ft.tracking.yolo_strongsort import Detection, StrongSortTrackerCore
-from ft.visualization.overlay import player_label
+from ft.visualization.overlay import player_label, referee_label
 
 
 def test_hungarian_assignment_prefers_jersey_over_uncertain_team():
@@ -35,7 +41,7 @@ def test_hungarian_assignment_prefers_jersey_over_uncertain_team():
             "mean_team_confidence": 0.25,
             "jersey_number": 7,
             "jersey_confidence": 1.0,
-            "jersey_votes": 3,
+            "jersey_votes": 5,
             "num_frames": 40,
             "mean_crop_quality": 0.4,
             "mean_pitch_position": None,
@@ -74,7 +80,7 @@ def test_reliable_jersey_blocks_same_team_wrong_number():
         "mean_team_confidence": 0.8,
         "jersey_number": 7,
         "jersey_confidence": 0.9,
-        "jersey_votes": 3,
+        "jersey_votes": 5,
         "num_frames": 40,
         "mean_crop_quality": 0.4,
         "mean_pitch_position": None,
@@ -92,6 +98,8 @@ def test_jersey_numbers_start_at_one():
     assert parse_number("1") == 1
     assert parse_number("00") is None
     assert parse_number("0") is None
+    assert parse_number("A17") == 17
+    assert parse_number("171") == 17
     try:
         normalize_jersey_number(0)
     except ValueError as exc:
@@ -184,6 +192,10 @@ def test_ocr_aggregates_variants_by_crop_before_voting():
 def test_mmocr_backend_alias_keeps_easyocr_fallback():
     assert requested_backends("mmocr_easyocr") == ["mmocr", "easyocr", "pytesseract"]
     assert requested_backends("mmocr,easyocr") == ["mmocr", "easyocr"]
+    assert requested_backends("mmocr_rec+easyocr") == ["mmocr_rec", "easyocr"]
+    assert backend_load_mode("mmocr_easyocr") == "combine"
+    assert backend_load_mode("mmocr-fallback") == "fallback"
+    assert normalize_mmocr_model_name("dbnet_resnet18_fpnc_1200e_icdar2015", task="det") == "dbnet_resnet18_fpnc_1200e_icdar2015"
 
 
 def test_mmocr_score_uses_mean_character_confidence():
@@ -195,6 +207,52 @@ def test_ocr_skips_referee_candidate_rows():
     assert not is_ocr_player_row({"role_detection": "referee_candidate"})
     assert not is_ocr_player_row({"semantic_group_id": 5})
     assert is_ocr_player_row({"role_detection": "player", "semantic_group_id": 1})
+
+
+def test_team_assigner_uses_roster_kit_colors_without_kmeans():
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        return
+
+    frame = np.full((90, 100, 3), 80, dtype=np.uint8)
+    frame[:, :50] = (0, 0, 0)
+    frame[:, 50:] = (255, 255, 255)
+    tracks = {
+        "players": [
+            {
+                1: {"bbox": [5, 5, 45, 85], "role_detection": "player"},
+                2: {"bbox": [55, 5, 95, 85], "role_detection": "player"},
+            }
+        ]
+    }
+    roster = [
+        {
+            "player_id": "team1_10",
+            "team_id": 1,
+            "role": "player",
+            "metadata": {"team_kit_color": "black_blue"},
+        },
+        {
+            "player_id": "team2_11",
+            "team_id": 2,
+            "role": "player",
+            "metadata": {"team_kit_color": "white"},
+        },
+    ]
+
+    assigner = TeamAssigner(
+        min_seed_colors=99,
+        min_tracklet_colors=1,
+        color_ranges_by_team=team_color_ranges_by_team_from_roster(roster),
+    )
+    assignments = assigner.fit_apply([frame], tracks)
+
+    assert assignments[1]["team"] == 1
+    assert assignments[1]["source"] == "roster_color"
+    assert assignments[2]["team"] == 2
+    assert tracks["players"][0][1]["frame_team"] == 1
+    assert tracks["players"][0][2]["frame_team"] == 2
 
 
 def test_summary_preserves_ocr_votes_not_frame_count():
@@ -348,6 +406,68 @@ def test_linker_accepts_distance_gap_when_embeddings_missing():
     assert linker.diagnostics["accepted_links"][0]["from_track_id"] == 1
 
 
+def test_jersey_identity_linker_links_reliable_same_number_continuation():
+    tracks = two_tracklets(
+        previous={
+            "display_track_id": 9,
+            "team": 1,
+            "team_confidence": 0.9,
+            "jersey_number": 6,
+            "jersey_votes": 5,
+            "jersey_evidence": {"confidence": 0.82, "head_confidence": 0.90, "winner_margin": 0.35, "votes": 5},
+        },
+        current={
+            "display_track_id": 59,
+            "team": 1,
+            "team_confidence": 0.9,
+            "jersey_number": 6,
+            "jersey_votes": 5,
+            "jersey_evidence": {"confidence": 0.78, "head_confidence": 0.88, "winner_margin": 0.32, "votes": 5},
+        },
+    )
+    rows = [
+        {"track_id": 1, "display_track_id": 9, "frame": 0},
+        {"track_id": 2, "display_track_id": 59, "frame": 3},
+    ]
+
+    diagnostics = JerseyIdentityLinker(max_gap=10, max_distance=20, min_frames=1).apply(tracks, rows=rows)
+
+    assert diagnostics["accepted_links"][0]["from_display_track_id"] == 9
+    assert diagnostics["accepted_links"][0]["to_display_track_id"] == 59
+    assert tracks["players"][3][2]["display_track_id"] == 9
+    assert rows[1]["display_track_id"] == 9
+    assert rows[1]["jersey_link_previous_display_track_id"] == 59
+
+
+def test_jersey_identity_linker_rejects_far_same_number_tracklet():
+    tracks = two_tracklets(
+        previous={
+            "display_track_id": 9,
+            "team": 1,
+            "team_confidence": 0.9,
+            "jersey_number": 6,
+            "jersey_votes": 5,
+            "jersey_evidence": {"confidence": 0.82, "head_confidence": 0.90, "winner_margin": 0.35, "votes": 5},
+            "position": (0.0, 0.0),
+        },
+        current={
+            "display_track_id": 59,
+            "team": 1,
+            "team_confidence": 0.9,
+            "jersey_number": 6,
+            "jersey_votes": 5,
+            "jersey_evidence": {"confidence": 0.78, "head_confidence": 0.88, "winner_margin": 0.32, "votes": 5},
+            "position": (300.0, 300.0),
+        },
+    )
+
+    diagnostics = JerseyIdentityLinker(max_gap=10, max_distance=20, min_frames=1).apply(tracks)
+
+    assert diagnostics["accepted_links"] == []
+    assert tracks["players"][3][2]["display_track_id"] == 59
+    assert diagnostics["rejection_counts"]["distance"] >= 1
+
+
 def test_strongsort_core_uses_appearance_to_keep_identity():
     tracker = StrongSortTrackerCore(
         min_confidence=0.1,
@@ -406,7 +526,7 @@ def test_reliable_jersey_beats_position_prior():
         "mean_team_confidence": 0.8,
         "jersey_number": 7,
         "jersey_confidence": 0.9,
-        "jersey_votes": 3,
+        "jersey_votes": 5,
         "num_frames": 40,
         "mean_crop_quality": 0.4,
         "mean_pitch_position": [0.0, 0.0],
@@ -482,6 +602,139 @@ def test_assignment_gate_allows_strong_team_visual_trajectory():
 
     assert assignments[10]["player_id"] == "p10"
     assert assignments[10]["evidence"]["assignment_gate"]["reason"] == "strong_team_visual_trajectory"
+
+
+def test_assignment_gate_allows_singleton_goalkeeper_from_palette():
+    identifier = HungarianPlayerIdentifier(roster_path=None, unknown_threshold=0.0)
+    identifier.roster = [
+        {
+            "player_id": "gk1",
+            "name": "GK1",
+            "team_id": 1,
+            "jersey_number": 1,
+            "role": "goalkeeper",
+            "position_prior": [18.0, 34.0],
+        },
+        {
+            "player_id": "p6",
+            "name": "P6",
+            "team_id": 1,
+            "jersey_number": 6,
+            "role": "player",
+            "position_prior": [35.0, 34.0],
+        },
+    ]
+    summaries = [
+        {
+            "track_id": 6,
+            "team_id": 1,
+            "mean_team_confidence": 1.0,
+            "role_detection": "goalkeeper",
+            "semantic_group_id": 3,
+            "goalkeeper_palette_match": True,
+            "goalkeeper_like_score": 0.58,
+            "goalkeeper_like_team": 1,
+            "jersey_number": 1,
+            "jersey_confidence": 0.23,
+            "jersey_votes": 28,
+            "jersey_distribution": [
+                {"jersey_number": 4, "confidence": 0.25, "votes": 31},
+                {"jersey_number": 1, "confidence": 0.42, "votes": 28},
+                {"jersey_number": 6, "confidence": 0.36, "votes": 14},
+            ],
+            "num_frames": 292,
+            "mean_crop_quality": 0.25,
+            "mean_pitch_position": [18.0, 34.0],
+            "visual_embedding": None,
+        }
+    ]
+
+    assignments, _ = identifier.assign(summaries)
+
+    assert assignments[6]["player_id"] == "gk1"
+    assert assignments[6]["evidence"]["assignment_gate"]["reason"] == "goalkeeper_roster_singleton"
+
+
+def test_assignment_gate_blocks_singleton_goalkeeper_when_roster_has_two_goalkeepers():
+    identifier = HungarianPlayerIdentifier(roster_path=None, unknown_threshold=0.0)
+    identifier.roster = [
+        {"player_id": "gk1", "team_id": 1, "jersey_number": 1, "role": "goalkeeper"},
+        {"player_id": "gk2", "team_id": 1, "jersey_number": 12, "role": "goalkeeper"},
+    ]
+    summaries = [
+        {
+            "track_id": 6,
+            "team_id": 1,
+            "mean_team_confidence": 1.0,
+            "role_detection": "goalkeeper",
+            "semantic_group_id": 3,
+            "goalkeeper_palette_match": True,
+            "goalkeeper_like_score": 0.58,
+            "goalkeeper_like_team": 1,
+            "jersey_number": None,
+            "jersey_confidence": 0.0,
+            "jersey_votes": 0,
+            "num_frames": 292,
+            "mean_crop_quality": 0.25,
+            "mean_pitch_position": None,
+            "visual_embedding": None,
+        }
+    ]
+
+    assignments, _ = identifier.assign(summaries)
+
+    assert assignments[6]["player_id"] == "unknown"
+    assert not assignments[6]["evidence"]["assignment_gate"]["goalkeeper_singleton"]
+
+
+def test_assignment_gate_blocks_weak_roster_promoted_jersey_candidate():
+    identifier = HungarianPlayerIdentifier(roster_path=None, unknown_threshold=0.0)
+    identifier.roster = [
+        {"player_id": "team2_04", "name": "P4", "team_id": 2, "jersey_number": 4, "role": "player"},
+    ]
+    summaries = [
+        {
+            "track_id": 11,
+            "team_id": 2,
+            "mean_team_confidence": 0.99,
+            "jersey_number": 4,
+            "jersey_confidence": 0.20,
+            "jersey_votes": 24,
+            "jersey_distribution": [
+                {"jersey_number": 4, "confidence": 0.75, "votes": 24},
+            ],
+            "jersey_raw_candidates": [
+                {"jersey_number": 1, "confidence": 0.42, "votes": 45},
+                {"jersey_number": 4, "confidence": 0.20, "votes": 24},
+            ],
+            "num_frames": 1900,
+            "mean_crop_quality": 0.4,
+            "mean_pitch_position": None,
+            "visual_embedding": None,
+        }
+    ]
+
+    assignments, _ = identifier.assign(summaries)
+
+    assert assignments[11]["player_id"] == "unknown"
+    assert assignments[11]["evidence"]["assignment_gate"]["reason"] == "insufficient_assignment_evidence"
+
+
+def test_duplicate_jersey_rank_prefers_stronger_ocr_over_identity_confidence():
+    weak_promoted = {
+        "identity_confidence": 1.0,
+        "jersey_evidence": {"confidence": 0.20, "votes": 24, "head_confidence": 0.0, "winner_margin": 0.0},
+        "crop_quality": 0.4,
+        "bbox": [0, 0, 20, 60],
+    }
+    strong_ocr = {
+        "identity_confidence": 0.8,
+        "jersey_evidence": {"confidence": 0.62, "votes": 5, "head_confidence": 0.75, "winner_margin": 0.18},
+        "crop_quality": 0.3,
+        "bbox": [0, 0, 20, 60],
+    }
+
+    assert jersey_rank(strong_ocr) > jersey_rank(weak_promoted)
 
 
 def test_constraints_clear_duplicate_player_id_in_same_frame():
@@ -581,6 +834,53 @@ def test_constraints_clear_duplicate_team_jersey_in_same_frame():
     assert tracks["players"][0][1]["jersey_number"] == 1
     assert tracks["players"][0][2]["jersey_number"] is None
     assert diagnostics["duplicate_team_jersey_count"] == 1
+
+
+def test_constraints_choose_global_team_jersey_owner_across_non_overlapping_tracks():
+    roster = [{"player_id": "team1_06", "team_id": 1, "jersey_number": 6, "role": "player"}]
+    weak_early = {
+        "display_track_id": 9,
+        "team": 1,
+        "player_id": "team1_06",
+        "player_name": "P6",
+        "identity_confidence": 1.0,
+        "jersey_number": 6,
+        "jersey_confidence": 0.24,
+        "jersey_votes": 12,
+        "jersey_evidence": {"confidence": 0.24, "votes": 12, "head_confidence": 0.30, "winner_margin": 0.02},
+        "bbox": [0, 0, 20, 40],
+    }
+    strong_late = {
+        "display_track_id": 59,
+        "team": 1,
+        "player_id": "team1_06",
+        "player_name": "P6",
+        "identity_confidence": 0.6,
+        "jersey_number": 6,
+        "jersey_confidence": 0.68,
+        "jersey_votes": 6,
+        "jersey_evidence": {"confidence": 0.68, "votes": 6, "head_confidence": 0.82, "winner_margin": 0.31},
+        "bbox": [30, 0, 50, 40],
+    }
+    tracks = {
+        "players": [
+            {9: dict(weak_early)},
+            {9: dict(weak_early)},
+            {59: dict(strong_late)},
+            {59: dict(strong_late)},
+        ]
+    }
+
+    diagnostics = enforce_identity_constraints(tracks, roster)
+
+    assert tracks["players"][0][9]["jersey_number"] is None
+    assert tracks["players"][0][9]["player_id"] == "unknown"
+    assert tracks["players"][1][9]["jersey_constraint"]["reason"] == "global_duplicate_team_jersey_owner"
+    assert tracks["players"][2][59]["jersey_number"] == 6
+    assert tracks["players"][2][59]["player_id"] == "team1_06"
+    assert diagnostics["global_team_jersey_owner_count"] == 1
+    assert diagnostics["global_team_jersey_owners"][0]["kept_display_track_id"] == 59
+    assert diagnostics["global_team_jersey_owners"][0]["cleared_display_track_id"] == 9
 
 
 def test_constraints_clear_goalkeeper_only_jersey_on_non_goalkeeper():
@@ -1051,6 +1351,15 @@ def test_overlay_can_show_any_ocr_winner_for_diagnostics():
     assert label == "T2 #17 ID5"
 
 
+def test_overlay_labels_referee_candidate_without_question_mark():
+    label = referee_label(
+        {"referee_like_color": "roster_yellow", "referee_like_score": 0.31},
+        prefix="ref",
+    )
+
+    assert label == "ref roster_yellow 0.31"
+
+
 def two_tracklets(previous, current):
     base_previous = {"bbox": [0, 0, 10, 20], "position": (10.0, 10.0)}
     base_previous.update(previous)
@@ -1086,6 +1395,7 @@ if __name__ == "__main__":
     test_mmocr_backend_alias_keeps_easyocr_fallback()
     test_mmocr_score_uses_mean_character_confidence()
     test_ocr_skips_referee_candidate_rows()
+    test_team_assigner_uses_roster_kit_colors_without_kmeans()
     test_summary_preserves_ocr_votes_not_frame_count()
     test_roster_aware_ocr_degrades_number_not_in_team_roster()
     test_roster_aware_ocr_promotes_valid_alternative()
@@ -1094,14 +1404,19 @@ if __name__ == "__main__":
     test_linker_team_gate_blocks_confident_team_mismatch()
     test_linker_appearance_gate_blocks_low_similarity()
     test_linker_accepts_distance_gap_when_embeddings_missing()
+    test_jersey_identity_linker_links_reliable_same_number_continuation()
+    test_jersey_identity_linker_rejects_far_same_number_tracklet()
     test_strongsort_core_uses_appearance_to_keep_identity()
     test_position_prior_is_capped()
     test_reliable_jersey_beats_position_prior()
     test_assignment_gate_blocks_weak_non_jersey_assignment()
     test_assignment_gate_allows_strong_team_visual_trajectory()
+    test_assignment_gate_blocks_weak_roster_promoted_jersey_candidate()
+    test_duplicate_jersey_rank_prefers_stronger_ocr_over_identity_confidence()
     test_constraints_clear_duplicate_player_id_in_same_frame()
     test_constraints_clear_invalid_team_jersey()
     test_constraints_clear_duplicate_team_jersey_in_same_frame()
+    test_constraints_choose_global_team_jersey_owner_across_non_overlapping_tracks()
     test_constraints_clear_goalkeeper_only_jersey_on_non_goalkeeper()
     test_constraints_clear_non_goalkeeper_jersey_on_goalkeeper()
     test_constraints_correct_goalkeeper_semantic_group_from_roster()
@@ -1119,4 +1434,5 @@ if __name__ == "__main__":
     test_overlay_shows_stable_low_mass_ocr_jersey()
     test_overlay_shows_head_confident_crop_aggregated_jersey()
     test_overlay_can_show_any_ocr_winner_for_diagnostics()
+    test_overlay_labels_referee_candidate_without_question_mark()
     print("FT identity tests passed")

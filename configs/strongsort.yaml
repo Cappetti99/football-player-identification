@@ -80,6 +80,8 @@ goalkeeper:
 
 jersey_ocr:
   enabled: true
+  # Combines MMOCR and EasyOCR proposals when MMOCR is installed; otherwise it
+  # falls back to EasyOCR and records the failed backend in diagnostics.
   backend: mmocr_easyocr
   min_confidence: 0.25
   max_crops_per_tracklet: 20
@@ -98,10 +100,10 @@ jersey_ocr:
   min_promoted_candidate_confidence: 0.12
   min_promoted_candidate_votes: 1
   debug_crops: true
-  template_matching: true
+  template_matching: false
   template_font_image: docs/numberFont.jpg
   template_min_score: 0.62
-  template_weight: 0.10
+  template_weight: 0.03
   template_max_candidates: 4
   aggregate_by_crop: true
   max_candidates_per_crop: 3
@@ -116,8 +118,10 @@ identity:
   unknown_threshold: 0.55
   candidate_top_k: 8
   enforce_unique_team_jersey: true
-  reliable_jersey_min_votes: 2
-  reliable_jersey_min_confidence: 0.5
+  reliable_jersey_min_votes: 5
+  reliable_jersey_min_confidence: 0.20
+  reliable_jersey_min_head_confidence: 0.55
+  reliable_jersey_min_winner_margin: 0.10
   position_prior_max_cost: 0.08
   position_prior_tiebreak_only: true
   require_assignment_evidence: true
@@ -138,13 +142,13 @@ identity:
 overlay:
   show_display_id: true
   show_jersey: true
-  show_jersey_winner: true
-  show_jersey_min_confidence: 0.55
-  show_jersey_min_votes: 2
+  show_jersey_winner: false
+  show_jersey_min_confidence: 0.30
+  show_jersey_min_votes: 3
   show_jersey_min_stable_votes: 20
-  show_jersey_min_winner_margin: 0.20
-  show_jersey_min_head_votes: 8
-  show_jersey_min_head_confidence: 0.70
+  show_jersey_min_winner_margin: 0.10
+  show_jersey_min_head_votes: 3
+  show_jersey_min_head_confidence: 0.55
   require_ocr_jersey_evidence: true
   show_player_id: false
   show_player_id_min_confidence: 0.80

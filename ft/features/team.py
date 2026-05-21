@@ -1,8 +1,40 @@
 from collections import defaultdict
 
-import cv2
 import numpy as np
-from sklearn.cluster import KMeans
+
+from ft.features.referee import color_to_ranges, palette_fraction
+
+
+TEAM_COLOR_RANGES = {
+    "black": [
+        {"v_max": 72, "s_max": 140},
+    ],
+    "white": [
+        {"s_max": 55, "v_min": 150},
+    ],
+    "blue": [
+        {"h_min": 98, "h_max": 132, "s_min": 45, "v_min": 45},
+    ],
+    "dark_blue": [
+        {"h_min": 98, "h_max": 132, "s_min": 45, "v_min": 28, "v_max": 135},
+    ],
+    "red": [
+        {"h_min": 0, "h_max": 10, "s_min": 70, "v_min": 70},
+        {"h_min": 170, "h_max": 179, "s_min": 70, "v_min": 70},
+    ],
+}
+
+TEAM_COLOR_ALIASES = {
+    "black_blue": ["black", "blue"],
+    "blackblue": ["black", "blue"],
+    "black_and_blue": ["black", "blue"],
+    "nero_blu": ["black", "blue"],
+    "neroblu": ["black", "blue"],
+    "nerazzurro": ["black", "blue"],
+    "nerazzurri": ["black", "blue"],
+    "lightblue": ["light_blue"],
+    "light_blue": ["light_blue"],
+}
 
 
 class TeamAssigner:
@@ -20,12 +52,18 @@ class TeamAssigner:
         min_cluster_separation=30.0,
         min_classification_margin=12.0,
         min_tracklet_colors=3,
+        color_ranges_by_team=None,
+        roster_color_min_fraction=0.16,
+        roster_color_min_margin=0.04,
     ):
         self.max_seed_frames = int(max_seed_frames)
         self.min_seed_colors = int(min_seed_colors)
         self.min_cluster_separation = float(min_cluster_separation)
         self.min_classification_margin = float(min_classification_margin)
         self.min_tracklet_colors = int(min_tracklet_colors)
+        self.color_ranges_by_team = normalize_team_ranges_by_team(color_ranges_by_team)
+        self.roster_color_min_fraction = float(roster_color_min_fraction)
+        self.roster_color_min_margin = float(roster_color_min_margin)
         self.kmeans = None
         self.team_colors = {}
 
@@ -45,7 +83,12 @@ class TeamAssigner:
             if seeded >= self.max_seed_frames and len(seed_colors) >= self.min_seed_colors:
                 break
         self._fit(seed_colors)
-        assignments = self._assign_tracklets(frames, tracks)
+        # Roster colours are trusted when they produce a clear palette match.
+        # KMeans remains available as a fallback for videos/teams where the
+        # roster does not describe the kit or the crop is too ambiguous.
+        cluster_assignments = self._assign_tracklets(frames, tracks)
+        roster_assignments = self._assign_tracklets_by_roster_palette(frames, tracks)
+        assignments = merge_assignments(roster_assignments, cluster_assignments)
         frame_assignments = self._assign_frames(frames, tracks)
         self._apply(assignments, frame_assignments, tracks)
         return assignments
@@ -53,6 +96,8 @@ class TeamAssigner:
     def _fit(self, colors):
         if len(colors) < self.min_seed_colors:
             return
+        from sklearn.cluster import KMeans
+
         x = np.asarray(colors, dtype=np.float32)
         model = KMeans(n_clusters=2, random_state=0, n_init=10).fit(x)
         centers = model.cluster_centers_
@@ -79,6 +124,28 @@ class TeamAssigner:
         for display_id, colors in colors_by_tracklet.items():
             assignments[display_id] = self._classify_colors(colors)
         return assignments
+
+    def _assign_tracklets_by_roster_palette(self, frames, tracks):
+        if not self.color_ranges_by_team:
+            return {}
+        samples_by_tracklet = defaultdict(list)
+        for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
+            frame = frames[frame_num]
+            for raw_id, track in frame_tracks.items():
+                display_id = int(track.get("display_track_id", raw_id))
+                samples_by_tracklet[display_id].append(
+                    classify_team_palette(
+                        frame,
+                        track["bbox"],
+                        self.color_ranges_by_team,
+                        self.roster_color_min_fraction,
+                        self.roster_color_min_margin,
+                    )
+                )
+        return {
+            display_id: summarize_team_palette_samples(samples, self.min_tracklet_colors)
+            for display_id, samples in samples_by_tracklet.items()
+        }
 
     def _classify_colors(self, colors):
         if self.kmeans is None or len(colors) < self.min_tracklet_colors:
@@ -114,6 +181,19 @@ class TeamAssigner:
             frame = frames[frame_num]
             frame_row = {}
             for raw_id, track in frame_tracks.items():
+                # Per-frame palette evidence is intentionally local. A sudden
+                # team flip inside one display_track_id is later treated as an
+                # identity-switch signal by the constraint stage.
+                roster_assignment = classify_team_palette(
+                    frame,
+                    track["bbox"],
+                    self.color_ranges_by_team,
+                    self.roster_color_min_fraction,
+                    self.roster_color_min_margin,
+                )
+                if roster_assignment.get("team") is not None:
+                    frame_row[int(raw_id)] = roster_assignment
+                    continue
                 color = self.player_color(frame, track["bbox"])
                 frame_row[int(raw_id)] = self._classify_color(color)
             frame_assignments.append(frame_row)
@@ -134,6 +214,7 @@ class TeamAssigner:
         return {
             "team": team,
             "confidence": float(confidence),
+            "source": "kmeans",
             "margin": float(margin),
             "distances": {int(index) + 1: float(value) for index, value in enumerate(distances)},
         }
@@ -158,6 +239,8 @@ class TeamAssigner:
 
     @staticmethod
     def player_color(frame, bbox):
+        import cv2
+
         crop = torso_crop(frame, bbox)
         if crop is None or crop.size == 0:
             return None
@@ -187,3 +270,184 @@ def torso_crop(frame, bbox):
     left = x1 + int(box_w * 0.15)
     right = x2 - int(box_w * 0.15)
     return frame[top:max(top + 1, bottom), left:max(left + 1, right)]
+
+
+def merge_assignments(primary, fallback):
+    """Prefer roster-palette teams only when they produce a valid decision."""
+    merged = dict(fallback or {})
+    for display_id, assignment in (primary or {}).items():
+        if assignment.get("team") is not None:
+            merged[display_id] = assignment
+        elif display_id not in merged:
+            merged[display_id] = assignment
+    return merged
+
+
+def classify_team_palette(frame, bbox, color_ranges_by_team, min_fraction=0.16, min_margin=0.04):
+    """Classify one detection against roster-provided team kit palettes."""
+    import cv2
+
+    if not color_ranges_by_team:
+        return {"team": None, "confidence": 0.0, "source": "roster_color", "margin": 0.0, "scores": {}}
+    crop = torso_crop(frame, bbox)
+    if crop is None or crop.size == 0:
+        return {"team": None, "confidence": 0.0, "source": "roster_color", "margin": 0.0, "scores": {}}
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    scores = {}
+    color_scores = {}
+    for team_id, ranges_by_name in color_ranges_by_team.items():
+        team_total = 0.0
+        team_color_scores = {}
+        for name, ranges in ranges_by_name.items():
+            score = palette_fraction(hsv, ranges)
+            team_color_scores[name] = float(score)
+            team_total += float(score)
+        # Multi-colour kits such as Inter's black/blue stripes are represented
+        # as several colour ranges for the same team. Summing their fractions
+        # lets either stripe contribute while capping the final evidence.
+        scores[int(team_id)] = min(1.0, team_total)
+        color_scores[int(team_id)] = team_color_scores
+    if not scores:
+        return {"team": None, "confidence": 0.0, "source": "roster_color", "margin": 0.0, "scores": {}}
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    team, score = ranked[0]
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+    margin = float(score - runner_up)
+    if score < float(min_fraction) or margin < float(min_margin):
+        team = None
+        confidence = 0.0
+    else:
+        confidence = min(1.0, score)
+    return {
+        "team": int(team) if team is not None else None,
+        "confidence": float(confidence),
+        "source": "roster_color",
+        "margin": margin,
+        "scores": {int(key): float(value) for key, value in sorted(scores.items())},
+        "color_scores": color_scores,
+    }
+
+
+def summarize_team_palette_samples(samples, min_samples):
+    """Aggregate per-frame roster-colour votes into one tracklet decision."""
+    if len(samples) < int(min_samples):
+        return {
+            "team": None,
+            "confidence": 0.0,
+            "source": "roster_color",
+            "num_colors": len(samples),
+            "reason": "not_enough_samples",
+        }
+    votes = defaultdict(int)
+    by_team_scores = defaultdict(list)
+    margins = []
+    for sample in samples:
+        team = sample.get("team")
+        if team is None:
+            continue
+        team = int(team)
+        votes[team] += 1
+        by_team_scores[team].append(float(sample.get("confidence", 0.0) or 0.0))
+        margins.append(float(sample.get("margin", 0.0) or 0.0))
+    if not votes:
+        return {
+            "team": None,
+            "confidence": 0.0,
+            "source": "roster_color",
+            "num_colors": len(samples),
+            "votes": {},
+        }
+    team, count = max(votes.items(), key=lambda item: item[1])
+    return {
+        "team": int(team),
+        "confidence": float(count / max(1, len(samples))),
+        "source": "roster_color",
+        "num_colors": len(samples),
+        "votes": {int(key): int(value) for key, value in sorted(votes.items())},
+        "mean_score": float(np.mean(by_team_scores[team])) if by_team_scores[team] else 0.0,
+        "mean_margin": float(np.mean(margins)) if margins else 0.0,
+    }
+
+
+def team_color_ranges_by_team_from_roster(roster):
+    """Extract outfield kit colours from player metadata, excluding GK/referee."""
+    ranges_by_team = {}
+    ignored_roles = {"goalkeeper", "keeper", "gk", "referee", "official", "match_official"}
+    for player in roster or []:
+        team_id = player.get("team_id")
+        if team_id is None:
+            continue
+        role = str(player.get("role") or "").lower()
+        if role in ignored_roles:
+            continue
+        metadata = player.get("metadata", {}) or {}
+        color = (
+            metadata.get("team_kit_color")
+            or metadata.get("team_colors")
+            or metadata.get("kit_colors")
+            or metadata.get("kit_color")
+            or metadata.get("uniform_color")
+            or metadata.get("shirt_color")
+            or metadata.get("color")
+        )
+        if color is None:
+            continue
+        team_id = int(team_id)
+        ranges_by_team.setdefault(team_id, {}).update(team_color_to_ranges(color, team_id=team_id))
+    return ranges_by_team
+
+
+def normalize_team_ranges_by_team(color_ranges_by_team):
+    normalized = {}
+    for team_id, ranges in (color_ranges_by_team or {}).items():
+        team_id = int(team_id)
+        normalized[team_id] = {}
+        for name, value in (ranges or {}).items():
+            if isinstance(value, str) or isinstance(value, (list, tuple)):
+                normalized[team_id].update(team_color_to_ranges(value, team_id=team_id, name=str(name)))
+            else:
+                normalized[team_id][str(name)] = list(value)
+    return {team: ranges for team, ranges in normalized.items() if ranges}
+
+
+def team_color_to_ranges(color, team_id=None, name=None):
+    """Normalize a roster colour value into HSV rules used by palette_fraction."""
+    ranges = {}
+    for token in expand_team_color_tokens(color):
+        range_name = name or f"team{team_id}_kit_{token}" if team_id is not None else f"kit_{token}"
+        if token in TEAM_COLOR_RANGES:
+            ranges[range_name] = TEAM_COLOR_RANGES[token]
+            continue
+        ranges.update(color_to_ranges(token, name=range_name))
+    return ranges
+
+
+def expand_team_color_tokens(color):
+    """Accept simple names, aliases, lists and composite strings like black_blue."""
+    if color is None:
+        return []
+    if isinstance(color, (list, tuple)):
+        tokens = []
+        for item in color:
+            tokens.extend(expand_team_color_tokens(item))
+        return tokens
+    text = str(color).strip().lower()
+    if not text:
+        return []
+    normalized = (
+        text.replace("-", "_")
+        .replace("/", "_")
+        .replace("+", "_")
+        .replace("&", "_")
+        .replace(" ", "_")
+    )
+    if normalized in TEAM_COLOR_ALIASES:
+        return TEAM_COLOR_ALIASES[normalized]
+    if normalized in TEAM_COLOR_RANGES:
+        return [normalized]
+    if normalized.startswith("#") or len(normalized) == 6:
+        return [normalized]
+    parts = [part for part in normalized.split("_") if part and part not in {"and", "e"}]
+    if len(parts) > 1:
+        return parts
+    return [normalized]

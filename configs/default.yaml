@@ -43,6 +43,18 @@ linking:
   appearance_min_similarity: 0.72
   max_rejection_records: 5000
 
+jersey_identity_linking:
+  enabled: true
+  max_gap: 90
+  max_distance: 140.0
+  min_frames: 3
+  min_confidence: 0.20
+  min_head_confidence: 0.55
+  min_winner_margin: 0.10
+  min_votes: 5
+  team_gate_min_confidence: 0.60
+  max_rejection_records: 5000
+
 calibration:
   enabled: true
   path: null
@@ -59,6 +71,8 @@ team:
   min_cluster_separation: 30.0
   min_classification_margin: 12.0
   min_tracklet_colors: 3
+  roster_color_min_fraction: 0.16
+  roster_color_min_margin: 0.04
 
 referee:
   enabled: true
@@ -80,6 +94,9 @@ goalkeeper:
 
 jersey_ocr:
   enabled: true
+  # If MMOCR is installed, this combines MMOCR and EasyOCR proposals before
+  # tracklet voting. Without MMOCR it records the failed import and falls back
+  # to EasyOCR, so existing environments still run.
   backend: mmocr_easyocr
   min_confidence: 0.25
   max_crops_per_tracklet: 20
@@ -98,10 +115,12 @@ jersey_ocr:
   min_promoted_candidate_confidence: 0.12
   min_promoted_candidate_votes: 1
   debug_crops: true
-  template_matching: true
+  # GSR OCR evaluation showed template-only votes over-predict "1"; keep it opt-in
+  # until the template candidate is confirmed by OCR or has very strong evidence.
+  template_matching: false
   template_font_image: docs/numberFont.jpg
   template_min_score: 0.62
-  template_weight: 0.10
+  template_weight: 0.03
   template_max_candidates: 4
   aggregate_by_crop: true
   max_candidates_per_crop: 3
@@ -116,8 +135,10 @@ identity:
   unknown_threshold: 0.55
   candidate_top_k: 8
   enforce_unique_team_jersey: true
-  reliable_jersey_min_votes: 2
-  reliable_jersey_min_confidence: 0.5
+  reliable_jersey_min_votes: 5
+  reliable_jersey_min_confidence: 0.20
+  reliable_jersey_min_head_confidence: 0.55
+  reliable_jersey_min_winner_margin: 0.10
   position_prior_max_cost: 0.08
   position_prior_tiebreak_only: true
   require_assignment_evidence: true
@@ -126,11 +147,15 @@ identity:
   strong_evidence_min_visual_similarity: 0.82
   strong_evidence_min_tracklet_frames: 45
   strong_evidence_max_position_distance: 18.0
+  goalkeeper_singleton_gate: true
+  goalkeeper_singleton_min_team_confidence: 0.75
+  goalkeeper_singleton_min_tracklet_frames: 30
   frame_team_consistency: true
   frame_team_min_confidence: 0.70
   frame_team_split_enabled: true
   frame_team_split_min_frames: 8
   frame_team_split_max_gap: 4
+  global_team_jersey_owner: true
   goalkeeper_number_one_prior: true
   number_one_goalkeeper_bonus: 0.08
   number_one_non_goalkeeper_penalty: 0.08
@@ -138,13 +163,13 @@ identity:
 overlay:
   show_display_id: true
   show_jersey: true
-  show_jersey_winner: true
-  show_jersey_min_confidence: 0.55
-  show_jersey_min_votes: 2
+  show_jersey_winner: false
+  show_jersey_min_confidence: 0.30
+  show_jersey_min_votes: 3
   show_jersey_min_stable_votes: 20
-  show_jersey_min_winner_margin: 0.20
-  show_jersey_min_head_votes: 8
-  show_jersey_min_head_confidence: 0.70
+  show_jersey_min_winner_margin: 0.10
+  show_jersey_min_head_votes: 3
+  show_jersey_min_head_confidence: 0.55
   require_ocr_jersey_evidence: true
   show_player_id: false
   show_player_id_min_confidence: 0.80

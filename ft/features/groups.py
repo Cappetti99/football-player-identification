@@ -1,3 +1,12 @@
+"""Assign semantic groups to tracked people for visualization and downstream logic.
+
+This module labels each tracked person as one of five operational groups:
+team 1 player, team 2 player, team 1 goalkeeper, team 2 goalkeeper, or referee.
+The assigned semantic_group_id is used by visualization, exports, OCR filtering,
+and identity constraints, while semantic_group_color is only used to color
+bounding boxes in overlays.
+"""
+
 SEMANTIC_GROUPS = {
     1: "team1_players",
     2: "team2_players",
@@ -7,12 +16,12 @@ SEMANTIC_GROUPS = {
 }
 
 
-GROUP_COLORS = {
-    1: (40, 140, 255),
-    2: (255, 90, 80),
-    3: (40, 220, 255),
-    4: (255, 170, 80),
-    5: (0, 255, 255),
+GROUP_COLORS = { #colori per le bbox dei gruppi, in formato (R, G, B)
+    1: (40, 140, 255), #azzurro per i giocatori della squadra 1
+    2: (255, 90, 80), #rosso per i giocatori della squadra 2
+    3: (40, 220, 255), #azzurro più chiaro per il portiere della squadra 1
+    4: (255, 170, 80), #arancione per il portiere della squadra 2
+    5: (0, 255, 255), #ciano per i referee e referee candidates
 }
 
 

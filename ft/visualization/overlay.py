@@ -2,12 +2,12 @@ DEFAULT_OVERLAY_CONFIG = {
     "show_display_id": True,
     "show_jersey": True,
     "show_jersey_winner": False,
-    "show_jersey_min_confidence": 0.65,
+    "show_jersey_min_confidence": 0.30,
     "show_jersey_min_votes": 3,
     "show_jersey_min_stable_votes": 20,
-    "show_jersey_min_winner_margin": 0.20,
-    "show_jersey_min_head_votes": 8,
-    "show_jersey_min_head_confidence": 0.70,
+    "show_jersey_min_winner_margin": 0.10,
+    "show_jersey_min_head_votes": 3,
+    "show_jersey_min_head_confidence": 0.55,
     "require_ocr_jersey_evidence": True,
     "show_player_id": False,
     "show_player_id_min_confidence": 0.80,
@@ -26,7 +26,7 @@ def draw_overlay(frames, tracks, config=None):
             bbox = [int(v) for v in track["bbox"]]
             if track.get("role_detection") == "referee_candidate":
                 color = tuple(int(v) for v in track.get("semantic_group_color", (0, 255, 255)))
-                label = referee_label(track, prefix="ref?")
+                label = referee_label(track, prefix="ref")
             else:
                 color = tuple(
                     int(v)
