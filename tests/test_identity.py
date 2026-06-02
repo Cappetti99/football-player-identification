@@ -7,6 +7,7 @@ from ft.features.jersey_ocr import (
     is_ocr_player_row,
     mmocr_score,
     normalize_mmocr_model_name,
+    ocr_decision_diagnostics,
     parse_number,
     requested_backends,
     vote_numbers,
@@ -108,6 +109,39 @@ def test_jersey_numbers_start_at_one():
         raise AssertionError("Expected jersey_number=0 to be rejected")
 
 
+def test_roster_kit_hint_feeds_referee_colour_ranges(tmp_path):
+    roster_path = tmp_path / "roster.json"
+    roster_path.write_text(
+        """
+        [
+          {
+            "player_id": "referee_yellow",
+            "name": "Referee",
+            "team_id": null,
+            "jersey_number": null,
+            "role": "referee",
+            "metadata": {
+              "kit_hint": {
+                "shirt": "fluorescent_yellow",
+                "shorts": "black",
+                "socks": "fluorescent_yellow"
+              }
+            }
+          }
+        ]
+        """,
+        encoding="utf-8",
+    )
+
+    from ft.identity.roster import load_roster
+
+    roster = load_roster(roster_path)
+    ranges = referee_color_ranges_from_roster(roster)
+
+    assert roster[0]["metadata"]["kit_color"] == "fluorescent_yellow"
+    assert "roster_fluorescent_yellow" in ranges
+
+
 def test_number_one_is_soft_goalkeeper_prior():
     identifier = HungarianPlayerIdentifier(roster_path=None, unknown_threshold=0.0)
     tracklet = {
@@ -196,6 +230,26 @@ def test_mmocr_backend_alias_keeps_easyocr_fallback():
     assert backend_load_mode("mmocr_easyocr") == "combine"
     assert backend_load_mode("mmocr-fallback") == "fallback"
     assert normalize_mmocr_model_name("dbnet_resnet18_fpnc_1200e_icdar2015", task="det") == "dbnet_resnet18_fpnc_1200e_icdar2015"
+
+
+def test_ocr_diagnostics_explain_direct_only_single_digit_rejection():
+    raw = [
+        {
+            "source": "mmocr",
+            "ocr_channel": "direct",
+            "crop_path": "a.jpg",
+            "variant": "mmocr_torso",
+            "number": 6,
+            "confidence": 0.9,
+        }
+    ]
+    aggregated = aggregate_detections_by_crop(raw, min_raw_confidence=0.05)
+    voted = vote_numbers(aggregated, min_raw_confidence=0.05)
+    diagnostics = ocr_decision_diagnostics(raw, aggregated, voted, min_votes=2, min_raw_confidence=0.05)
+
+    assert voted is None
+    assert diagnostics["status"] == "only_direct_single_digit_candidates"
+    assert diagnostics["voting_rejection_reasons"]["direct_only_single_digit"] == 1
 
 
 def test_mmocr_score_uses_mean_character_confidence():
@@ -1393,6 +1447,7 @@ if __name__ == "__main__":
     test_template_prefers_two_digit_candidates_over_digit_fragments()
     test_ocr_aggregates_variants_by_crop_before_voting()
     test_mmocr_backend_alias_keeps_easyocr_fallback()
+    test_ocr_diagnostics_explain_direct_only_single_digit_rejection()
     test_mmocr_score_uses_mean_character_confidence()
     test_ocr_skips_referee_candidate_rows()
     test_team_assigner_uses_roster_kit_colors_without_kmeans()

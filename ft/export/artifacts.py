@@ -11,17 +11,35 @@ from ft.utils.geometry import bbox_height, clip_bbox
 class ArtifactExporter:
     """Persist crops and metadata rows used by downstream identification."""
 
-    def __init__(self, artifacts_dir, video_id, progress_every=5000, save_crops=True):
+    def __init__(
+        self,
+        artifacts_dir,
+        video_id,
+        progress_every=5000,
+        save_crops=True,
+        deduplicate_crops=True,
+    ):
         self.artifacts_dir = Path(artifacts_dir)
         self.video_id = video_id
         self.progress_every = int(progress_every or 0)
         self.save_crops = bool(save_crops)
+        self.deduplicate_crops = bool(deduplicate_crops)
         self.metadata_dir = self.artifacts_dir / "metadata"
         self.crops_dir = self.artifacts_dir / "crops" / video_id
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         self.crops_dir.mkdir(parents=True, exist_ok=True)
+        self._crop_cache = {}
+        self.crop_stats = {
+            "save_crops": self.save_crops,
+            "deduplicate_crops": self.deduplicate_crops,
+            "saved": 0,
+            "reused": 0,
+            "skipped_empty": 0,
+            "write_failed": 0,
+            "bytes_written": 0,
+        }
 
-    def export_tracklets(self, frames, tracks, stage="tracklets"):
+    def export_tracklets(self, frames, tracks, stage="tracklets", save_json=True, save_csv=True):
         rows = []
         frame_groups = tracks.get("players", [])
         print(
@@ -30,14 +48,15 @@ class ArtifactExporter:
         )
         for frame_num, frame_tracks in enumerate(frame_groups):
             frame = frames[frame_num]
-            for raw_track_id, track in sorted(frame_tracks.items()):
+            for track_group, raw_track_id, track in self._frame_export_items(tracks, frame_num):
                 bbox = clip_bbox(track["bbox"], frame)
-                crop_path = self._save_crop(frame, frame_num, raw_track_id, bbox)
+                crop_path = self._save_crop(frame, frame_num, raw_track_id, bbox, track_group=track_group)
                 # Keep both raw and display IDs: raw_track_id is useful for
                 # tracker debugging, while display_track_id is the semantic
                 # identity surface after linking/splitting.
                 row = {
                     "video_id": self.video_id,
+                    "track_group": track_group,
                     "frame": int(frame_num),
                     "track_id": int(raw_track_id),
                     "raw_track_id": int(track.get("raw_track_id", raw_track_id)),
@@ -78,6 +97,15 @@ class ArtifactExporter:
                     "player_name": track.get("player_name", "unknown"),
                     "identity_confidence": float(track.get("identity_confidence", 0.0)),
                     "identity_evidence": track.get("identity_evidence", {}),
+                    "candidate_player_id": track.get("candidate_player_id"),
+                    "candidate_player_name": track.get("candidate_player_name"),
+                    "candidate_team_id": track.get("candidate_team_id"),
+                    "candidate_jersey_number": track.get("candidate_jersey_number"),
+                    "candidate_confidence": float(track.get("candidate_confidence", 0.0)),
+                    "candidate_cost": track.get("candidate_cost"),
+                    "candidate_margin": track.get("candidate_margin"),
+                    "candidate_reason": track.get("candidate_reason"),
+                    "candidate_evidence": track.get("candidate_evidence", {}),
                     "referee_like_score": float(track.get("referee_like_score", 0.0)),
                     "referee_like_color": track.get("referee_like_color"),
                     "referee_palette_match": bool(track.get("referee_palette_match", False)),
@@ -93,23 +121,57 @@ class ArtifactExporter:
                         flush=True,
                     )
         print(f"FT export {stage}: writing metadata rows={len(rows)}", flush=True)
-        self.write_json(rows, self.metadata_dir / f"{self.video_id}_tracklets.json")
-        self.write_csv(rows, self.metadata_dir / f"{self.video_id}_tracklets.csv")
-        print(f"FT export {stage}: done rows={len(rows)}", flush=True)
+        if save_json:
+            self.write_json(rows, self.metadata_dir / f"{self.video_id}_tracklets.json")
+        if save_csv:
+            self.write_csv(rows, self.metadata_dir / f"{self.video_id}_tracklets.csv")
+        print(
+            f"FT export {stage}: done rows={len(rows)}"
+            f" crops_saved={self.crop_stats['saved']}"
+            f" crops_reused={self.crop_stats['reused']}",
+            flush=True,
+        )
         return rows
 
-    def _save_crop(self, frame, frame_num, track_id, bbox):
+    @staticmethod
+    def _frame_export_items(tracks, frame_num):
+        for track_group in ("players", "referees"):
+            frame_groups = tracks.get(track_group, [])
+            if frame_num >= len(frame_groups):
+                continue
+            for raw_track_id, track in sorted(frame_groups[frame_num].items()):
+                yield track_group, raw_track_id, track
+
+    def _save_crop(self, frame, frame_num, track_id, bbox, track_group="players"):
         if not self.save_crops:
             return None
         x1, y1, x2, y2 = map(int, bbox)
         if x2 <= x1 or y2 <= y1:
+            self.crop_stats["skipped_empty"] += 1
             return None
+        cache_key = (track_group, int(frame_num), int(track_id), x1, y1, x2, y2)
+        if self.deduplicate_crops and cache_key in self._crop_cache:
+            self.crop_stats["reused"] += 1
+            return self._crop_cache[cache_key]
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
+            self.crop_stats["skipped_empty"] += 1
             return None
-        path = self.crops_dir / f"track_{int(track_id):04d}_frame_{frame_num:06d}.jpg"
-        cv2.imwrite(str(path), crop)
+        path = self.crops_dir / f"{track_group}_track_{int(track_id):04d}_frame_{frame_num:06d}.jpg"
+        if not cv2.imwrite(str(path), crop):
+            self.crop_stats["write_failed"] += 1
+            return None
+        self.crop_stats["saved"] += 1
+        try:
+            self.crop_stats["bytes_written"] += path.stat().st_size
+        except OSError:
+            pass
+        if self.deduplicate_crops:
+            self._crop_cache[cache_key] = path
         return path
+
+    def diagnostics(self):
+        return {"crops": dict(self.crop_stats)}
 
     @staticmethod
     def write_json(payload, path):

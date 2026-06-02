@@ -1,0 +1,7 @@
+base_config: default.yaml
+
+jersey_ocr:
+  number_roi_enabled: true
+  number_roi_upscale: 3
+  number_roi_clahe: true
+  mmocr_direct_recognition: true

@@ -9,11 +9,34 @@ class VisualFeatureExtractor:
     Hungarian assignment a weak physical/visual cue.
     """
 
+    def __init__(self, cache_enabled=True):
+        self.cache_enabled = bool(cache_enabled)
+        self._cache = {}
+        self.stats = {
+            "cache_enabled": self.cache_enabled,
+            "computed": 0,
+            "reused": 0,
+        }
+
     def add_row_features(self, rows):
         for row in rows:
             crop_path = row.get("crop_path")
-            row["visual_embedding"] = self.extract(crop_path) if crop_path else None
+            row["visual_embedding"] = self.extract_cached(crop_path) if crop_path else None
         return rows
+
+    def extract_cached(self, crop_path):
+        key = str(crop_path)
+        if self.cache_enabled and key in self._cache:
+            self.stats["reused"] += 1
+            return self._cache[key]
+        embedding = self.extract(crop_path)
+        self.stats["computed"] += 1
+        if self.cache_enabled:
+            self._cache[key] = embedding
+        return embedding
+
+    def diagnostics(self):
+        return dict(self.stats)
 
     @staticmethod
     def extract(crop_path):

@@ -5,6 +5,10 @@ artifacts_dir: artifacts/ft_run
 roster_path: configs/roster.example.json
 max_frames: 300
 
+run:
+  validate_inputs: true
+  unknown_config_keys: warn
+
 detection:
   confidence: 0.05
   ball_confidence: 0.002
@@ -63,6 +67,18 @@ calibration:
   auto_recalibrate_every: 0
   pitch_length: 105.0
   pitch_width: 68.0
+  tvcalib:
+    enabled: false
+    path: null
+    per_frame: true
+    coordinate_system: tvcalib_centered
+    invert: false
+    temporal_index: 0
+    frame_offset: 0
+    nearest_frame: true
+    max_frame_gap: null
+    image_id: null
+    frame: null
 
 team:
   enabled: true
@@ -73,6 +89,10 @@ team:
   min_tracklet_colors: 3
   roster_color_min_fraction: 0.16
   roster_color_min_margin: 0.04
+  prefer_roster_palette: true
+  trusted_palette_min_fraction: 0.18
+  trusted_palette_min_margin: 0.04
+  trusted_palette_min_samples: 3
 
 referee:
   enabled: true
@@ -129,7 +149,16 @@ jersey_ocr:
   mmocr_det: dbnet_resnet18_fpnc_1200e_icdar2015
   mmocr_rec: SAR
   mmocr_batch_size: 8
+  mmocr_direct_recognition: null
   progress_every: 5
+  cache_enabled: true
+  cache_dir: .ft_cache/ocr
+  number_roi_enabled: false
+  number_roi_upscale: 3
+  number_roi_clahe: true
+  demote_direct_only_single_digits: true
+  prefer_two_digit_candidates: true
+  apply_to_goalkeepers: false
 
 identity:
   unknown_threshold: 0.55
@@ -159,6 +188,11 @@ identity:
   goalkeeper_number_one_prior: true
   number_one_goalkeeper_bonus: 0.08
   number_one_non_goalkeeper_penalty: 0.08
+  candidate_fallback:
+    enabled: true
+    min_confidence: 0.35
+    max_cost: 0.85
+    min_margin: 0.0
 
 overlay:
   show_display_id: true
@@ -193,3 +227,8 @@ progress:
 
 export:
   save_crops: true
+  deduplicate_crops: true
+  save_pre_identity_json: false
+  save_pre_identity_csv: true
+  save_final_json: true
+  save_final_csv: true

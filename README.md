@@ -100,6 +100,7 @@ configs/
   bytetrack_tracking_debug.yaml
   strongsort.yaml
   strongsort_tracking_debug.yaml
+  tvcalib_calibration.example.yaml
 
 docs/
   numberFont.jpg            jersey-number font reference for template matching
@@ -174,6 +175,53 @@ costume-video/Roma-Verona/Roma-Verona.json
 ```
 
 `costume-video/` is ignored by git except for its placeholder files.
+
+## TVCalib Calibration
+
+The default calibration remains the lightweight field-quad fallback. For runs
+where position priors matter, the pipeline can now consume TVCalib
+`per_sample_output.json` files and use one homography per sampled frame.
+
+Expected TVCalib input:
+
+```text
+evaluation_outputs/tvcalib/<MatchName>/per_sample_output.json
+```
+
+The file may be JSONL as produced by TVCalib, a JSON list, or a dict of keyed
+records. Each record must contain a `homography` field and should include an
+`image_id`, `image_ids`, `frame`, or `frame_index` so FT can align it to video
+frames. Numeric suffixes such as `frame_000250.jpg` are interpreted as frame
+numbers.
+
+Example override:
+
+```yaml
+base_config: default.yaml
+
+calibration:
+  enabled: true
+  auto: false
+  tvcalib:
+    enabled: true
+    path: evaluation_outputs/tvcalib/Inter-Juve/per_sample_output.json
+    per_frame: true
+    coordinate_system: tvcalib_centered
+    frame_offset: 0
+    nearest_frame: true
+    max_frame_gap: 75
+```
+
+`coordinate_system: tvcalib_centered` converts TVCalib/SoccerNet centered field
+coordinates into FT pitch meters `[0, 105] x [0, 68]`. Use
+`coordinate_system: ft` only if the homography is already in FT's top-left pitch
+coordinate system.
+
+The run writes calibration diagnostics to:
+
+```text
+artifacts/.../metadata/<video_id>_calibration.json
+```
 
 ## Roster Format
 
@@ -298,13 +346,31 @@ For a run under `artifacts/costume-video/<run_name>/metadata/`:
 *_tracklets.csv                  final per-frame table
 *_tracklet_summaries.csv         one row per display_track_id
 *_candidate_scores.csv           Hungarian assignment candidate costs
+*_identity_candidates.csv/json   diagnostic best candidate for unknown tracks
+*_run_manifest.json              resolved config, environment and git snapshot
+*_run_diagnostics.json           timing and artifact disk delta by stage
 *_identity_assignments.json      final tracklet identity assignments
 *_jersey_ocr.json                OCR detections, votes and candidates
 *_constraints.json               identity-constraint diagnostics
 *_linking.json                   tracklet-linking diagnostics
+*_calibration.json               pitch calibration source and frame matching diagnostics
+*_export.json                    crop write/reuse diagnostics
+*_visual_features.json           visual embedding cache diagnostics
 *_referee_colour.json            referee colour diagnostics
 *_goalkeeper_colour.json         goalkeeper colour diagnostics
 ```
+
+OCR results are cached across runs when `jersey_ocr.cache_enabled` is true.
+The default cache directory is:
+
+```text
+.ft_cache/ocr/jersey_ocr/
+```
+
+The cache key includes the crop contents and OCR/template configuration, so
+reruns reuse expensive OCR calls while config changes naturally miss the cache.
+The `pre_identity` export skips the large JSON file by default and keeps CSV
+plus crops; the final export still writes both CSV and JSON.
 
 Useful high-level diagnostics:
 
@@ -392,7 +458,7 @@ python3 -m ft.cli run --help
   stack and should be kept separate from the lightweight runtime environment.
 - The single-font template matcher is disabled by default because it did not
   improve the controlled SoccerNet-GSR evaluation and can over-predict `1`.
-- Pitch calibration has an automatic fallback but is not a full metric field-keypoint model.
+- Pitch calibration can use TVCalib outputs when available; otherwise it falls back to a simple field-quad estimate.
 
 ## Thesis Direction
 

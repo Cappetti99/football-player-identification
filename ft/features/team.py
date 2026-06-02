@@ -55,6 +55,10 @@ class TeamAssigner:
         color_ranges_by_team=None,
         roster_color_min_fraction=0.16,
         roster_color_min_margin=0.04,
+        prefer_roster_palette=True,
+        trusted_palette_min_fraction=None,
+        trusted_palette_min_margin=None,
+        trusted_palette_min_samples=None,
     ):
         self.max_seed_frames = int(max_seed_frames)
         self.min_seed_colors = int(min_seed_colors)
@@ -62,8 +66,20 @@ class TeamAssigner:
         self.min_classification_margin = float(min_classification_margin)
         self.min_tracklet_colors = int(min_tracklet_colors)
         self.color_ranges_by_team = normalize_team_ranges_by_team(color_ranges_by_team)
-        self.roster_color_min_fraction = float(roster_color_min_fraction)
-        self.roster_color_min_margin = float(roster_color_min_margin)
+        self.prefer_roster_palette = bool(prefer_roster_palette)
+        self.roster_color_min_fraction = float(
+            trusted_palette_min_fraction
+            if trusted_palette_min_fraction is not None
+            else roster_color_min_fraction
+        )
+        self.roster_color_min_margin = float(
+            trusted_palette_min_margin
+            if trusted_palette_min_margin is not None
+            else roster_color_min_margin
+        )
+        self.trusted_palette_min_samples = (
+            int(trusted_palette_min_samples) if trusted_palette_min_samples is not None else None
+        )
         self.kmeans = None
         self.team_colors = {}
 
@@ -87,7 +103,11 @@ class TeamAssigner:
         # KMeans remains available as a fallback for videos/teams where the
         # roster does not describe the kit or the crop is too ambiguous.
         cluster_assignments = self._assign_tracklets(frames, tracks)
-        roster_assignments = self._assign_tracklets_by_roster_palette(frames, tracks)
+        roster_assignments = (
+            self._assign_tracklets_by_roster_palette(frames, tracks)
+            if self.prefer_roster_palette
+            else {}
+        )
         assignments = merge_assignments(roster_assignments, cluster_assignments)
         frame_assignments = self._assign_frames(frames, tracks)
         self._apply(assignments, frame_assignments, tracks)
@@ -390,10 +410,17 @@ def team_color_ranges_by_team_from_roster(roster):
             or metadata.get("shirt_color")
             or metadata.get("color")
         )
-        if color is None:
-            continue
         team_id = int(team_id)
-        ranges_by_team.setdefault(team_id, {}).update(team_color_to_ranges(color, team_id=team_id))
+        colors = []
+        if color is not None:
+            colors.append(color)
+        kit_hint = metadata.get("kit_hint") or {}
+        if isinstance(kit_hint, dict):
+            shirt = kit_hint.get("shirt") or kit_hint.get("shirt_color") or kit_hint.get("primary")
+            if shirt:
+                colors.append(shirt)
+        for item in colors:
+            ranges_by_team.setdefault(team_id, {}).update(team_color_to_ranges(item, team_id=team_id))
     return ranges_by_team
 
 

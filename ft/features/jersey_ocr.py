@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ft.caching.cache_manager import DisabledCache, JsonDiskCache, hash_file, stable_hash
 from ft.features.jersey_template import JerseyTemplateMatcher
 
 
@@ -39,7 +40,15 @@ class JerseyOCR:
         mmocr_det="dbnet_resnet18_fpnc_1200e_icdar2015",
         mmocr_rec="SAR",
         mmocr_batch_size=8,
+        mmocr_direct_recognition=None,
         progress_every=5,
+        cache_enabled=True,
+        cache_dir=".ft_cache/ocr",
+        number_roi_enabled=False,
+        number_roi_upscale=3,
+        number_roi_clahe=True,
+        demote_direct_only_single_digits=True,
+        prefer_two_digit_candidates=True,
     ):
         self.requested_backend_name = backend
         self.backend_name = backend
@@ -65,8 +74,19 @@ class JerseyOCR:
         self.mmocr_det = str(mmocr_det)
         self.mmocr_rec = str(mmocr_rec)
         self.mmocr_batch_size = int(mmocr_batch_size)
+        self.mmocr_direct_recognition = (
+            bool(number_roi_enabled) if mmocr_direct_recognition is None else bool(mmocr_direct_recognition)
+        )
         self.progress_every = int(progress_every or 0)
         self.backends = []
+        self.cache_enabled = bool(cache_enabled)
+        self.cache_dir = Path(cache_dir) if cache_dir else Path(".ft_cache/ocr")
+        self.number_roi_enabled = bool(number_roi_enabled)
+        self.number_roi_upscale = max(1, int(number_roi_upscale))
+        self.number_roi_clahe = bool(number_roi_clahe)
+        self.demote_direct_only_single_digits = bool(demote_direct_only_single_digits)
+        self.prefer_two_digit_candidates = bool(prefer_two_digit_candidates)
+        self.cache = JsonDiskCache(self.cache_dir, "jersey_ocr") if self.cache_enabled else DisabledCache()
         self.backend = None
         self.message = None
         self.backend_attempts = []
@@ -121,9 +141,17 @@ class JerseyOCR:
                     detections.extend(self._recognize_row(row, track_id, pass_index))
             voting_detections = self._voting_detections(detections)
             voted = vote_numbers(voting_detections, min_raw_confidence=self.min_raw_confidence)
+            decision = ocr_decision_diagnostics(
+                detections,
+                voting_detections,
+                voted,
+                min_votes=self.min_votes,
+                min_raw_confidence=self.min_raw_confidence,
+            )
             diagnostics[str(track_id)] = {
                 "available_crops": len(items),
                 "usable_crops": len(usable_items),
+                "crop_selection": crop_selection_diagnostics(items, usable_items, selected),
                 "selected_crops": [
                     {
                         "pass": pass_index,
@@ -141,6 +169,7 @@ class JerseyOCR:
                 "raw_detection_count": len(detections),
                 "voting_detection_count": len(voting_detections),
                 "voted": voted,
+                "decision": decision,
             }
             if voted and voted["votes"] >= self.min_votes:
                 assignments[track_id] = voted
@@ -177,7 +206,18 @@ class JerseyOCR:
                 "det": self.mmocr_det,
                 "rec": self.mmocr_rec,
                 "batch_size": self.mmocr_batch_size,
+                "direct_recognition": self.mmocr_direct_recognition,
             },
+            "number_roi": {
+                "enabled": self.number_roi_enabled,
+                "upscale": self.number_roi_upscale,
+                "clahe": self.number_roi_clahe,
+            },
+            "voting_policy": {
+                "demote_direct_only_single_digits": self.demote_direct_only_single_digits,
+                "prefer_two_digit_candidates": self.prefer_two_digit_candidates,
+            },
+            "cache": self.cache.diagnostics(),
             "template_matching": self._template_diagnostics(),
             "tracklets": diagnostics,
             "assigned_tracklets": {str(k): v for k, v in assignments.items()},
@@ -194,6 +234,8 @@ class JerseyOCR:
             min_raw_confidence=self.min_raw_confidence,
             max_candidates_per_crop=self.max_candidates_per_crop,
             min_candidate_ratio=self.min_crop_candidate_ratio,
+            demote_direct_only_single_digits_enabled=self.demote_direct_only_single_digits,
+            prefer_two_digit_candidates_enabled=self.prefer_two_digit_candidates,
         )
 
     def _load_backends(self):
@@ -226,6 +268,7 @@ class JerseyOCR:
                 det=self.mmocr_det,
                 rec=self.mmocr_rec,
                 batch_size=self.mmocr_batch_size,
+                direct_recognition=self.mmocr_direct_recognition,
             )
         if backend == "mmocr_rec":
             return MMOCRRecognitionBackend(
@@ -296,14 +339,33 @@ class JerseyOCR:
         return "unavailable"
 
     def _recognize_row(self, row, track_id, pass_index=0):
+        cache_key = self._row_cache_key(row)
+        cached = self.cache.get(cache_key) if cache_key else None
+        if cached is not None:
+            return [
+                self._materialize_cached_detection(item, row, pass_index)
+                for item in cached.get("detections", [])
+            ]
+
         detections = []
         for backend in self.backends:
             reader = backend["reader"]
             backend_name = backend["name"]
             if getattr(reader, "uses_text_detection", False):
-                variants = preprocess_text_detection_variants(row["crop_path"])
+                variants = preprocess_text_detection_variants(
+                    row["crop_path"],
+                    number_roi_enabled=self.number_roi_enabled,
+                    number_roi_upscale=self.number_roi_upscale,
+                    number_roi_clahe=self.number_roi_clahe,
+                )
             else:
-                variants = preprocess_variants(row["crop_path"], augment=self.augment)
+                variants = preprocess_variants(
+                    row["crop_path"],
+                    augment=self.augment,
+                    number_roi_enabled=self.number_roi_enabled,
+                    number_roi_upscale=self.number_roi_upscale,
+                    number_roi_clahe=self.number_roi_clahe,
+                )
             detections.extend(
                 self._recognize_backend_variants(
                     row,
@@ -323,7 +385,13 @@ class JerseyOCR:
                 and item.get("source") != "template"
                 and float(item.get("confidence", 0.0) or 0.0) >= self.min_raw_confidence
             }
-            for name, image in preprocess_variants(row["crop_path"], augment=self.augment):
+            for name, image in preprocess_variants(
+                row["crop_path"],
+                augment=self.augment,
+                number_roi_enabled=self.number_roi_enabled,
+                number_roi_upscale=self.number_roi_upscale,
+                number_roi_clahe=self.number_roi_clahe,
+            ):
                 self._write_debug(track_id, row, name, image, pass_index)
                 if not is_template_variant(name):
                     continue
@@ -344,14 +412,78 @@ class JerseyOCR:
                             "template": candidate,
                         }
                     )
+        if cache_key:
+            self.cache.set(
+                cache_key,
+                {
+                    "schema": 1,
+                    "config": self._cache_config(),
+                    "detections": [self._cacheable_detection(item) for item in detections],
+                },
+            )
         return detections
+
+    def _row_cache_key(self, row):
+        crop_path = row.get("crop_path")
+        if not crop_path:
+            return None
+        try:
+            crop_hash = hash_file(crop_path)
+        except OSError:
+            return None
+        return stable_hash({"crop_hash": crop_hash, "config": self._cache_config()})
+
+    def _cache_config(self):
+        return {
+            "backend": self.backend_name,
+            "min_confidence": self.min_confidence,
+            "augment": self.augment,
+            "template_matching": self.template_matching,
+            "template_font_image": str(self.template_font_image) if self.template_font_image else None,
+            "template_min_score": self.template_min_score,
+            "template_weight": self.template_weight,
+            "template_max_candidates": self.template_max_candidates,
+            "mmocr_det": self.mmocr_det,
+            "mmocr_rec": self.mmocr_rec,
+            "mmocr_direct_recognition": self.mmocr_direct_recognition,
+            "direct_recognition_variant_policy": "number_roi_regions_v2",
+            "demote_direct_only_single_digits": self.demote_direct_only_single_digits,
+            "prefer_two_digit_candidates": self.prefer_two_digit_candidates,
+            "number_roi_enabled": self.number_roi_enabled,
+            "number_roi_upscale": self.number_roi_upscale,
+            "number_roi_clahe": self.number_roi_clahe,
+        }
+
+    @staticmethod
+    def _cacheable_detection(item):
+        return {
+            key: value
+            for key, value in item.items()
+            if key not in {"crop_path", "frame", "pass"}
+        }
+
+    @staticmethod
+    def _materialize_cached_detection(item, row, pass_index):
+        out = dict(item)
+        out["pass"] = pass_index
+        out["crop_path"] = row.get("crop_path")
+        out["frame"] = row.get("frame")
+        return out
 
     def _recognize_backend_variants(self, row, track_id, pass_index, backend_name, backend, variants):
         detections = []
         for name, image in variants:
             self._write_debug(track_id, row, name, image, pass_index)
             try:
-                raw = backend.read(image)
+                if getattr(backend, "supports_direct_recognition_control", False):
+                    raw = backend.read(
+                        image,
+                        direct_recognition=(
+                            self.mmocr_direct_recognition and should_direct_recognize_variant(name)
+                        ),
+                    )
+                else:
+                    raw = backend.read(image)
             except Exception as exc:
                 detections.append(
                     {
@@ -366,16 +498,19 @@ class JerseyOCR:
                     }
                 )
                 raw = []
-            for text, confidence in raw:
+            for item in raw:
+                text, confidence, ocr_channel = normalize_ocr_result(item)
+                number = parse_number(text)
                 detections.append(
                     {
                         "source": backend_name,
+                        "ocr_channel": ocr_channel,
                         "pass": pass_index,
                         "crop_path": row.get("crop_path"),
                         "frame": row.get("frame"),
                         "variant": name,
                         "text": text,
-                        "number": parse_number(text),
+                        "number": number,
                         "confidence": float(confidence or 0.0),
                     }
                 )
@@ -425,12 +560,21 @@ class TesseractBackend:
 
 class MMOCRBackend:
     uses_text_detection = True
+    supports_direct_recognition_control = True
 
-    def __init__(self, device="cuda:0", det="dbnet_resnet18_fpnc_1200e_icdar2015", rec="SAR", batch_size=8):
+    def __init__(
+        self,
+        device="cuda:0",
+        det="dbnet_resnet18_fpnc_1200e_icdar2015",
+        rec="SAR",
+        batch_size=8,
+        direct_recognition=False,
+    ):
         self.device = device
         self.det = normalize_mmocr_model_name(det, task="det")
         self.rec = normalize_mmocr_model_name(rec, task="rec")
         self.batch_size = int(batch_size)
+        self.direct_recognition = bool(direct_recognition)
         self.mode = "mmocr_inferencer"
         try:
             from mmocr.apis import MMOCRInferencer
@@ -451,7 +595,7 @@ class MMOCRBackend:
             self.crop_img = crop_img
             self.poly2bbox = poly2bbox
 
-    def read(self, image):
+    def read(self, image, direct_recognition=None):
         image = np.asarray(image)
         if image.ndim == 2:
             image = np.repeat(image[:, :, None], 3, axis=2)
@@ -459,7 +603,7 @@ class MMOCRBackend:
             image = np.clip(image, 0, 255).astype(np.uint8)
         if self.mode == "mmocr_inferencer":
             return self._read_with_mmocr_inferencer(image)
-        return self._read_with_standard_inferencers(image)
+        return self._read_with_standard_inferencers(image, direct_recognition=direct_recognition)
 
     def _read_with_mmocr_inferencer(self, image):
         result = self.inferencer(
@@ -485,20 +629,27 @@ class MMOCRBackend:
                 rows.append((text, confidence))
         return rows
 
-    def _read_with_standard_inferencers(self, image):
+    def _read_with_standard_inferencers(self, image, direct_recognition=None):
+        rec_inputs = []
+        rec_channels = []
+        use_direct_recognition = self.direct_recognition if direct_recognition is None else bool(direct_recognition)
+        if use_direct_recognition:
+            rec_inputs.append(image)
+            rec_channels.append("direct")
+
         det_data = self.textdetinferencer(
             [image],
             return_datasamples=True,
             batch_size=1,
             progress_bar=False,
         )["predictions"][0]
-        rec_inputs = []
         for polygon in pred_instance_polygons(det_data.pred_instances):
             quad = self.bbox2poly(self.poly2bbox(polygon)).tolist()
             rec_input = self.crop_img(image, quad)
             if rec_input.shape[0] == 0 or rec_input.shape[1] == 0:
                 continue
             rec_inputs.append(rec_input)
+            rec_channels.append("detected_box")
         if not rec_inputs:
             return []
 
@@ -509,11 +660,11 @@ class MMOCRBackend:
             progress_bar=False,
         )["predictions"]
         rows = []
-        for prediction in rec_predictions:
+        for prediction, channel in zip(rec_predictions, rec_channels):
             result = self.textrecinferencer.pred2dict(prediction)
             text = result.get("text")
             confidence = mmocr_score(result.get("scores"))
-            rows.append((text, confidence))
+            rows.append((text, confidence, channel))
         return rows
 
 
@@ -685,6 +836,19 @@ def mmocr_score(scores):
     return float(max(0.0, min(1.0, float(array.mean()))))
 
 
+def normalize_ocr_result(item):
+    if isinstance(item, dict):
+        return item.get("text"), item.get("confidence", 0.0), item.get("ocr_channel", "unknown")
+    if isinstance(item, (list, tuple)):
+        if len(item) >= 3:
+            return item[0], item[1], item[2]
+        if len(item) >= 2:
+            return item[0], item[1], "unknown"
+        if len(item) == 1:
+            return item[0], 0.0, "unknown"
+    return item, 0.0, "unknown"
+
+
 def select_spread_crops(items, max_count, pass_index=0, pass_count=1):
     if max_count <= 0:
         return []
@@ -741,23 +905,37 @@ def filter_quality_items(items, min_crop_quality):
     return filtered if len(filtered) >= 3 else list(items)
 
 
-def preprocess_variants(crop_path, augment=True):
+def crop_selection_diagnostics(items, usable_items, selected):
+    selected_keys = {
+        (int(pass_index), str(row.get("crop_path")), int(row.get("frame", 0)))
+        for pass_index, row in selected
+    }
+    quality_values = [float(row.get("crop_quality", 0.0) or 0.0) for row in items]
+    return {
+        "available": len(items),
+        "usable": len(usable_items),
+        "selected": len(selected),
+        "unselected": max(0, len(usable_items) - len(selected_keys)),
+        "min_quality": min(quality_values) if quality_values else None,
+        "max_quality": max(quality_values) if quality_values else None,
+        "mean_quality": float(sum(quality_values) / len(quality_values)) if quality_values else None,
+    }
+
+
+def preprocess_variants(
+    crop_path,
+    augment=True,
+    number_roi_enabled=False,
+    number_roi_upscale=3,
+    number_roi_clahe=True,
+):
     import cv2
 
     image = cv2.imread(str(crop_path))
     if image is None or image.size == 0:
         return []
     h, w = image.shape[:2]
-    regions = {
-        "full_body": (0.00, 1.00, 0.00, 1.00),
-        "back_number_wide": (0.12, 0.72, 0.04, 0.96),
-        "back_number_mid": (0.18, 0.70, 0.12, 0.88),
-        "full_upper": (0.04, 0.82, 0.06, 0.94),
-        "upper": (0.08, 0.66, 0.10, 0.90),
-        "torso": (0.20, 0.78, 0.18, 0.82),
-        "center_torso": (0.24, 0.74, 0.28, 0.72),
-        "lower_torso": (0.34, 0.86, 0.18, 0.82),
-    }
+    regions = number_roi_regions() if number_roi_enabled else legacy_ocr_regions()
     variants = []
     for name, (top_r, bottom_r, left_r, right_r) in regions.items():
         top = int(h * top_r)
@@ -767,14 +945,14 @@ def preprocess_variants(crop_path, augment=True):
         crop = image[top:bottom, left:right]
         if crop.size == 0:
             continue
-        scale = 3 if max(crop.shape[:2]) < 160 else 2
+        scale = int(number_roi_upscale) if number_roi_enabled else (3 if max(crop.shape[:2]) < 160 else 2)
         crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         crop = cv2.copyMakeBorder(crop, 8, 8, 8, 8, cv2.BORDER_REPLICATE)
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         equalized = cv2.equalizeHist(gray)
         variants.append((f"{name}_equalized", equalized))
         if augment:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray) if number_roi_clahe else equalized
             variants.append((f"{name}_clahe", clahe))
             sharpened = cv2.filter2D(equalized, -1, np.asarray([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32))
             variants.append((f"{name}_sharpened", sharpened))
@@ -795,19 +973,19 @@ def preprocess_variants(crop_path, augment=True):
     return variants
 
 
-def preprocess_text_detection_variants(crop_path):
+def preprocess_text_detection_variants(
+    crop_path,
+    number_roi_enabled=False,
+    number_roi_upscale=3,
+    number_roi_clahe=True,
+):
     import cv2
 
     image = cv2.imread(str(crop_path))
     if image is None or image.size == 0:
         return []
     h, w = image.shape[:2]
-    regions = {
-        "mmocr_full_body": (0.00, 1.00, 0.00, 1.00),
-        "mmocr_back_number_wide": (0.10, 0.76, 0.04, 0.96),
-        "mmocr_upper": (0.06, 0.70, 0.08, 0.92),
-        "mmocr_torso": (0.18, 0.78, 0.16, 0.84),
-    }
+    regions = number_roi_regions(prefix="mmocr") if number_roi_enabled else legacy_mmocr_regions()
     variants = []
     for name, (top_r, bottom_r, left_r, right_r) in regions.items():
         top = int(h * top_r)
@@ -817,11 +995,56 @@ def preprocess_text_detection_variants(crop_path):
         crop = image[top:bottom, left:right]
         if crop.size == 0:
             continue
-        scale = 3 if max(crop.shape[:2]) < 160 else 2
+        scale = int(number_roi_upscale) if number_roi_enabled else (3 if max(crop.shape[:2]) < 160 else 2)
         crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         crop = cv2.copyMakeBorder(crop, 8, 8, 8, 8, cv2.BORDER_REPLICATE)
         variants.append((name, crop))
+        if number_roi_enabled and number_roi_clahe:
+            lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+            l_chan, a_chan, b_chan = cv2.split(lab)
+            l_chan = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l_chan)
+            clahe = cv2.cvtColor(cv2.merge([l_chan, a_chan, b_chan]), cv2.COLOR_LAB2BGR)
+            variants.append((f"{name}_clahe", clahe))
+        if number_roi_enabled:
+            sharpened = cv2.filter2D(
+                crop,
+                -1,
+                np.asarray([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32),
+            )
+            variants.append((f"{name}_sharpened", sharpened))
     return variants
+
+
+def legacy_ocr_regions():
+    return {
+        "full_body": (0.00, 1.00, 0.00, 1.00),
+        "back_number_wide": (0.12, 0.72, 0.04, 0.96),
+        "back_number_mid": (0.18, 0.70, 0.12, 0.88),
+        "full_upper": (0.04, 0.82, 0.06, 0.94),
+        "upper": (0.08, 0.66, 0.10, 0.90),
+        "torso": (0.20, 0.78, 0.18, 0.82),
+        "center_torso": (0.24, 0.74, 0.28, 0.72),
+        "lower_torso": (0.34, 0.86, 0.18, 0.82),
+    }
+
+
+def legacy_mmocr_regions():
+    return {
+        "mmocr_full_body": (0.00, 1.00, 0.00, 1.00),
+        "mmocr_back_number_wide": (0.10, 0.76, 0.04, 0.96),
+        "mmocr_upper": (0.06, 0.70, 0.08, 0.92),
+        "mmocr_torso": (0.18, 0.78, 0.16, 0.84),
+    }
+
+
+def number_roi_regions(prefix="roi"):
+    return {
+        f"{prefix}_full_body": (0.00, 1.00, 0.00, 1.00),
+        f"{prefix}_upper_back": (0.18, 0.55, 0.20, 0.80),
+        f"{prefix}_center_back": (0.20, 0.50, 0.25, 0.75),
+        f"{prefix}_torso": (0.12, 0.62, 0.15, 0.85),
+        f"{prefix}_number_band": (0.24, 0.48, 0.18, 0.82),
+    }
 
 
 def is_ocr_player_row(row):
@@ -858,6 +1081,7 @@ def vote_numbers(detections, min_raw_confidence=0.0):
         for item in detections
         if item.get("number") is not None
         and float(item.get("confidence", 0.0) or 0.0) >= float(min_raw_confidence)
+        and not item.get("direct_only_single_digit")
     ]
     if not valid:
         return None
@@ -895,11 +1119,77 @@ def vote_numbers(detections, min_raw_confidence=0.0):
     }
 
 
+def ocr_decision_diagnostics(detections, voting_detections, voted, min_votes=2, min_raw_confidence=0.0):
+    raw_reasons = Counter()
+    raw_channels = Counter()
+    raw_variants = Counter()
+    raw_numbers = Counter()
+    for item in detections:
+        raw_channels[str(item.get("ocr_channel", "unknown"))] += 1
+        if item.get("variant") is not None:
+            raw_variants[str(item.get("variant"))] += 1
+        number = item.get("number")
+        if number is None:
+            if item.get("error"):
+                raw_reasons["backend_error"] += 1
+            elif item.get("text") in (None, ""):
+                raw_reasons["empty_text"] += 1
+            else:
+                raw_reasons["non_numeric_text"] += 1
+            continue
+        raw_numbers[int(number)] += 1
+        if float(item.get("confidence", 0.0) or 0.0) < float(min_raw_confidence):
+            raw_reasons["below_min_raw_confidence"] += 1
+
+    voting_reasons = Counter()
+    voting_numbers = Counter()
+    voting_channels = Counter()
+    for item in voting_detections:
+        number = item.get("number")
+        if number is not None:
+            voting_numbers[int(number)] += 1
+        for channel in item.get("raw_channels") or [item.get("ocr_channel", "unknown")]:
+            voting_channels[str(channel)] += 1
+        if item.get("direct_only_single_digit"):
+            voting_reasons["direct_only_single_digit"] += 1
+        if float(item.get("confidence", 0.0) or 0.0) < float(min_raw_confidence):
+            voting_reasons["below_min_raw_confidence"] += 1
+
+    if voted is None:
+        if not detections:
+            status = "no_raw_detections"
+        elif not voting_detections:
+            status = "no_voting_detections"
+        elif all(item.get("direct_only_single_digit") for item in voting_detections):
+            status = "only_direct_single_digit_candidates"
+        else:
+            status = "no_valid_vote"
+    elif int(voted.get("votes", 0) or 0) < int(min_votes):
+        status = "insufficient_votes"
+    else:
+        status = "assigned"
+
+    return {
+        "status": status,
+        "min_votes": int(min_votes),
+        "min_raw_confidence": float(min_raw_confidence),
+        "raw_rejection_reasons": dict(raw_reasons),
+        "voting_rejection_reasons": dict(voting_reasons),
+        "raw_channel_counts": dict(raw_channels),
+        "voting_channel_counts": dict(voting_channels),
+        "raw_number_counts": {str(k): v for k, v in raw_numbers.items()},
+        "voting_number_counts": {str(k): v for k, v in voting_numbers.items()},
+        "top_raw_variants": raw_variants.most_common(12),
+    }
+
+
 def aggregate_detections_by_crop(
     detections,
     min_raw_confidence=0.0,
     max_candidates_per_crop=3,
     min_candidate_ratio=0.35,
+    demote_direct_only_single_digits_enabled=True,
+    prefer_two_digit_candidates_enabled=True,
 ):
     grouped = defaultdict(list)
     for item in detections:
@@ -913,7 +1203,10 @@ def aggregate_detections_by_crop(
     aggregated = []
     for key, items in sorted(grouped.items(), key=lambda entry: str(entry[0])):
         candidates = aggregate_crop_candidates(items)
-        candidates = prefer_two_digit_voting_candidates(candidates)
+        if demote_direct_only_single_digits_enabled:
+            candidates = demote_direct_only_single_digits(candidates)
+        if prefer_two_digit_candidates_enabled:
+            candidates = prefer_two_digit_voting_candidates(candidates)
         candidates = filter_crop_candidates(candidates, max_candidates_per_crop, min_candidate_ratio)
         aggregated.extend(candidates)
     return aggregated
@@ -947,6 +1240,7 @@ def aggregate_crop_candidates(items):
                 "raw_observation_count": len(observations),
                 "raw_best_confidence": float(best_item.get("confidence", 0.0) or 0.0),
                 "raw_sources": sorted({str(item.get("source", "ocr")) for _, item in observations}),
+                "raw_channels": sorted({str(item.get("ocr_channel", "unknown")) for _, item in observations}),
                 "raw_variants": [
                     str(item.get("variant"))
                     for _, item in observations[:6]
@@ -955,6 +1249,19 @@ def aggregate_crop_candidates(items):
             }
         )
     return sorted(candidates, key=lambda item: item["confidence"], reverse=True)
+
+
+def demote_direct_only_single_digits(candidates):
+    demoted = []
+    for candidate in candidates:
+        item = dict(candidate)
+        number = int(item.get("number", 0) or 0)
+        channels = set(item.get("raw_channels") or [])
+        if 1 <= number <= 9 and channels == {"direct"}:
+            item["direct_only_single_digit"] = True
+            item["confidence"] = min(float(item.get("confidence", 0.0) or 0.0), 0.01)
+        demoted.append(item)
+    return sorted(demoted, key=lambda item: item["confidence"], reverse=True)
 
 
 def detection_crop_key(item):
@@ -999,3 +1306,10 @@ def is_template_variant(name):
     if "full_body" in str(name):
         return False
     return any(part in str(name) for part in ("back_number", "upper", "torso"))
+
+
+def should_direct_recognize_variant(name):
+    name = str(name)
+    if "full_body" in name:
+        return False
+    return any(part in name for part in ("upper_back", "center_back", "torso", "number_band"))

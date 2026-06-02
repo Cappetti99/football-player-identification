@@ -1,6 +1,6 @@
 from collections import defaultdict
 
-from ft.identity.roster import roster_numbers_by_team
+from ft.identity.roster import goalkeeper_numbers_by_team, roster_numbers_by_team
 
 
 class RosterAwareOCRFilter:
@@ -17,6 +17,7 @@ class RosterAwareOCRFilter:
         min_promoted_candidate_votes=1,
     ):
         self.numbers_by_team = roster_numbers_by_team(roster)
+        self.goalkeeper_numbers_by_team = goalkeeper_numbers_by_team(roster)
         self.mode = str(mode)
         self.unknown_team_policy = str(unknown_team_policy)
         self.confidence_scale = float(confidence_scale)
@@ -36,11 +37,14 @@ class RosterAwareOCRFilter:
             }
 
         teams_by_tracklet = summarize_team_by_tracklet(rows)
+        roles_by_tracklet = summarize_role_by_tracklet(rows)
         filtered = {}
         dropped = {}
         degraded = {}
+        goalkeeper_rejections = {}
         for track_id, assignment in sorted(assignments.items()):
             team_id = teams_by_tracklet.get(int(track_id))
+            role = roles_by_tracklet.get(int(track_id))
             jersey = int(assignment["jersey_number"])
             if team_id is None:
                 if self.unknown_team_policy == "drop":
@@ -50,6 +54,26 @@ class RosterAwareOCRFilter:
                 continue
 
             valid_numbers = self.numbers_by_team.get(int(team_id), set())
+            if role in {"goalkeeper", "keeper", "gk"}:
+                valid_goalkeeper_numbers = self.goalkeeper_numbers_by_team.get(int(team_id), set())
+                if valid_goalkeeper_numbers:
+                    assignment = apply_roster_distribution(assignment, valid_goalkeeper_numbers)
+                    jersey = int(assignment["jersey_number"])
+                    if jersey not in valid_goalkeeper_numbers:
+                        promoted = self._promote_candidate(assignment, team_id, valid_goalkeeper_numbers)
+                        if promoted is not None:
+                            filtered[track_id] = promoted
+                            degraded[str(track_id)] = promoted["roster_filter"]
+                            continue
+                        goalkeeper_rejections[str(track_id)] = rejection_payload(
+                            assignment,
+                            team_id,
+                            "goalkeeper_number_not_in_goalkeeper_roster",
+                            valid_goalkeeper_numbers,
+                        )
+                        dropped[str(track_id)] = goalkeeper_rejections[str(track_id)]
+                        continue
+
             assignment = apply_roster_distribution(assignment, valid_numbers)
             jersey = int(assignment["jersey_number"])
             if jersey in valid_numbers:
@@ -85,6 +109,7 @@ class RosterAwareOCRFilter:
             "kept": len(filtered),
             "dropped": dropped,
             "degraded": degraded,
+            "goalkeeper_rejections": goalkeeper_rejections,
         }
 
     def _promote_candidate(self, assignment, team_id, valid_numbers):
@@ -130,6 +155,21 @@ def summarize_team_by_tracklet(rows):
         team, _ = max(counts.items(), key=lambda item: item[1])
         teams[track_id] = int(team)
     return teams
+
+
+def summarize_role_by_tracklet(rows):
+    votes = defaultdict(lambda: defaultdict(int))
+    for row in rows:
+        display_id = int(row.get("display_track_id", row["track_id"]))
+        role = str(row.get("role_detection") or "").strip().lower()
+        if not role:
+            continue
+        votes[display_id][role] += 1
+    roles = {}
+    for track_id, counts in votes.items():
+        role, _ = max(counts.items(), key=lambda item: item[1])
+        roles[track_id] = role
+    return roles
 
 
 def rejection_payload(assignment, team_id, reason, valid_numbers=None):

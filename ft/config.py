@@ -8,6 +8,10 @@ DEFAULT_CONFIG = {
     "artifacts_dir": "artifacts_ft/run",
     "roster_path": None,
     "max_frames": None,
+    "run": {
+        "validate_inputs": True,
+        "unknown_config_keys": "warn",
+    },
     "detection": {
         "confidence": 0.05,
         "ball_confidence": 0.002,
@@ -67,6 +71,19 @@ DEFAULT_CONFIG = {
         "auto_recalibrate_every": 0,
         "pitch_length": 105.0,
         "pitch_width": 68.0,
+        "tvcalib": {
+            "enabled": False,
+            "path": None,
+            "per_frame": True,
+            "coordinate_system": "tvcalib_centered",
+            "invert": False,
+            "temporal_index": 0,
+            "frame_offset": 0,
+            "nearest_frame": True,
+            "max_frame_gap": None,
+            "image_id": None,
+            "frame": None,
+        },
     },
     "team": {
         "enabled": True,
@@ -77,12 +94,23 @@ DEFAULT_CONFIG = {
         "min_tracklet_colors": 3,
         "roster_color_min_fraction": 0.16,
         "roster_color_min_margin": 0.04,
+        "prefer_roster_palette": True,
+        "trusted_palette_min_fraction": 0.18,
+        "trusted_palette_min_margin": 0.04,
+        "trusted_palette_min_samples": 3,
     },
     "jersey_ocr": {
         "enabled": False,
         "backend": "auto",
         "min_confidence": 0.4,
         "max_crops_per_tracklet": 12,
+        "temporal_passes": 1,
+        "augment": True,
+        "min_crop_quality": 0.08,
+        "min_votes": 2,
+        "min_raw_confidence": 0.05,
+        "min_winner_margin": 0.15,
+        "easyocr_gpu": False,
         "debug_crops": False,
         "template_matching": False,
         "template_font_image": None,
@@ -96,7 +124,23 @@ DEFAULT_CONFIG = {
         "mmocr_det": "dbnet_resnet18_fpnc_1200e_icdar2015",
         "mmocr_rec": "SAR",
         "mmocr_batch_size": 8,
+        "mmocr_direct_recognition": None,
         "progress_every": 5,
+        "cache_enabled": True,
+        "cache_dir": ".ft_cache/ocr",
+        "number_roi_enabled": False,
+        "number_roi_upscale": 3,
+        "number_roi_clahe": True,
+        "demote_direct_only_single_digits": True,
+        "prefer_two_digit_candidates": True,
+        "apply_to_goalkeepers": False,
+        "roster_aware": True,
+        "roster_filter_mode": "degrade",
+        "roster_unknown_team_policy": "keep",
+        "roster_degrade_confidence_scale": 0.60,
+        "promote_roster_candidate": True,
+        "min_promoted_candidate_confidence": 0.12,
+        "min_promoted_candidate_votes": 1,
     },
     "referee": {
         "enabled": True,
@@ -119,6 +163,7 @@ DEFAULT_CONFIG = {
     "identity": {
         "unknown_threshold": 0.55,
         "candidate_top_k": 8,
+        "enforce_unique_team_jersey": True,
         "reliable_jersey_min_votes": 5,
         "reliable_jersey_min_confidence": 0.20,
         "reliable_jersey_min_head_confidence": 0.55,
@@ -137,6 +182,15 @@ DEFAULT_CONFIG = {
         "frame_team_split_min_frames": 8,
         "frame_team_split_max_gap": 4,
         "global_team_jersey_owner": True,
+        "goalkeeper_number_one_prior": True,
+        "number_one_goalkeeper_bonus": 0.08,
+        "number_one_non_goalkeeper_penalty": 0.08,
+        "candidate_fallback": {
+            "enabled": True,
+            "min_confidence": 0.35,
+            "max_cost": 0.85,
+            "min_margin": 0.0,
+        },
     },
     "overlay": {
         "show_display_id": True,
@@ -171,6 +225,11 @@ DEFAULT_CONFIG = {
     },
     "export": {
         "save_crops": True,
+        "deduplicate_crops": True,
+        "save_pre_identity_json": False,
+        "save_pre_identity_csv": True,
+        "save_final_json": True,
+        "save_final_csv": True,
     },
 }
 
@@ -190,8 +249,15 @@ def load_config(path=None):
     if path:
         import yaml
 
-        with Path(path).open("r", encoding="utf-8") as f:
+        path = Path(path)
+        with path.open("r", encoding="utf-8") as f:
             user_config = yaml.safe_load(f) or {}
+        base_config = user_config.pop("base_config", None)
+        if base_config:
+            base_path = Path(base_config)
+            if not base_path.is_absolute():
+                base_path = path.parent / base_path
+            config = load_config(base_path)
         config = deep_merge(config, user_config)
     return config
 

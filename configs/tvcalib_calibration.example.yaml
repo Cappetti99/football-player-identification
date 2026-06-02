@@ -1,0 +1,18 @@
+base_config: default.yaml
+
+calibration:
+  enabled: true
+  auto: false
+  path: null
+  pitch_length: 105.0
+  pitch_width: 68.0
+  tvcalib:
+    enabled: true
+    path: evaluation_outputs/tvcalib/Inter-Juve/per_sample_output.json
+    per_frame: true
+    coordinate_system: tvcalib_centered
+    invert: false
+    temporal_index: 0
+    frame_offset: 0
+    nearest_frame: true
+    max_frame_gap: 75

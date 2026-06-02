@@ -14,6 +14,21 @@ def load_roster(roster_path):
     for row in payload:
         jersey_number = normalize_jersey_number(row.get("jersey_number"))
         metadata = dict(row.get("metadata", {}) or {})
+        if "kit_hint" in row and "kit_hint" not in metadata:
+            metadata["kit_hint"] = row["kit_hint"]
+        kit_hint = metadata.get("kit_hint")
+        if isinstance(kit_hint, dict):
+            shirt = kit_hint.get("shirt") or kit_hint.get("shirt_color") or kit_hint.get("primary")
+            shorts = kit_hint.get("shorts") or kit_hint.get("shorts_color")
+            socks = kit_hint.get("socks") or kit_hint.get("socks_color")
+            if shirt and "kit_color" not in metadata:
+                metadata["kit_color"] = shirt
+            if shirt and "shirt_color" not in metadata:
+                metadata["shirt_color"] = shirt
+            if shorts and "shorts_color" not in metadata:
+                metadata["shorts_color"] = shorts
+            if socks and "socks_color" not in metadata:
+                metadata["socks_color"] = socks
         for key in ("kit_color", "uniform_color", "shirt_color", "referee_color", "color"):
             if key in row and key not in metadata:
                 metadata[key] = row[key]

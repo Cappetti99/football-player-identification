@@ -1,0 +1,15 @@
+base_config: default.yaml
+
+jersey_ocr:
+  # Real broadcast videos such as Inter-Juve worked better with the legacy
+  # detected-box/template OCR signal. Keep ROI preprocessing available for
+  # diagnostics, but do not let direct recognition replace the legacy vote.
+  number_roi_enabled: true
+  mmocr_direct_recognition: false
+  demote_direct_only_single_digits: false
+  prefer_two_digit_candidates: false
+  apply_to_goalkeepers: false
+
+identity:
+  candidate_fallback:
+    enabled: true
