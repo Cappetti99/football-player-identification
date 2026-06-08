@@ -1,0 +1,6 @@
+base_config: default_realvideo_ocr.yaml
+
+jersey_ocr:
+  promote_roster_candidate: true
+  min_promoted_candidate_confidence: 0.30
+  min_promoted_candidate_votes: 5

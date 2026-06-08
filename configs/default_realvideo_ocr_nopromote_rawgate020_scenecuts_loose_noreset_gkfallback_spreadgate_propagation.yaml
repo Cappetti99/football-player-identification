@@ -1,0 +1,32 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_scenecuts_loose_noreset_gkfallback_spreadgate.yaml
+
+visual:
+  embedding_mode: hsv_lab_gradient
+
+identity_propagation:
+  enabled: true
+  min_composite_score: 0.60
+  min_score_margin: 0.10
+  max_hops: 1
+  allow_propagated_sources: false
+  min_source_confidence: 0.65
+  allow_partial_conflict_frames: true
+  min_partial_frames: 80
+  min_partial_fraction: 0.35
+  propagate_goalkeepers: false
+  min_team_confidence: 0.55
+  max_temporal_gap: 180
+  max_spatial_distance: 35.0
+  min_appearance_similarity: 0.50
+  strong_appearance_similarity: 0.92
+  allow_temporal_overlap: true
+  temporal_overlap_score: 0.08
+  require_team_match: true
+  require_jersey_match: true
+  block_goalkeeper_mismatch: true
+  require_jersey_or_strong_appearance: true
+  conflict_buffer: 0
+  cut_bridge_enabled: false
+  cut_bridge_max_gap: 20
+  cut_bridge_min_jersey_confidence: 0.20
+  cut_bridge_min_jersey_votes: 3

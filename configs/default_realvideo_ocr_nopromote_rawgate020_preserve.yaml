@@ -1,0 +1,4 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020.yaml
+
+jersey_ocr:
+  roster_preserve_dropped_evidence: true

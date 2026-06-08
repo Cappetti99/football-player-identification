@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 
 from ft.features.groups import apply_group
@@ -13,6 +14,12 @@ def enforce_identity_constraints(
     frame_team_split_min_frames=8,
     frame_team_split_max_gap=2,
     global_team_jersey_owner=True,
+    goalkeeper_only_alternate_enabled=False,
+    goalkeeper_only_alternate_min_confidence=0.10,
+    goalkeeper_only_alternate_min_votes=1,
+    goalkeeper_only_alternate_max_rank=5,
+    goalkeeper_only_alternate_block_known_owner=True,
+    goalkeeper_only_alternate_stop_on_known_owner_conflict=True,
 ):
     """Apply hard consistency constraints to final per-frame identities.
 
@@ -31,6 +38,8 @@ def enforce_identity_constraints(
         "semantic_group_corrections": [],
         "goalkeeper_invalid_jersey": [],
         "goalkeeper_only_jersey": [],
+        "goalkeeper_only_jersey_alternates": [],
+        "goalkeeper_only_jersey_alternate_rejections": [],
         "frame_team_conflicts": [],
         "display_track_splits": [],
         "global_team_jersey_owners": [],
@@ -39,13 +48,27 @@ def enforce_identity_constraints(
         return diagnostics
 
     player_roster = {str(player["player_id"]): player for player in roster}
+    known_team_jersey_owners = team_jersey_known_owners(tracks)
     for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
         # Ordering matters: first remove team contradictions, then apply roster
         # and uniqueness constraints using the corrected per-frame state.
         if frame_team_consistency:
             _apply_frame_team_consistency(frame_num, frame_tracks, frame_team_min_confidence, diagnostics)
         _clear_invalid_team_jerseys(frame_num, frame_tracks, numbers_by_team, diagnostics)
-        _clear_goalkeeper_only_jerseys(frame_num, frame_tracks, goalkeeper_numbers, diagnostics)
+        _clear_goalkeeper_only_jerseys(
+            frame_num,
+            frame_tracks,
+            numbers_by_team,
+            goalkeeper_numbers,
+            diagnostics,
+            alternate_enabled=goalkeeper_only_alternate_enabled,
+            alternate_min_confidence=goalkeeper_only_alternate_min_confidence,
+            alternate_min_votes=goalkeeper_only_alternate_min_votes,
+            alternate_max_rank=goalkeeper_only_alternate_max_rank,
+            alternate_block_known_owner=goalkeeper_only_alternate_block_known_owner,
+            alternate_stop_on_known_owner_conflict=goalkeeper_only_alternate_stop_on_known_owner_conflict,
+            known_team_jersey_owners=known_team_jersey_owners,
+        )
         _clear_goalkeeper_invalid_jerseys(frame_num, frame_tracks, goalkeeper_numbers, diagnostics)
         _clear_duplicate_player_ids(frame_num, frame_tracks, player_roster, diagnostics)
         _enforce_semantic_groups(frame_num, frame_tracks, player_roster, diagnostics)
@@ -67,6 +90,10 @@ def enforce_identity_constraints(
     diagnostics["semantic_group_correction_count"] = len(diagnostics["semantic_group_corrections"])
     diagnostics["goalkeeper_invalid_jersey_count"] = len(diagnostics["goalkeeper_invalid_jersey"])
     diagnostics["goalkeeper_only_jersey_count"] = len(diagnostics["goalkeeper_only_jersey"])
+    diagnostics["goalkeeper_only_jersey_alternate_count"] = len(diagnostics["goalkeeper_only_jersey_alternates"])
+    diagnostics["goalkeeper_only_jersey_alternate_rejection_count"] = len(
+        diagnostics["goalkeeper_only_jersey_alternate_rejections"]
+    )
     diagnostics["frame_team_conflict_count"] = len(diagnostics["frame_team_conflicts"])
     diagnostics["display_track_split_count"] = len(diagnostics["display_track_splits"])
     diagnostics["remaining_duplicate_team_jersey_count"] = remaining_duplicate_team_jersey_count(tracks)
@@ -387,7 +414,13 @@ def _clear_duplicate_team_jerseys(frame_num, frame_tracks, diagnostics):
 
 
 def _enforce_global_team_jersey_owners(tracks, diagnostics):
-    """Keep one final owner for each team/jersey pair across the whole video."""
+    """Keep one final player owner for each team/jersey pair across the video.
+
+    Display IDs are tracker fragments, not identities. When propagation links
+    two non-overlapping fragments to the same player, both fragments should
+    survive. The global constraint only clears competing player owners, and
+    keeps the old one-display behavior when the jersey has no known owner.
+    """
     by_team_jersey = defaultdict(lambda: defaultdict(list))
     for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
         for raw_id, track in frame_tracks.items():
@@ -406,22 +439,32 @@ def _enforce_global_team_jersey_owners(tracks, diagnostics):
     for (team, jersey), by_display in sorted(by_team_jersey.items()):
         if len(by_display) <= 1:
             continue
-        keep_display_id, keep_items = max(
-            by_display.items(),
+        owner_groups = group_global_jersey_owners(by_display)
+        selectable_owner_groups = {
+            owner_key: items
+            for owner_key, items in owner_groups.items()
+            if first_non_unknown_player_id(items) != "unknown"
+        } or owner_groups
+        keep_owner_key, keep_items = max(
+            selectable_owner_groups.items(),
             key=lambda item: global_jersey_owner_rank(item[1]),
         )
+        keep_display_ids = sorted(int(display_id) for display_id in keep_owner_key)
         kept_rank = global_jersey_owner_rank(keep_items)
-        for display_id, items in sorted(by_display.items()):
-            if display_id == keep_display_id:
+        for owner_key, items in sorted(owner_groups.items(), key=lambda item: item[0]):
+            if owner_key == keep_owner_key:
                 continue
+            cleared_display_ids = sorted(int(display_id) for display_id in owner_key)
             cleared_rank = global_jersey_owner_rank(items)
             diagnostics["global_team_jersey_owners"].append(
                 {
                     "reason": "global_duplicate_team_jersey_owner",
                     "team_id": int(team),
                     "jersey_number": int(jersey),
-                    "cleared_display_track_id": int(display_id),
-                    "kept_display_track_id": int(keep_display_id),
+                    "cleared_display_track_id": int(cleared_display_ids[0]),
+                    "kept_display_track_id": int(keep_display_ids[0]),
+                    "cleared_display_track_ids": [int(display_id) for display_id in cleared_display_ids],
+                    "kept_display_track_ids": [int(display_id) for display_id in keep_display_ids],
                     "cleared_player_id": first_non_unknown_player_id(items),
                     "kept_player_id": first_non_unknown_player_id(keep_items),
                     "cleared_num_rows": int(len(items)),
@@ -441,8 +484,10 @@ def _enforce_global_team_jersey_owners(tracks, diagnostics):
                             "reason": "global_duplicate_team_jersey_owner",
                             "team_id": int(team),
                             "jersey_number": int(jersey),
-                            "cleared_display_track_id": int(display_id),
-                            "kept_display_track_id": int(keep_display_id),
+                            "cleared_display_track_id": int(cleared_display_ids[0]),
+                            "kept_display_track_id": int(keep_display_ids[0]),
+                            "cleared_display_track_ids": [int(display_id) for display_id in cleared_display_ids],
+                            "kept_display_track_ids": [int(display_id) for display_id in keep_display_ids],
                         },
                     )
                 if track.get("player_id") not in (None, "unknown"):
@@ -453,10 +498,36 @@ def _enforce_global_team_jersey_owners(tracks, diagnostics):
                             "reason": "global_duplicate_team_jersey_owner",
                             "team_id": int(team),
                             "jersey_number": int(jersey),
-                            "cleared_display_track_id": int(display_id),
-                            "kept_display_track_id": int(keep_display_id),
+                            "cleared_display_track_id": int(cleared_display_ids[0]),
+                            "kept_display_track_id": int(keep_display_ids[0]),
+                            "cleared_display_track_ids": [int(display_id) for display_id in cleared_display_ids],
+                            "kept_display_track_ids": [int(display_id) for display_id in keep_display_ids],
                         },
                     )
+
+
+def group_global_jersey_owners(by_display):
+    """Group display fragments by known player before global jersey arbitration."""
+    known = defaultdict(list)
+    unknown = {}
+    for display_id, items in by_display.items():
+        player_id = first_non_unknown_player_id(items)
+        if player_id == "unknown":
+            unknown[display_id] = items
+        else:
+            known[str(player_id)].append((display_id, items))
+    if not known:
+        return {
+            (int(display_id),): list(items)
+            for display_id, items in unknown.items()
+        }
+    groups = {}
+    for player_items in known.values():
+        key = tuple(int(display_id) for display_id, _items in sorted(player_items))
+        groups[key] = [item for _display_id, items in player_items for item in items]
+    for display_id, items in unknown.items():
+        groups[(int(display_id),)] = list(items)
+    return groups
 
 
 def _clear_duplicate_player_ids(frame_num, frame_tracks, player_roster, diagnostics):
@@ -632,7 +703,20 @@ def _enforce_semantic_groups(frame_num, frame_tracks, player_roster, diagnostics
         apply_group(track, target_group)
 
 
-def _clear_goalkeeper_only_jerseys(frame_num, frame_tracks, goalkeeper_numbers, diagnostics):
+def _clear_goalkeeper_only_jerseys(
+    frame_num,
+    frame_tracks,
+    numbers_by_team,
+    goalkeeper_numbers,
+    diagnostics,
+    alternate_enabled=False,
+    alternate_min_confidence=0.10,
+    alternate_min_votes=1,
+    alternate_max_rank=5,
+    alternate_block_known_owner=True,
+    alternate_stop_on_known_owner_conflict=True,
+    known_team_jersey_owners=None,
+):
     if not goalkeeper_numbers:
         return
     for raw_id, track in frame_tracks.items():
@@ -649,6 +733,24 @@ def _clear_goalkeeper_only_jerseys(frame_num, frame_tracks, goalkeeper_numbers, 
             continue
         if has_goalkeeper_evidence(track):
             continue
+        candidate_distribution = jersey_candidate_distribution(track)
+        alternate = goalkeeper_only_alternate_candidate(
+            candidate_distribution,
+            team,
+            jersey,
+            numbers_by_team,
+            goalkeeper_numbers,
+            min_confidence=alternate_min_confidence,
+            min_votes=alternate_min_votes,
+            max_rank=alternate_max_rank,
+            block_known_owner=alternate_block_known_owner,
+            stop_on_known_owner_conflict=alternate_stop_on_known_owner_conflict,
+            known_team_jersey_owners=known_team_jersey_owners,
+            current_display_id=int(track.get("display_track_id", raw_id)),
+        ) if alternate_enabled else None
+        alternate_rejection = alternate.get("rejection") if isinstance(alternate, dict) and alternate.get("rejection") else None
+        if alternate_rejection:
+            alternate = None
         diagnostics["goalkeeper_only_jersey"].append(
             {
                 "frame": int(frame_num),
@@ -658,6 +760,9 @@ def _clear_goalkeeper_only_jerseys(frame_num, frame_tracks, goalkeeper_numbers, 
                 "jersey_number": int(jersey),
                 "semantic_group_id": track.get("semantic_group_id"),
                 "role_detection": track.get("role_detection"),
+                "alternate_applied": bool(alternate),
+                "alternate_jersey_number": alternate.get("jersey_number") if alternate else None,
+                "alternate_rejection": alternate_rejection,
             }
         )
         _clear_jersey(
@@ -678,6 +783,37 @@ def _clear_goalkeeper_only_jerseys(frame_num, frame_tracks, goalkeeper_numbers, 
                     "team_id": int(team),
                     "jersey_number": int(jersey),
                 },
+            )
+        if alternate:
+            apply_goalkeeper_only_alternate(
+                track,
+                alternate,
+                previous_jersey=jersey,
+                candidate_distribution=candidate_distribution,
+            )
+            diagnostics["goalkeeper_only_jersey_alternates"].append(
+                {
+                    "frame": int(frame_num),
+                    "raw_track_id": int(raw_id),
+                    "display_track_id": int(track.get("display_track_id", raw_id)),
+                    "team_id": int(team),
+                    "previous_jersey_number": int(jersey),
+                    "jersey_number": int(alternate["jersey_number"]),
+                    "confidence": float(alternate.get("confidence", 0.0) or 0.0),
+                    "votes": int(alternate.get("votes", 0) or 0),
+                    "rank": int(alternate.get("rank", 0) or 0),
+                }
+            )
+        elif alternate_rejection:
+            diagnostics["goalkeeper_only_jersey_alternate_rejections"].append(
+                {
+                    "frame": int(frame_num),
+                    "raw_track_id": int(raw_id),
+                    "display_track_id": int(track.get("display_track_id", raw_id)),
+                    "team_id": int(team),
+                    "previous_jersey_number": int(jersey),
+                    **alternate_rejection,
+                }
             )
 
 
@@ -731,6 +867,164 @@ def _clear_goalkeeper_invalid_jerseys(frame_num, frame_tracks, goalkeeper_number
                     "jersey_number": int(jersey),
                 },
             )
+
+
+def jersey_candidate_distribution(track):
+    """Return OCR jersey candidates in rank order without trusting one field."""
+    candidates = []
+    seen = set()
+    for field in ("jersey_distribution", "raw_jersey_distribution", "jersey_candidates"):
+        for candidate in parse_candidate_list(track.get(field)):
+            try:
+                number = int(candidate.get("jersey_number"))
+            except (TypeError, ValueError):
+                continue
+            if number in seen:
+                continue
+            seen.add(number)
+            candidates.append(
+                {
+                    "jersey_number": int(number),
+                    "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+                    "votes": int(candidate.get("votes", 0) or 0),
+                    "source": field,
+                }
+            )
+    candidates.sort(key=lambda item: (float(item["confidence"]), int(item["votes"])), reverse=True)
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = int(rank)
+    return candidates
+
+
+def parse_candidate_list(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return []
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def goalkeeper_only_alternate_candidate(
+    candidates,
+    team,
+    rejected_jersey,
+    numbers_by_team,
+    goalkeeper_numbers,
+    min_confidence=0.10,
+    min_votes=1,
+    max_rank=5,
+    block_known_owner=True,
+    stop_on_known_owner_conflict=True,
+    known_team_jersey_owners=None,
+    current_display_id=None,
+):
+    """Pick the first non-goalkeeper roster-valid OCR fallback candidate."""
+    team = int(team)
+    valid_numbers = set(numbers_by_team.get(team, set()))
+    reserved_goalkeeper_numbers = set(goalkeeper_numbers.get(team, set()))
+    known_team_jersey_owners = known_team_jersey_owners or {}
+    blocked_rejection = None
+    for candidate in candidates:
+        number = int(candidate["jersey_number"])
+        if int(candidate.get("rank") or 0) > int(max_rank):
+            continue
+        if number == int(rejected_jersey):
+            continue
+        if number not in valid_numbers:
+            continue
+        if number in reserved_goalkeeper_numbers:
+            continue
+        if float(candidate.get("confidence", 0.0) or 0.0) < float(min_confidence):
+            continue
+        if int(candidate.get("votes", 0) or 0) < int(min_votes):
+            continue
+        owners = known_team_jersey_owners.get((team, number), {})
+        other_owners = {
+            display_id: sorted(player_ids)
+            for display_id, player_ids in owners.items()
+            if current_display_id is None or int(display_id) != int(current_display_id)
+        }
+        if block_known_owner and other_owners:
+            blocked_rejection = {
+                "reason": "alternate_known_owner_conflict",
+                "jersey_number": int(number),
+                "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+                "votes": int(candidate.get("votes", 0) or 0),
+                "rank": int(candidate.get("rank", 0) or 0),
+                "known_owners": {
+                    str(display_id): player_ids
+                    for display_id, player_ids in sorted(other_owners.items())
+                },
+            }
+            if stop_on_known_owner_conflict:
+                return {"rejection": blocked_rejection}
+            continue
+        return candidate
+    if blocked_rejection:
+        return {"rejection": blocked_rejection}
+    return None
+
+
+def team_jersey_known_owners(tracks):
+    """Map team/jersey pairs to display IDs that already have known identities."""
+    owners = defaultdict(lambda: defaultdict(set))
+    for frame_tracks in tracks.get("players", []):
+        for raw_id, track in frame_tracks.items():
+            player_id = track.get("player_id")
+            if player_id in (None, "", "unknown"):
+                continue
+            team = track.get("team")
+            jersey = track.get("jersey_number")
+            if team in (None, "", "None") or jersey in (None, "", "None", -1):
+                continue
+            try:
+                team = int(team)
+                jersey = int(jersey)
+                display_id = int(track.get("display_track_id", raw_id))
+            except (TypeError, ValueError):
+                continue
+            owners[(team, jersey)][display_id].add(str(player_id))
+    return owners
+
+
+def apply_goalkeeper_only_alternate(track, candidate, previous_jersey, candidate_distribution):
+    """Restore a safe alternate jersey after clearing a goalkeeper-only winner."""
+    track["jersey_number"] = int(candidate["jersey_number"])
+    track["jersey_confidence"] = float(candidate.get("confidence", 0.0) or 0.0)
+    track["jersey_votes"] = int(candidate.get("votes", 0) or 0)
+    track["jersey_evidence"] = {
+        "status": "constraint_fallback",
+        "reason": "goalkeeper_only_alternate_jersey",
+        "previous_jersey_number": int(previous_jersey),
+        "jersey_number": int(candidate["jersey_number"]),
+        "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+        "votes": int(candidate.get("votes", 0) or 0),
+        "rank": int(candidate.get("rank", 0) or 0),
+        "source": candidate.get("source"),
+    }
+    track["jersey_constraint"] = {
+        "status": "fallback_applied",
+        "reason": "goalkeeper_only_jersey_on_non_goalkeeper",
+        "previous_jersey_number": int(previous_jersey),
+        "jersey_number": int(candidate["jersey_number"]),
+    }
+    track["jersey_candidates"] = candidate_distribution
+    track["raw_jersey_distribution"] = candidate_distribution
+    track["jersey_distribution"] = [
+        {
+            "jersey_number": int(candidate["jersey_number"]),
+            "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+            "votes": int(candidate.get("votes", 0) or 0),
+        }
+    ]
+    track["jersey_roster_mass"] = float(candidate.get("confidence", 0.0) or 0.0)
 
 
 def is_goalkeeper_track(track):
@@ -788,8 +1082,10 @@ def _clear_jersey(track, evidence):
     track["jersey_number"] = None
     track["jersey_confidence"] = 0.0
     track["jersey_votes"] = 0
+    track["jersey_segment_index"] = None
     track["jersey_evidence"] = None
     track["jersey_candidates"] = None
+    track["raw_jersey_distribution"] = None
     track["jersey_distribution"] = None
     track["jersey_roster_mass"] = 0.0
     track["jersey_constraint"] = evidence

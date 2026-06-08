@@ -1,0 +1,9 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_scenecuts.yaml
+
+identity:
+  goalkeeper_only_alternate_enabled: true
+  goalkeeper_only_alternate_min_confidence: 0.08
+  goalkeeper_only_alternate_min_votes: 1
+  goalkeeper_only_alternate_max_rank: 5
+  goalkeeper_only_alternate_block_known_owner: true
+  goalkeeper_only_alternate_stop_on_known_owner_conflict: true

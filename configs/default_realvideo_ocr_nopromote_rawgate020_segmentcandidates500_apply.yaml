@@ -1,0 +1,10 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_segmentcandidates500.yaml
+
+identity:
+  candidate_fallback:
+    segment_enabled: true
+    segment_min_confidence: 0.25
+    segment_min_votes: 8
+    segment_max_jersey_display_spread: 2
+    segment_require_unique_roster_player: true
+    segment_only_unknown_identity: true

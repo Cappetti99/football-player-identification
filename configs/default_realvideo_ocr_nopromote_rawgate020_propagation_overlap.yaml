@@ -1,0 +1,11 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_propagation_relaxed.yaml
+
+identity_propagation:
+  enabled: true
+  allow_temporal_overlap: true
+  allow_partial_conflict_frames: true
+  min_partial_frames: 20
+  min_partial_fraction: 0.10
+  min_composite_score: 0.30
+  min_score_margin: 0.03
+  temporal_overlap_score: 0.10

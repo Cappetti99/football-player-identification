@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 
 import numpy as np
@@ -67,7 +68,7 @@ class HungarianPlayerIdentifier:
         """Collapse per-frame rows into the evidence unit used by Hungarian."""
         grouped = defaultdict(list)
         for row in rows:
-            grouped[int(row.get("display_track_id", row["track_id"]))].append(row)
+            grouped[int(row.get("identity_tracklet_id") or row.get("display_track_id", row["track_id"]))].append(row)
         summaries = []
         for track_id, items in sorted(grouped.items()):
             if is_non_player_tracklet(items):
@@ -76,17 +77,27 @@ class HungarianPlayerIdentifier:
             team_ids = [row.get("team_id") for row in items if row.get("team_id") is not None]
             jerseys = [row.get("jersey_number") for row in items if row.get("jersey_number") not in (None, -1)]
             jersey_number = mode(jerseys)
-            jersey_distribution = aggregate_jersey_distribution(items)
-            jersey_raw_candidates = aggregate_jersey_distribution(items, fields=("jersey_candidates",))
+            raw_jersey_distribution = aggregate_jersey_distribution(
+                items,
+                fields=("raw_jersey_distribution", "jersey_candidates"),
+            )
+            jersey_distribution = aggregate_jersey_distribution(items, fields=("jersey_distribution",))
+            jersey_raw_candidates = raw_jersey_distribution
             positions = [row.get("position_pitch") for row in items if row.get("position_pitch") is not None]
             visual_values = [row.get("visual_embedding") for row in items if row.get("visual_embedding") is not None]
             roles = [row.get("role_detection") for row in items if row.get("role_detection")]
+            preserved_dropped_jersey_evidence = any(
+                is_preserved_dropped_jersey_evidence(row.get("jersey_roster_filter"))
+                for row in items
+            )
             semantic_groups = [row.get("semantic_group_id") for row in items if row.get("semantic_group_id") is not None]
             goalkeeper_matches = [bool(row.get("goalkeeper_palette_match", False)) for row in items]
             goalkeeper_scores = [row.get("goalkeeper_like_score", 0.0) for row in items if row.get("goalkeeper_like_score") is not None]
             goalkeeper_teams = [row.get("goalkeeper_like_team") for row in items if row.get("goalkeeper_like_team") is not None]
             summary = {
                 "track_id": int(track_id),
+                "display_track_id": mode([row.get("display_track_id") for row in items if row.get("display_track_id") is not None]),
+                "jersey_segment_index": mode([row.get("jersey_segment_index") for row in items if row.get("jersey_segment_index") is not None]),
                 "raw_track_ids": sorted({int(row.get("raw_track_id", row["track_id"])) for row in items}),
                 "role_detection": mode(roles),
                 "semantic_group_id": mode(semantic_groups),
@@ -98,7 +109,9 @@ class HungarianPlayerIdentifier:
                 "goalkeeper_like_team": mode(goalkeeper_teams),
                 "jersey_number": jersey_number,
                 "jersey_distribution": jersey_distribution,
+                "raw_jersey_distribution": raw_jersey_distribution,
                 "jersey_raw_candidates": jersey_raw_candidates,
+                "preserved_dropped_jersey_evidence": preserved_dropped_jersey_evidence,
                 "jersey_roster_mass": mean(
                     row.get("jersey_roster_mass", 0.0)
                     for row in items
@@ -143,7 +156,7 @@ class HungarianPlayerIdentifier:
             return unknown_assignments(summaries, "missing_roster"), []
         scores = self.candidate_scores(summaries)
         cost_matrix = np.asarray(
-            [[self.cost_details(tracklet, player)["cost"] for player in self.roster] for tracklet in summaries],
+            [[self.cost_details(tracklet, player, allow_preserved_evidence=False)["cost"] for player in self.roster] for tracklet in summaries],
             dtype=float,
         )
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
@@ -151,7 +164,7 @@ class HungarianPlayerIdentifier:
         for row, col in zip(row_ind, col_ind):
             tracklet = summaries[row]
             player = self.roster[col]
-            details = self.cost_details(tracklet, player)
+            details = self.cost_details(tracklet, player, allow_preserved_evidence=False)
             confidence = details["confidence"]
             track_id = int(tracklet["track_id"])
             assignment_gate = self.assignment_gate(tracklet, player, details)
@@ -203,7 +216,7 @@ class HungarianPlayerIdentifier:
         rows = []
         for tracklet in summaries:
             for player in self.roster:
-                details = self.cost_details(tracklet, player)
+                details = self.cost_details(tracklet, player, allow_preserved_evidence=True)
                 rows.append(
                     {
                         "track_id": tracklet["track_id"],
@@ -218,6 +231,7 @@ class HungarianPlayerIdentifier:
                         "tracklet_jersey_confidence": tracklet.get("jersey_confidence"),
                         "tracklet_jersey_votes": tracklet.get("jersey_votes"),
                         "tracklet_jersey_distribution": tracklet.get("jersey_distribution"),
+                        "tracklet_raw_jersey_distribution": tracklet.get("raw_jersey_distribution"),
                         "tracklet_jersey_raw_candidates": tracklet.get("jersey_raw_candidates"),
                         "tracklet_jersey_roster_mass": tracklet.get("jersey_roster_mass"),
                         "tracklet_frames": tracklet.get("num_frames"),
@@ -225,6 +239,7 @@ class HungarianPlayerIdentifier:
                         "mean_pitch_position": tracklet.get("mean_pitch_position"),
                         "position_prior_distance": details["position_prior_distance"],
                         "visual_similarity": details["visual_similarity"],
+                        "jersey_score_source": details.get("jersey_score_source"),
                         "assignment_gate": self.assignment_gate(tracklet, player, details),
                         "cost": details["cost"],
                         "confidence": details["confidence"],
@@ -234,7 +249,7 @@ class HungarianPlayerIdentifier:
         rows.sort(key=lambda row: (row["track_id"], row["cost"], row["player_id"]))
         return rows
 
-    def cost_details(self, tracklet, player):
+    def cost_details(self, tracklet, player, allow_preserved_evidence=False):
         """Return total cost and each feature contribution for one candidate."""
         components = {
             "base": 0.25,
@@ -255,7 +270,24 @@ class HungarianPlayerIdentifier:
 
         observed = tracklet.get("jersey_number")
         expected = player.get("jersey_number")
-        jersey_score = jersey_candidate_score(tracklet, expected)
+        jersey_score_source = None
+        use_preserved_evidence = (
+            bool(tracklet.get("preserved_dropped_jersey_evidence"))
+            and bool(allow_preserved_evidence)
+        )
+        use_trusted_raw_evidence = not bool(tracklet.get("preserved_dropped_jersey_evidence"))
+        jersey_score = None
+        if use_trusted_raw_evidence or use_preserved_evidence:
+            # Preserved dropped evidence is useful for diagnostics/candidates,
+            # but it must not become authoritative identity evidence. The
+            # caller controls that via allow_preserved_evidence.
+            jersey_score = jersey_candidate_score(tracklet, expected, field="raw_jersey_distribution")
+            if jersey_score is not None:
+                jersey_score_source = "raw_jersey_distribution"
+            else:
+                jersey_score = jersey_candidate_score(tracklet, expected)
+                if jersey_score is not None:
+                    jersey_score_source = "jersey_distribution"
         if expected is not None and jersey_score is not None:
             # Candidate distributions let a lower-ranked but roster-valid OCR
             # number still influence the assignment.
@@ -319,6 +351,7 @@ class HungarianPlayerIdentifier:
             "raw_cost": raw_cost,
             "confidence": clamp(1.0 - cost, 0.0, 1.0),
             "components": {key: float(value) for key, value in components.items()},
+            "jersey_score_source": jersey_score_source,
             "position_prior_distance": position_prior_distance,
             "visual_similarity": visual_similarity,
         }
@@ -382,11 +415,15 @@ class HungarianPlayerIdentifier:
         }
 
     def _has_reliable_jersey_match(self, tracklet, player):
+        if tracklet.get("preserved_dropped_jersey_evidence"):
+            return False
         expected = player.get("jersey_number")
         if expected is None:
             return False
-        raw_candidates = tracklet.get("jersey_raw_candidates") or []
-        candidate_score = jersey_candidate_score(tracklet, expected, field="jersey_raw_candidates")
+        raw_candidates = tracklet.get("raw_jersey_distribution") or tracklet.get("jersey_raw_candidates") or []
+        candidate_score = jersey_candidate_score(tracklet, expected, field="raw_jersey_distribution")
+        if candidate_score is None:
+            candidate_score = jersey_candidate_score(tracklet, expected, field="jersey_raw_candidates")
         if raw_candidates:
             # Roster filtering can promote a valid alternative after dropping
             # impossible numbers. The gate should still look at the raw OCR
@@ -436,6 +473,20 @@ def is_non_player_tracklet(items):
     return referee_like / len(roles) >= 0.5
 
 
+def is_preserved_dropped_jersey_evidence(value):
+    """Detect OCR evidence kept only for candidate diagnostics after roster drop."""
+    if not value:
+        return False
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return False
+    if not isinstance(value, dict):
+        return False
+    return value.get("status") == "dropped_preserved_evidence"
+
+
 def same_team(tracklet, player):
     return (
         tracklet.get("team_id") is not None
@@ -477,8 +528,8 @@ def unknown_assignments(summaries, status):
 def apply_assignments(tracks, assignments):
     for frame_tracks in tracks.get("players", []):
         for raw_id, track in frame_tracks.items():
-            display_id = int(track.get("display_track_id", raw_id))
-            assignment = assignments.get(display_id)
+            tracklet_id = int(track.get("identity_tracklet_id") or track.get("display_track_id", raw_id))
+            assignment = assignments.get(tracklet_id)
             if not assignment:
                 continue
             track["player_id"] = assignment["player_id"]

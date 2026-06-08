@@ -1,0 +1,4 @@
+base_config: default_realvideo_ocr_nopromote.yaml
+
+identity:
+  reliable_jersey_min_candidate_score: 0.20

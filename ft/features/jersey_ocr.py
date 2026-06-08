@@ -36,6 +36,9 @@ class JerseyOCR:
         aggregate_by_crop=True,
         max_candidates_per_crop=3,
         min_crop_candidate_ratio=0.35,
+        crop_quality_vote_weighting=False,
+        crop_quality_min_vote_weight=0.35,
+        crop_quality_vote_power=1.0,
         mmocr_device=None,
         mmocr_det="dbnet_resnet18_fpnc_1200e_icdar2015",
         mmocr_rec="SAR",
@@ -47,8 +50,16 @@ class JerseyOCR:
         number_roi_enabled=False,
         number_roi_upscale=3,
         number_roi_clahe=True,
+        broadcast_contrast_enabled=False,
+        broadcast_contrast_clip_limit=4.0,
+        broadcast_contrast_tile_grid_size=4,
+        super_resolution_enabled=False,
+        super_resolution_scale=4,
+        super_resolution_max_side=100,
+        segment_frames=0,
         demote_direct_only_single_digits=True,
         prefer_two_digit_candidates=True,
+        digit_confusion_overrides=None,
     ):
         self.requested_backend_name = backend
         self.backend_name = backend
@@ -70,6 +81,9 @@ class JerseyOCR:
         self.aggregate_by_crop = bool(aggregate_by_crop)
         self.max_candidates_per_crop = int(max_candidates_per_crop)
         self.min_crop_candidate_ratio = float(min_crop_candidate_ratio)
+        self.crop_quality_vote_weighting = bool(crop_quality_vote_weighting)
+        self.crop_quality_min_vote_weight = max(0.0, min(1.0, float(crop_quality_min_vote_weight)))
+        self.crop_quality_vote_power = max(0.01, float(crop_quality_vote_power))
         self.mmocr_device = mmocr_device
         self.mmocr_det = str(mmocr_det)
         self.mmocr_rec = str(mmocr_rec)
@@ -84,8 +98,16 @@ class JerseyOCR:
         self.number_roi_enabled = bool(number_roi_enabled)
         self.number_roi_upscale = max(1, int(number_roi_upscale))
         self.number_roi_clahe = bool(number_roi_clahe)
+        self.broadcast_contrast_enabled = bool(broadcast_contrast_enabled)
+        self.broadcast_contrast_clip_limit = float(broadcast_contrast_clip_limit)
+        self.broadcast_contrast_tile_grid_size = max(2, int(broadcast_contrast_tile_grid_size))
+        self.super_resolution_enabled = bool(super_resolution_enabled)
+        self.super_resolution_scale = max(1, int(super_resolution_scale))
+        self.super_resolution_max_side = max(1, int(super_resolution_max_side))
+        self.segment_frames = max(0, int(segment_frames or 0))
         self.demote_direct_only_single_digits = bool(demote_direct_only_single_digits)
         self.prefer_two_digit_candidates = bool(prefer_two_digit_candidates)
+        self.digit_confusion_overrides = normalize_digit_confusion_overrides(digit_confusion_overrides)
         self.cache = JsonDiskCache(self.cache_dir, "jersey_ocr") if self.cache_enabled else DisabledCache()
         self.backend = None
         self.message = None
@@ -112,10 +134,10 @@ class JerseyOCR:
         grouped = defaultdict(list)
         for row in rows:
             if row.get("crop_path") and is_ocr_player_row(row):
-                grouped[int(row.get("display_track_id", row["track_id"]))].append(row)
+                grouped[jersey_group_key(row, self.segment_frames)].append(row)
         assignments = {}
         diagnostics = {}
-        grouped_items = sorted(grouped.items())
+        grouped_items = sorted(grouped.items(), key=lambda item: diagnostic_key(item[0]))
         print(
             f"FT jersey OCR: start tracklets={len(grouped_items)}"
             f" backend={self.backend_name}"
@@ -123,6 +145,7 @@ class JerseyOCR:
             flush=True,
         )
         for index, (track_id, items) in enumerate(grouped_items, start=1):
+            display_id, segment_index = split_jersey_group_key(track_id)
             usable_items = filter_quality_items(items, self.min_crop_quality)
             selected = []
             detections = []
@@ -138,9 +161,20 @@ class JerseyOCR:
                 )
                 for row in pass_rows:
                     selected.append((pass_index, row))
-                    detections.extend(self._recognize_row(row, track_id, pass_index))
+                    detections.extend(self._recognize_row(row, display_id, pass_index))
+            detections = apply_crop_quality_vote_weights(
+                detections,
+                selected,
+                enabled=self.crop_quality_vote_weighting,
+                min_weight=self.crop_quality_min_vote_weight,
+                power=self.crop_quality_vote_power,
+            )
             voting_detections = self._voting_detections(detections)
-            voted = vote_numbers(voting_detections, min_raw_confidence=self.min_raw_confidence)
+            voted = vote_numbers(
+                voting_detections,
+                min_raw_confidence=self.min_raw_confidence,
+                digit_confusion_overrides=self.digit_confusion_overrides,
+            )
             decision = ocr_decision_diagnostics(
                 detections,
                 voting_detections,
@@ -148,7 +182,11 @@ class JerseyOCR:
                 min_votes=self.min_votes,
                 min_raw_confidence=self.min_raw_confidence,
             )
-            diagnostics[str(track_id)] = {
+            diagnostics[diagnostic_key(track_id)] = {
+                "display_track_id": int(display_id),
+                "segment_index": segment_index,
+                "segment_start_frame": segment_start_frame(segment_index, self.segment_frames),
+                "segment_end_frame": segment_end_frame(segment_index, self.segment_frames),
                 "available_crops": len(items),
                 "usable_crops": len(usable_items),
                 "crop_selection": crop_selection_diagnostics(items, usable_items, selected),
@@ -172,6 +210,10 @@ class JerseyOCR:
                 "decision": decision,
             }
             if voted and voted["votes"] >= self.min_votes:
+                voted["display_track_id"] = int(display_id)
+                voted["segment_index"] = segment_index
+                voted["segment_start_frame"] = segment_start_frame(segment_index, self.segment_frames)
+                voted["segment_end_frame"] = segment_end_frame(segment_index, self.segment_frames)
                 assignments[track_id] = voted
             if self.progress_every > 0 and (index % self.progress_every == 0 or index == len(grouped_items)):
                 print(
@@ -213,14 +255,29 @@ class JerseyOCR:
                 "upscale": self.number_roi_upscale,
                 "clahe": self.number_roi_clahe,
             },
+            "broadcast_contrast": {
+                "enabled": self.broadcast_contrast_enabled,
+                "clip_limit": self.broadcast_contrast_clip_limit,
+                "tile_grid_size": self.broadcast_contrast_tile_grid_size,
+            },
+            "super_resolution": {
+                "enabled": self.super_resolution_enabled,
+                "scale": self.super_resolution_scale,
+                "max_side": self.super_resolution_max_side,
+            },
+            "segment_frames": self.segment_frames,
             "voting_policy": {
                 "demote_direct_only_single_digits": self.demote_direct_only_single_digits,
                 "prefer_two_digit_candidates": self.prefer_two_digit_candidates,
+                "digit_confusion_overrides": self.digit_confusion_overrides,
+                "crop_quality_vote_weighting": self.crop_quality_vote_weighting,
+                "crop_quality_min_vote_weight": self.crop_quality_min_vote_weight,
+                "crop_quality_vote_power": self.crop_quality_vote_power,
             },
             "cache": self.cache.diagnostics(),
             "template_matching": self._template_diagnostics(),
             "tracklets": diagnostics,
-            "assigned_tracklets": {str(k): v for k, v in assignments.items()},
+            "assigned_tracklets": {diagnostic_key(k): v for k, v in assignments.items()},
         }
 
     def _voting_detections(self, detections):
@@ -280,6 +337,8 @@ class JerseyOCR:
             import easyocr
 
             return EasyOCRBackend(easyocr.Reader(["en"], gpu=self.easyocr_gpu), gpu=self.easyocr_gpu)
+        if backend == "paddleocr":
+            return PaddleOCRBackend(use_gpu=self.easyocr_gpu)
         if backend == "pytesseract":
             import pytesseract
 
@@ -357,6 +416,12 @@ class JerseyOCR:
                     number_roi_enabled=self.number_roi_enabled,
                     number_roi_upscale=self.number_roi_upscale,
                     number_roi_clahe=self.number_roi_clahe,
+                    broadcast_contrast_enabled=self.broadcast_contrast_enabled,
+                    broadcast_contrast_clip_limit=self.broadcast_contrast_clip_limit,
+                    broadcast_contrast_tile_grid_size=self.broadcast_contrast_tile_grid_size,
+                    super_resolution_enabled=self.super_resolution_enabled,
+                    super_resolution_scale=self.super_resolution_scale,
+                    super_resolution_max_side=self.super_resolution_max_side,
                 )
             else:
                 variants = preprocess_variants(
@@ -365,6 +430,12 @@ class JerseyOCR:
                     number_roi_enabled=self.number_roi_enabled,
                     number_roi_upscale=self.number_roi_upscale,
                     number_roi_clahe=self.number_roi_clahe,
+                    broadcast_contrast_enabled=self.broadcast_contrast_enabled,
+                    broadcast_contrast_clip_limit=self.broadcast_contrast_clip_limit,
+                    broadcast_contrast_tile_grid_size=self.broadcast_contrast_tile_grid_size,
+                    super_resolution_enabled=self.super_resolution_enabled,
+                    super_resolution_scale=self.super_resolution_scale,
+                    super_resolution_max_side=self.super_resolution_max_side,
                 )
             detections.extend(
                 self._recognize_backend_variants(
@@ -391,6 +462,12 @@ class JerseyOCR:
                 number_roi_enabled=self.number_roi_enabled,
                 number_roi_upscale=self.number_roi_upscale,
                 number_roi_clahe=self.number_roi_clahe,
+                broadcast_contrast_enabled=self.broadcast_contrast_enabled,
+                broadcast_contrast_clip_limit=self.broadcast_contrast_clip_limit,
+                broadcast_contrast_tile_grid_size=self.broadcast_contrast_tile_grid_size,
+                super_resolution_enabled=self.super_resolution_enabled,
+                super_resolution_scale=self.super_resolution_scale,
+                super_resolution_max_side=self.super_resolution_max_side,
             ):
                 self._write_debug(track_id, row, name, image, pass_index)
                 if not is_template_variant(name):
@@ -404,6 +481,7 @@ class JerseyOCR:
                             "pass": pass_index,
                             "crop_path": row.get("crop_path"),
                             "frame": row.get("frame"),
+                            "crop_quality": row.get("crop_quality", 0.0),
                             "variant": name,
                             "text": str(candidate["jersey_number"]),
                             "number": int(candidate["jersey_number"]),
@@ -452,6 +530,12 @@ class JerseyOCR:
             "number_roi_enabled": self.number_roi_enabled,
             "number_roi_upscale": self.number_roi_upscale,
             "number_roi_clahe": self.number_roi_clahe,
+            "broadcast_contrast_enabled": self.broadcast_contrast_enabled,
+            "broadcast_contrast_clip_limit": self.broadcast_contrast_clip_limit,
+            "broadcast_contrast_tile_grid_size": self.broadcast_contrast_tile_grid_size,
+            "super_resolution_enabled": self.super_resolution_enabled,
+            "super_resolution_scale": self.super_resolution_scale,
+            "super_resolution_max_side": self.super_resolution_max_side,
         }
 
     @staticmethod
@@ -459,7 +543,7 @@ class JerseyOCR:
         return {
             key: value
             for key, value in item.items()
-            if key not in {"crop_path", "frame", "pass"}
+            if key not in {"crop_path", "frame", "pass", "crop_quality", "crop_quality_vote_weight", "base_vote_weight"}
         }
 
     @staticmethod
@@ -468,6 +552,7 @@ class JerseyOCR:
         out["pass"] = pass_index
         out["crop_path"] = row.get("crop_path")
         out["frame"] = row.get("frame")
+        out["crop_quality"] = row.get("crop_quality", 0.0)
         return out
 
     def _recognize_backend_variants(self, row, track_id, pass_index, backend_name, backend, variants):
@@ -491,6 +576,7 @@ class JerseyOCR:
                         "pass": pass_index,
                         "crop_path": row.get("crop_path"),
                         "frame": row.get("frame"),
+                        "crop_quality": row.get("crop_quality", 0.0),
                         "variant": name,
                         "number": None,
                         "confidence": 0.0,
@@ -508,6 +594,7 @@ class JerseyOCR:
                         "pass": pass_index,
                         "crop_path": row.get("crop_path"),
                         "frame": row.get("frame"),
+                        "crop_quality": row.get("crop_quality", 0.0),
                         "variant": name,
                         "text": text,
                         "number": number,
@@ -555,6 +642,30 @@ class TesseractBackend:
             except ValueError:
                 score = 0.0
             rows.append((text, score))
+        return rows
+
+
+class PaddleOCRBackend:
+    """Optional PaddleOCR backend loaded only when explicitly requested."""
+
+    def __init__(self, use_gpu=False):
+        from paddleocr import PaddleOCR
+
+        self.ocr = PaddleOCR(use_angle_cls=False, lang="en", use_gpu=bool(use_gpu))
+
+    def read(self, image):
+        result = self.ocr.ocr(np.asarray(image), cls=False)
+        rows = []
+        if not result:
+            return rows
+        for page in result:
+            for line in page or []:
+                try:
+                    text = line[1][0]
+                    confidence = float(line[1][1])
+                except Exception:
+                    continue
+                rows.append((text, confidence))
         return rows
 
 
@@ -606,7 +717,8 @@ class MMOCRBackend:
         return self._read_with_standard_inferencers(image, direct_recognition=direct_recognition)
 
     def _read_with_mmocr_inferencer(self, image):
-        result = self.inferencer(
+        result = call_mmocr_inferencer_quiet(
+            self.inferencer,
             [image],
             batch_size=1,
             det_batch_size=1,
@@ -693,7 +805,8 @@ class MMOCRRecognitionBackend:
         if image.dtype != np.uint8:
             image = np.clip(image, 0, 255).astype(np.uint8)
         if self.mode == "mmocr_inferencer":
-            result = self.inferencer(
+            result = call_mmocr_inferencer_quiet(
+                self.inferencer,
                 [image],
                 batch_size=1,
                 rec_batch_size=self.batch_size,
@@ -728,6 +841,10 @@ def requested_backends(backend_name):
     name = str(backend_name or "auto").strip().lower()
     if name in ("auto", "default"):
         return ["easyocr", "pytesseract"]
+    if name in ("paddleocr", "paddle_ocr", "paddle"):
+        return ["paddleocr"]
+    if name in ("paddleocr_easyocr", "paddleocr+easyocr", "paddle_ocr_easyocr"):
+        return ["paddleocr", "easyocr", "pytesseract"]
     if name in ("mmocr_easyocr", "mmocr+easyocr", "mmocr_auto"):
         return ["mmocr", "easyocr", "pytesseract"]
     if name in ("mmocr_rec", "mmocr-rec", "mmocr_recognition"):
@@ -792,6 +909,25 @@ def normalize_mmocr_model_name(model_name, task):
     }
     aliases = det_aliases if task == "det" else rec_aliases
     return aliases.get(key, value)
+
+
+def call_mmocr_inferencer_quiet(inferencer, inputs, **kwargs):
+    """Call MMOCRInferencer without per-crop rich progress bars.
+
+    MMOCR versions differ in which quiet flags they accept. The first call
+    disables known console outputs; the fallback preserves compatibility with
+    older versions that reject one of those keyword arguments.
+    """
+    quiet_kwargs = {
+        **kwargs,
+        "progress_bar": False,
+        "show": False,
+        "print_result": False,
+    }
+    try:
+        return inferencer(inputs, **quiet_kwargs)
+    except TypeError:
+        return inferencer(inputs, **kwargs)
 
 
 def mmocr_prediction_text_scores(prediction):
@@ -922,18 +1058,106 @@ def crop_selection_diagnostics(items, usable_items, selected):
     }
 
 
+def apply_crop_quality_vote_weights(detections, selected, enabled=False, min_weight=0.35, power=1.0):
+    """Attach a relative crop-quality weight to OCR detections before voting.
+
+    The OCR backend can emit many correlated variants for the same crop. This
+    weighting keeps the best selected crop at full strength and downweights the
+    weakest selected crops, so noisy frames contribute diagnostics without
+    dominating tracklet-level voting.
+    """
+    if not enabled or not detections:
+        return detections
+
+    quality_by_key = selected_crop_quality_by_detection_key(selected)
+    quality_values = list(quality_by_key.values())
+    if not quality_values:
+        return detections
+
+    min_quality = min(quality_values)
+    max_quality = max(quality_values)
+    if max_quality <= min_quality + 1e-9:
+        return [
+            {
+                **item,
+                "crop_quality": quality_for_detection(item, quality_by_key),
+                "crop_quality_vote_weight": 1.0,
+                "base_vote_weight": float(item.get("vote_weight", 1.0) or 0.0),
+            }
+            for item in detections
+        ]
+
+    min_weight = max(0.0, min(1.0, float(min_weight)))
+    power = max(0.01, float(power))
+    weighted = []
+    for item in detections:
+        quality = quality_for_detection(item, quality_by_key)
+        if quality is None:
+            quality_weight = 1.0
+        else:
+            relative = (float(quality) - min_quality) / (max_quality - min_quality)
+            relative = max(0.0, min(1.0, relative))
+            quality_weight = min_weight + (1.0 - min_weight) * (relative ** power)
+        base_weight = max(0.0, float(item.get("base_vote_weight", item.get("vote_weight", 1.0)) or 0.0))
+        out = dict(item)
+        out["crop_quality"] = quality
+        out["crop_quality_vote_weight"] = float(quality_weight)
+        out["base_vote_weight"] = float(base_weight)
+        out["vote_weight"] = float(base_weight * quality_weight)
+        weighted.append(out)
+    return weighted
+
+
+def selected_crop_quality_by_detection_key(selected):
+    quality_by_key = {}
+    for pass_index, row in selected:
+        quality = safe_float(row.get("crop_quality"), default=0.0)
+        crop_path = row.get("crop_path")
+        if crop_path:
+            quality_by_key[("crop", str(crop_path))] = quality
+        quality_by_key[("frame", row.get("frame"), pass_index)] = quality
+    return quality_by_key
+
+
+def quality_for_detection(item, quality_by_key):
+    value = safe_float(item.get("crop_quality"), default=None)
+    if value is not None:
+        return value
+    return quality_by_key.get(detection_crop_key(item))
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def preprocess_variants(
     crop_path,
     augment=True,
     number_roi_enabled=False,
     number_roi_upscale=3,
     number_roi_clahe=True,
+    broadcast_contrast_enabled=False,
+    broadcast_contrast_clip_limit=4.0,
+    broadcast_contrast_tile_grid_size=4,
+    super_resolution_enabled=False,
+    super_resolution_scale=4,
+    super_resolution_max_side=100,
 ):
     import cv2
 
     image = cv2.imread(str(crop_path))
     if image is None or image.size == 0:
         return []
+    image = super_resolve_small_crop(
+        image,
+        cv2,
+        enabled=super_resolution_enabled,
+        scale=super_resolution_scale,
+        max_side=super_resolution_max_side,
+    )
     h, w = image.shape[:2]
     regions = number_roi_regions() if number_roi_enabled else legacy_ocr_regions()
     variants = []
@@ -954,6 +1178,20 @@ def preprocess_variants(
         if augment:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray) if number_roi_clahe else equalized
             variants.append((f"{name}_clahe", clahe))
+            if broadcast_contrast_enabled:
+                broadcast = broadcast_contrast_gray(
+                    crop,
+                    cv2,
+                    clip_limit=broadcast_contrast_clip_limit,
+                    tile_grid_size=broadcast_contrast_tile_grid_size,
+                )
+                variants.append((f"{name}_broadcast_luma", broadcast))
+                broadcast_sharp = cv2.filter2D(
+                    broadcast,
+                    -1,
+                    np.asarray([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32),
+                )
+                variants.append((f"{name}_broadcast_luma_sharpened", broadcast_sharp))
             sharpened = cv2.filter2D(equalized, -1, np.asarray([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32))
             variants.append((f"{name}_sharpened", sharpened))
             blur = cv2.GaussianBlur(equalized, (3, 3), 0)
@@ -978,12 +1216,25 @@ def preprocess_text_detection_variants(
     number_roi_enabled=False,
     number_roi_upscale=3,
     number_roi_clahe=True,
+    broadcast_contrast_enabled=False,
+    broadcast_contrast_clip_limit=4.0,
+    broadcast_contrast_tile_grid_size=4,
+    super_resolution_enabled=False,
+    super_resolution_scale=4,
+    super_resolution_max_side=100,
 ):
     import cv2
 
     image = cv2.imread(str(crop_path))
     if image is None or image.size == 0:
         return []
+    image = super_resolve_small_crop(
+        image,
+        cv2,
+        enabled=super_resolution_enabled,
+        scale=super_resolution_scale,
+        max_side=super_resolution_max_side,
+    )
     h, w = image.shape[:2]
     regions = number_roi_regions(prefix="mmocr") if number_roi_enabled else legacy_mmocr_regions()
     variants = []
@@ -1005,6 +1256,18 @@ def preprocess_text_detection_variants(
             l_chan = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l_chan)
             clahe = cv2.cvtColor(cv2.merge([l_chan, a_chan, b_chan]), cv2.COLOR_LAB2BGR)
             variants.append((f"{name}_clahe", clahe))
+        if broadcast_contrast_enabled:
+            variants.append(
+                (
+                    f"{name}_broadcast_luma",
+                    broadcast_contrast_bgr(
+                        crop,
+                        cv2,
+                        clip_limit=broadcast_contrast_clip_limit,
+                        tile_grid_size=broadcast_contrast_tile_grid_size,
+                    ),
+                )
+            )
         if number_roi_enabled:
             sharpened = cv2.filter2D(
                 crop,
@@ -1013,6 +1276,35 @@ def preprocess_text_detection_variants(
             )
             variants.append((f"{name}_sharpened", sharpened))
     return variants
+
+
+def super_resolve_small_crop(crop, cv2, enabled=False, scale=4, max_side=100):
+    """Upscale small crops before ROI generation using OpenCV cubic fallback."""
+    if not enabled or crop is None or crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    if max(h, w) >= int(max_side):
+        return crop
+    scale = max(1, int(scale))
+    if scale <= 1:
+        return crop
+    return cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+
+def broadcast_contrast_gray(crop, cv2, clip_limit=4.0, tile_grid_size=4):
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    l_chan = lab[:, :, 0]
+    tile_grid = (int(tile_grid_size), int(tile_grid_size))
+    enhanced = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tile_grid).apply(l_chan)
+    return enhanced
+
+
+def broadcast_contrast_bgr(crop, cv2, clip_limit=4.0, tile_grid_size=4):
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+    tile_grid = (int(tile_grid_size), int(tile_grid_size))
+    enhanced_l = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tile_grid).apply(l_chan)
+    return cv2.cvtColor(cv2.merge([enhanced_l, a_chan, b_chan]), cv2.COLOR_LAB2BGR)
 
 
 def legacy_ocr_regions():
@@ -1059,6 +1351,39 @@ def is_ocr_player_row(row):
     return True
 
 
+def jersey_group_key(row, segment_frames=0):
+    display_id = int(row.get("display_track_id", row["track_id"]))
+    segment_frames = int(segment_frames or 0)
+    if segment_frames <= 0:
+        return display_id
+    frame = int(row.get("frame", 0) or 0)
+    return (display_id, frame // segment_frames)
+
+
+def split_jersey_group_key(key):
+    if isinstance(key, tuple):
+        return int(key[0]), int(key[1])
+    return int(key), None
+
+
+def segment_start_frame(segment_index, segment_frames):
+    if segment_index is None or int(segment_frames or 0) <= 0:
+        return None
+    return int(segment_index) * int(segment_frames)
+
+
+def segment_end_frame(segment_index, segment_frames):
+    if segment_index is None or int(segment_frames or 0) <= 0:
+        return None
+    return (int(segment_index) + 1) * int(segment_frames) - 1
+
+
+def diagnostic_key(key):
+    if isinstance(key, tuple):
+        return f"{int(key[0])}:{int(key[1])}"
+    return str(int(key))
+
+
 def parse_number(text):
     if text is None:
         return None
@@ -1075,7 +1400,7 @@ def parse_number(text):
     return value
 
 
-def vote_numbers(detections, min_raw_confidence=0.0):
+def vote_numbers(detections, min_raw_confidence=0.0, digit_confusion_overrides=None):
     valid = [
         item
         for item in detections
@@ -1093,9 +1418,9 @@ def vote_numbers(detections, min_raw_confidence=0.0):
         scores[number] += max(0.01, float(item.get("confidence", 0.0))) * vote_weight
         counts[number] += 1
     ranked = sorted(scores.items(), key=lambda item: (item[1], counts[item[0]]), reverse=True)
-    number, score = ranked[0]
+    number, score = apply_digit_confusion_override(ranked, digit_confusion_overrides)
     total = sum(scores.values())
-    runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+    runner_up = max((candidate_score for candidate, candidate_score in ranked if int(candidate) != int(number)), default=0.0)
     head_total = score + runner_up
     return {
         "jersey_number": int(number),
@@ -1117,6 +1442,50 @@ def vote_numbers(detections, min_raw_confidence=0.0):
             for candidate, candidate_score in ranked[:8]
         ],
     }
+
+
+def apply_digit_confusion_override(ranked, overrides=None):
+    if not ranked:
+        return None, 0.0
+    winner, winner_score = ranked[0]
+    override = (overrides or {}).get(str(int(winner))) or (overrides or {}).get(int(winner))
+    if not override:
+        return int(winner), float(winner_score)
+    preferred = int(override.get("prefer", winner))
+    if preferred == int(winner):
+        return int(winner), float(winner_score)
+    scores = {int(number): float(score) for number, score in ranked}
+    preferred_score = scores.get(preferred)
+    if preferred_score is None:
+        return int(winner), float(winner_score)
+    min_ratio = float(override.get("min_alternative_ratio", 0.0) or 0.0)
+    if preferred_score < float(winner_score) * min_ratio:
+        return int(winner), float(winner_score)
+    max_winner_ratio = override.get("max_winner_ratio")
+    if max_winner_ratio is not None and float(winner_score) / max(0.01, preferred_score) > float(max_winner_ratio):
+        return int(winner), float(winner_score)
+    return int(preferred), float(preferred_score)
+
+
+def normalize_digit_confusion_overrides(overrides):
+    normalized = {}
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, int):
+            normalized[str(int(key))] = {"prefer": int(value)}
+            continue
+        if not isinstance(value, dict):
+            continue
+        if "prefer" not in value:
+            continue
+        item = {"prefer": int(value["prefer"])}
+        if "min_alternative_ratio" in value:
+            item["min_alternative_ratio"] = float(value["min_alternative_ratio"])
+        if "max_winner_ratio" in value:
+            item["max_winner_ratio"] = float(value["max_winner_ratio"])
+        normalized[str(int(key))] = item
+    return normalized
 
 
 def ocr_decision_diagnostics(detections, voting_detections, voted, min_votes=2, min_raw_confidence=0.0):
@@ -1239,6 +1608,9 @@ def aggregate_crop_candidates(items):
                 "confidence": float(min(1.0, best_weighted)),
                 "raw_observation_count": len(observations),
                 "raw_best_confidence": float(best_item.get("confidence", 0.0) or 0.0),
+                "raw_crop_quality": best_item.get("crop_quality"),
+                "crop_quality_vote_weight": best_item.get("crop_quality_vote_weight"),
+                "base_vote_weight": best_item.get("base_vote_weight"),
                 "raw_sources": sorted({str(item.get("source", "ocr")) for _, item in observations}),
                 "raw_channels": sorted({str(item.get("ocr_channel", "unknown")) for _, item in observations}),
                 "raw_variants": [

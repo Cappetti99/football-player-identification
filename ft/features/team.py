@@ -59,6 +59,7 @@ class TeamAssigner:
         trusted_palette_min_fraction=None,
         trusted_palette_min_margin=None,
         trusted_palette_min_samples=None,
+        kmeans_random_states=None,
     ):
         self.max_seed_frames = int(max_seed_frames)
         self.min_seed_colors = int(min_seed_colors)
@@ -80,6 +81,7 @@ class TeamAssigner:
         self.trusted_palette_min_samples = (
             int(trusted_palette_min_samples) if trusted_palette_min_samples is not None else None
         )
+        self.kmeans_random_states = normalize_random_states(kmeans_random_states)
         self.kmeans = None
         self.team_colors = {}
 
@@ -119,16 +121,24 @@ class TeamAssigner:
         from sklearn.cluster import KMeans
 
         x = np.asarray(colors, dtype=np.float32)
-        model = KMeans(n_clusters=2, random_state=0, n_init=10).fit(x)
-        centers = model.cluster_centers_
-        if np.linalg.norm(centers[0] - centers[1]) < self.min_cluster_separation:
+        best_model = None
+        best_separation = -1.0
+        for random_state in self.kmeans_random_states:
+            model = KMeans(n_clusters=2, random_state=random_state, n_init=10).fit(x)
+            centers = model.cluster_centers_
+            separation = float(np.linalg.norm(centers[0] - centers[1]))
+            if separation > best_separation:
+                best_model = model
+                best_separation = separation
+
+        if best_model is None or best_separation < self.min_cluster_separation:
             # If the first frames do not separate into two kit colours, it is
             # safer to leave team unknown than to build a noisy classifier.
             return
-        self.kmeans = model
+        self.kmeans = best_model
         self.team_colors = {
-            1: tuple(int(v) for v in centers[0]),
-            2: tuple(int(v) for v in centers[1]),
+            1: tuple(int(v) for v in self.kmeans.cluster_centers_[0]),
+            2: tuple(int(v) for v in self.kmeans.cluster_centers_[1]),
         }
 
     def _assign_tracklets(self, frames, tracks):
@@ -303,6 +313,18 @@ def merge_assignments(primary, fallback):
     return merged
 
 
+def normalize_random_states(values):
+    """Normalize configurable K-Means seeds into a deterministic integer list."""
+    if values in (None, "", []):
+        return [0, 42, 7, 13]
+    if isinstance(values, int):
+        return [int(values)]
+    if isinstance(values, str):
+        values = [value.strip() for value in values.split(",") if value.strip()]
+    states = [int(value) for value in values]
+    return states or [0, 42, 7, 13]
+
+
 def classify_team_palette(frame, bbox, color_ranges_by_team, min_fraction=0.16, min_margin=0.04):
     """Classify one detection against roster-provided team kit palettes."""
     import cv2
@@ -430,11 +452,21 @@ def normalize_team_ranges_by_team(color_ranges_by_team):
         team_id = int(team_id)
         normalized[team_id] = {}
         for name, value in (ranges or {}).items():
-            if isinstance(value, str) or isinstance(value, (list, tuple)):
+            if is_hsv_rule_list(value):
+                normalized[team_id][str(name)] = list(value)
+            elif isinstance(value, str) or isinstance(value, (list, tuple)):
                 normalized[team_id].update(team_color_to_ranges(value, team_id=team_id, name=str(name)))
             else:
                 normalized[team_id][str(name)] = list(value)
     return {team: ranges for team, ranges in normalized.items() if ranges}
+
+
+def is_hsv_rule_list(value):
+    return (
+        isinstance(value, (list, tuple))
+        and bool(value)
+        and all(isinstance(item, dict) for item in value)
+    )
 
 
 def team_color_to_ranges(color, team_id=None, name=None):

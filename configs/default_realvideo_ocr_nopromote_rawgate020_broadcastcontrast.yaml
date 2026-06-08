@@ -1,0 +1,6 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020.yaml
+
+jersey_ocr:
+  broadcast_contrast_enabled: true
+  broadcast_contrast_clip_limit: 4.0
+  broadcast_contrast_tile_grid_size: 4

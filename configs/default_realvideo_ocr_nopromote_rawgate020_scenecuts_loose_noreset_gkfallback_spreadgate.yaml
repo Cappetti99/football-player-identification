@@ -1,0 +1,15 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_scenecuts_gkfallback.yaml
+
+scene_cuts:
+  threshold: 0.12
+  hard_cut_threshold: 0.20
+  min_gap: 40
+  tracking_reset_enabled: false
+  max_cuts: 12
+  top_scores: 50
+
+identity:
+  candidate_fallback:
+    max_jersey_display_spread: 2
+    display_spread_scope: team
+    display_spread_only_unknown: true

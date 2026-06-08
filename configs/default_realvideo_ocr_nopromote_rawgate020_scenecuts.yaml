@@ -1,0 +1,34 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020.yaml
+
+scene_cuts:
+  enabled: true
+  threshold: 0.65
+  hard_cut_threshold: 0.90
+  min_gap: 12
+  crop_top_fraction: 0.12
+  crop_bottom_fraction: 0.16
+  crop_left_fraction: 0.04
+  crop_right_fraction: 0.04
+  resize_width: 320
+  tracking_reset_enabled: true
+
+identity_propagation:
+  enabled: true
+  min_composite_score: 0.40
+  min_score_margin: 0.08
+  max_hops: 1
+  allow_propagated_sources: false
+  min_source_confidence: 0.55
+  allow_partial_conflict_frames: true
+  min_partial_frames: 20
+  min_partial_fraction: 0.25
+  max_temporal_gap: 300
+  max_spatial_distance: 25.0
+  min_team_confidence: 0.50
+  min_appearance_similarity: 0.50
+  require_team_match: true
+  require_jersey_or_strong_appearance: true
+  cut_bridge_enabled: true
+  cut_bridge_max_gap: 5
+  cut_bridge_min_jersey_confidence: 0.20
+  cut_bridge_min_jersey_votes: 3

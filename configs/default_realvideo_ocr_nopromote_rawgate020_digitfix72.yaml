@@ -1,0 +1,8 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020.yaml
+
+jersey_ocr:
+  digit_confusion_overrides:
+    "7":
+      prefer: 2
+      min_alternative_ratio: 0.35
+      max_winner_ratio: 3.0

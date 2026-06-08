@@ -23,6 +23,8 @@ tracking:
   frame_rate: 25
   minimum_consecutive_frames: 2
   progress_every: 250
+  inference_mode: true
+  half_precision: false
   strongsort:
     max_age: 150
     min_hits: 2
@@ -87,12 +89,17 @@ team:
   min_cluster_separation: 30.0
   min_classification_margin: 12.0
   min_tracklet_colors: 3
+  kmeans_random_states: [0, 42, 7, 13]
   roster_color_min_fraction: 0.16
   roster_color_min_margin: 0.04
   prefer_roster_palette: true
   trusted_palette_min_fraction: 0.18
   trusted_palette_min_margin: 0.04
   trusted_palette_min_samples: 3
+
+visual:
+  cache_enabled: true
+  embedding_mode: hsv
 
 referee:
   enabled: true
@@ -156,6 +163,9 @@ jersey_ocr:
   number_roi_enabled: false
   number_roi_upscale: 3
   number_roi_clahe: true
+  super_resolution_enabled: false
+  super_resolution_scale: 4
+  super_resolution_max_side: 100
   demote_direct_only_single_digits: true
   prefer_two_digit_candidates: true
   apply_to_goalkeepers: false
@@ -217,7 +227,7 @@ wandb:
   init_timeout: 180
   tags: []
   notes: null
-  log_artifacts: true
+  log_artifacts: false
   log_video: false
   alert_on_finish: true
   alert_on_failure: true

@@ -1,0 +1,4 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_preserve.yaml
+
+identity:
+  global_team_jersey_owner: false

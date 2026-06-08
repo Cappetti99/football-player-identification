@@ -86,8 +86,16 @@ class JerseyIdentityLinker:
                     "jersey_number": int(current["jersey_number"]),
                     "gap": int(current["start"] - best["end"]),
                     "distance": tracklet_distance(best, current),
+                    "from_frames": int(best["num_frames"]),
+                    "to_frames": int(current["num_frames"]),
+                    "from_jersey_votes": int(best["jersey_votes"]),
+                    "to_jersey_votes": int(current["jersey_votes"]),
+                    "from_jersey_margin": float(best["jersey_winner_margin"]),
+                    "to_jersey_margin": float(current["jersey_winner_margin"]),
                     "from_jersey_confidence": float(best["jersey_confidence"]),
                     "to_jersey_confidence": float(current["jersey_confidence"]),
+                    "from_team_confidence": float(best["mean_team_confidence"]),
+                    "to_team_confidence": float(current["mean_team_confidence"]),
                 }
             )
 

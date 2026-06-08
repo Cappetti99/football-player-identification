@@ -1,0 +1,6 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_scenecuts_loose_noreset_gkfallback_spreadgate.yaml
+
+jersey_ocr:
+  crop_quality_vote_weighting: true
+  crop_quality_min_vote_weight: 0.35
+  crop_quality_vote_power: 1.0

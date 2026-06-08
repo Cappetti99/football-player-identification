@@ -1,5 +1,7 @@
 from collections import defaultdict
 
+REFEREE_ROLES = {"referee", "referee_candidate", "official", "match_official"}
+
 
 def build_identity_candidates(
     candidate_scores,
@@ -8,6 +10,9 @@ def build_identity_candidates(
     min_confidence=0.35,
     max_cost=0.85,
     min_margin=0.0,
+    max_jersey_display_spread=None,
+    display_spread_scope="team",
+    display_spread_only_unknown=True,
 ):
     """Select one diagnostic identity candidate for each still-unknown track.
 
@@ -19,6 +24,7 @@ def build_identity_candidates(
         return {}
 
     assigned_track_ids = assigned_display_track_ids(tracks) if tracks is not None else set()
+    blocked_track_ids = referee_like_track_ids(tracks) if tracks is not None else set()
     grouped = defaultdict(list)
     for row in candidate_scores or []:
         try:
@@ -27,9 +33,13 @@ def build_identity_candidates(
             continue
         if track_id in assigned_track_ids:
             continue
+        if track_id in blocked_track_ids:
+            continue
+        if is_referee_roster_candidate(row):
+            continue
         grouped[track_id].append(row)
 
-    candidates = {}
+    selected = {}
     for track_id, rows in grouped.items():
         rows = sorted(rows, key=lambda row: (float(row.get("cost", 1.0) or 1.0), str(row.get("player_id"))))
         if not rows:
@@ -46,7 +56,7 @@ def build_identity_candidates(
         if margin < float(min_margin):
             continue
 
-        candidates[track_id] = {
+        selected[track_id] = {
             "candidate_player_id": best.get("player_id"),
             "candidate_player_name": best.get("player_name", best.get("player_id")),
             "candidate_team_id": best.get("player_team_id"),
@@ -68,16 +78,68 @@ def build_identity_candidates(
                 "visual_similarity": best.get("visual_similarity"),
             },
         }
+    spread = candidate_jersey_display_spread(selected, scope=display_spread_scope)
+    candidates = {}
+    for track_id, candidate in selected.items():
+        jersey = candidate.get("candidate_jersey_number")
+        if max_jersey_display_spread not in (None, "", 0, "0") and jersey not in (None, "", "None"):
+            key = candidate_jersey_spread_key(candidate, scope=display_spread_scope)
+            if int(spread.get(key, 0)) > int(max_jersey_display_spread):
+                continue
+        if spread:
+            evidence = candidate.setdefault("candidate_evidence", {})
+            evidence["candidate_jersey_display_spread"] = int(
+                spread.get(candidate_jersey_spread_key(candidate, scope=display_spread_scope), 0)
+            )
+            evidence["candidate_jersey_display_spread_scope"] = str(display_spread_scope or "global")
+            evidence["candidate_jersey_display_spread_only_unknown"] = bool(display_spread_only_unknown)
+        candidates[track_id] = candidate
     return candidates
 
 
+def candidate_jersey_display_spread(candidates, scope="team"):
+    """Count how many unknown tracklets selected each jersey candidate.
+
+    Candidate fallback is diagnostic and should not promote numbers that behave
+    like OCR attractors across many display IDs. Counting after the first-pass
+    best-candidate selection catches cases where the same jersey is proposed
+    for many unrelated unknown tracklets in one video.
+    """
+    by_key = defaultdict(set)
+    for track_id, candidate in (candidates or {}).items():
+        key = candidate_jersey_spread_key(candidate, scope=scope)
+        if key is None:
+            continue
+        by_key[key].add(int(track_id))
+    return {key: len(track_ids) for key, track_ids in by_key.items()}
+
+
+def candidate_jersey_spread_key(candidate, scope="team"):
+    jersey = candidate.get("candidate_jersey_number")
+    if jersey in (None, "", "None"):
+        return None
+    try:
+        jersey = int(jersey)
+    except (TypeError, ValueError):
+        return None
+    if str(scope or "team").lower() == "team":
+        team = candidate.get("candidate_team_id")
+        try:
+            team = int(team)
+        except (TypeError, ValueError):
+            team = None
+        return (team, jersey)
+    return jersey
+
+
 def apply_identity_candidates(tracks, candidates):
+    """Attach non-authoritative identity candidates to still-unknown tracks."""
     if not candidates:
         return
     for frame_tracks in tracks.get("players", []):
         for raw_id, track in frame_tracks.items():
-            display_id = int(track.get("display_track_id", raw_id))
-            candidate = candidates.get(display_id)
+            tracklet_id = int(track.get("identity_tracklet_id") or track.get("display_track_id", raw_id))
+            candidate = candidates.get(tracklet_id)
             if not candidate:
                 continue
             if track.get("player_id") not in (None, "", "unknown"):
@@ -86,6 +148,7 @@ def apply_identity_candidates(tracks, candidates):
 
 
 def identity_candidate_rows(candidates):
+    """Convert candidate diagnostics into stable CSV/JSON rows."""
     rows = []
     for track_id, candidate in sorted((candidates or {}).items()):
         row = {"track_id": int(track_id)}
@@ -95,16 +158,56 @@ def identity_candidate_rows(candidates):
 
 
 def assigned_display_track_ids(tracks):
+    """Return tracklet ids that already have an authoritative identity."""
     assigned = set()
     for frame_tracks in (tracks or {}).get("players", []):
         for raw_id, track in frame_tracks.items():
             if track.get("player_id") in (None, "", "unknown"):
                 continue
-            assigned.add(int(track.get("display_track_id", raw_id)))
+            assigned.add(int(track.get("identity_tracklet_id") or track.get("display_track_id", raw_id)))
     return assigned
 
 
+def referee_like_track_ids(tracks, min_referee_score=0.25):
+    """Find tracklets where player candidates would likely describe the referee.
+
+    Referee detections can pass through the players branch so downstream
+    exports remain uniform. Candidate identities are only diagnostic, but
+    writing player candidates on referee-like display ids makes audits noisy
+    and was observed to turn yellow referee tracks into roster players.
+    """
+    stats = defaultdict(lambda: {"total": 0, "referee_like": 0, "strong": False})
+    for group in ("players", "referees"):
+        for frame_tracks in (tracks or {}).get(group, []):
+            for raw_id, track in frame_tracks.items():
+                tracklet_id = int(track.get("identity_tracklet_id") or track.get("display_track_id", raw_id))
+                stats[tracklet_id]["total"] += 1
+                role = str(track.get("role_detection") or "").lower()
+                referee_like = (
+                    group == "referees"
+                    or role in REFEREE_ROLES
+                    or track.get("semantic_group_id") == 5
+                    or bool(track.get("referee_palette_match", False))
+                    or float(track.get("referee_like_score") or 0.0) >= float(min_referee_score)
+                )
+                if referee_like:
+                    stats[tracklet_id]["referee_like"] += 1
+                if group == "referees" or role == "referee":
+                    stats[tracklet_id]["strong"] = True
+    return {
+        tracklet_id
+        for tracklet_id, values in stats.items()
+        if values["strong"] or values["referee_like"] / max(1, values["total"]) >= 0.5
+    }
+
+
+def is_referee_roster_candidate(row):
+    """Return whether a candidate-score row points at a referee roster entry."""
+    return str(row.get("player_role") or "").lower() in REFEREE_ROLES
+
+
 def candidate_reason(row):
+    """Explain why a non-authoritative candidate was selected."""
     gate = row.get("assignment_gate") or {}
     if gate.get("pass") and gate.get("reason"):
         return str(gate["reason"])

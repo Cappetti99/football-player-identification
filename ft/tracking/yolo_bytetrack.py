@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,11 @@ try:
     import supervision as sv
 except ImportError:
     sv = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 PLAYER_CLASSES = {"person", "player", "goalkeeper"}
@@ -43,6 +49,8 @@ class YoloByteTracker:
         frame_rate=25,
         minimum_consecutive_frames=2,
         progress_every=250,
+        inference_mode=True,
+        half_precision=False,
     ):
         if YOLO is None:
             raise ImportError("Missing ultralytics. Install FT requirements first.")
@@ -55,6 +63,13 @@ class YoloByteTracker:
         self.ball_confidence = float(ball_confidence)
         self.ball_max_area_ratio = float(ball_max_area_ratio)
         self.ball_size_penalty = float(ball_size_penalty)
+        self.tracker_params = {
+            "track_activation_threshold": track_activation_threshold,
+            "lost_track_buffer": lost_track_buffer,
+            "minimum_matching_threshold": minimum_matching_threshold,
+            "frame_rate": frame_rate,
+            "minimum_consecutive_frames": minimum_consecutive_frames,
+        }
         self.tracker = self._build_tracker(
             track_activation_threshold,
             lost_track_buffer,
@@ -63,6 +78,8 @@ class YoloByteTracker:
             minimum_consecutive_frames,
         )
         self.progress_every = int(progress_every or 0)
+        self.inference_mode = bool(inference_mode)
+        self.half_precision = bool(half_precision)
 
     @staticmethod
     def _build_tracker(
@@ -86,33 +103,56 @@ class YoloByteTracker:
         except TypeError:
             return sv.ByteTrack(**kwargs)
 
-    def run(self, frames, batch_size=20):
+    def reset_tracker(self):
+        """Reset ByteTrack state while keeping the detector warm."""
+        self.tracker = self._build_tracker(**self.tracker_params)
+
+    def run(self, frames, batch_size=20, scene_cut_frames=None):
+        """Track frames sequentially, optionally resetting at shot boundaries."""
         tracks = {"players": [], "referees": [], "ball": []}
-        for start in range(0, len(frames), batch_size):
-            # Detection is batched for GPU throughput, but ByteTrack still
-            # receives frames in order so its temporal state remains valid.
-            results = self.model.predict(
-                frames[start : start + batch_size],
-                conf=self.ball_confidence,
-                verbose=False,
-            )
-            for local_index, result in enumerate(results):
-                frame_num = start + local_index
-                frame_tracks = self._process_frame(result)
-                for key in tracks:
-                    tracks[key].append(frame_tracks[key])
-                if self.progress_every > 0 and (frame_num + 1) % self.progress_every == 0:
-                    print(
-                        "FT bytetrack:"
-                        f" processed_frames={frame_num + 1}/{len(frames)}",
-                        flush=True,
+        scene_cut_frames = {int(frame) for frame in (scene_cut_frames or []) if int(frame) > 0}
+        current_id_offset = 0
+        max_seen_track_id = 0
+        scene_segment_id = 0
+        context = torch.inference_mode() if torch is not None and self.inference_mode else nullcontext()
+        with context:
+            for start in range(0, len(frames), batch_size):
+                # Detection is batched for GPU throughput, but ByteTrack still
+                # receives frames in order so its temporal state remains valid.
+                results = self.model.predict(
+                    frames[start : start + batch_size],
+                    conf=self.ball_confidence,
+                    verbose=False,
+                    half=self.half_precision,
+                )
+                for local_index, result in enumerate(results):
+                    frame_num = start + local_index
+                    scene_cut_reset = frame_num in scene_cut_frames
+                    if scene_cut_reset:
+                        self.reset_tracker()
+                        current_id_offset = max_seen_track_id
+                        scene_segment_id += 1
+                    frame_tracks = self._process_frame(
+                        result,
+                        id_offset=current_id_offset,
+                        scene_segment_id=scene_segment_id,
+                        scene_cut_reset=scene_cut_reset,
                     )
+                    for key in tracks:
+                        tracks[key].append(frame_tracks[key])
+                    max_seen_track_id = max(max_seen_track_id, max_frame_track_id(frame_tracks))
+                    if self.progress_every > 0 and (frame_num + 1) % self.progress_every == 0:
+                        print(
+                            "FT bytetrack:"
+                            f" processed_frames={frame_num + 1}/{len(frames)}",
+                            flush=True,
+                        )
         self.add_positions(tracks)
         tracks["ball"] = self.interpolate_ball(tracks["ball"])
         self.add_positions(tracks)
         return tracks
 
-    def _process_frame(self, result):
+    def _process_frame(self, result, id_offset=0, scene_segment_id=0, scene_cut_reset=False):
         names = {int(k): str(v).lower() for k, v in result.names.items()}
         detections = sv.Detections.from_ultralytics(result)
         if len(detections) > 0:
@@ -143,13 +183,22 @@ class YoloByteTracker:
         for item in tracked:
             bbox = item[0].tolist()
             class_id = int(item[3])
-            track_id = int(item[4])
+            local_track_id = int(item[4])
+            track_id = local_track_id + int(id_offset)
             class_name = names[class_id]
+            payload = {
+                "bbox": bbox,
+                "role_detection": "goalkeeper" if class_name == "goalkeeper" else "player",
+                "raw_track_id": local_track_id,
+                "scene_segment_id": int(scene_segment_id),
+            }
+            if scene_cut_reset:
+                payload["scene_cut_boundary"] = True
             if class_name in PLAYER_CLASSES:
-                role = "goalkeeper" if class_name == "goalkeeper" else "player"
-                output["players"][track_id] = {"bbox": bbox, "role_detection": role}
+                output["players"][track_id] = payload
             elif class_name in REFEREE_CLASSES:
-                output["referees"][track_id] = {"bbox": bbox, "role_detection": "referee"}
+                payload["role_detection"] = "referee"
+                output["referees"][track_id] = payload
 
         ball_candidates = []
         frame_height, frame_width = result.orig_shape
@@ -161,6 +210,9 @@ class YoloByteTracker:
                 ball_candidates.append((bbox.tolist(), float(confidence)))
         selected_ball = self.select_ball(ball_candidates, frame_area)
         if selected_ball:
+            selected_ball["scene_segment_id"] = int(scene_segment_id)
+            if scene_cut_reset:
+                selected_ball["scene_cut_boundary"] = True
             output["ball"][1] = selected_ball
         return output
 
@@ -220,3 +272,11 @@ class YoloByteTracker:
             ({1: {"bbox": row.tolist(), "interpolated": True}} if not row.isna().any() else {})
             for _, row in df.iterrows()
         ]
+
+
+def max_frame_track_id(frame_tracks):
+    max_id = 0
+    for group in ("players", "referees"):
+        if frame_tracks.get(group):
+            max_id = max(max_id, max(int(track_id) for track_id in frame_tracks[group]))
+    return max_id

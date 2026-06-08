@@ -1,0 +1,4 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020.yaml
+
+visual:
+  embedding_mode: hsv_lab_gradient
