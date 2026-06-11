@@ -334,12 +334,25 @@ def frame_conflict_for_assignment(tracks, target_display_id, player, buffer=0):
 def build_assignment(player, source, target, edge, propagation_depth):
     """Create a propagated assignment record to store on every target frame."""
     confidence = edge.composite_score * min(1.0, float(source.identity_confidence or 0.0)) * 0.85
+    risk_flags = propagation_risk_flags(confidence, source, target, edge)
     return {
         "player_id": player["player_id"],
         "player_name": player.get("name", player["player_id"]),
         "team_id": target.team_id if target.team_id is not None else player.get("team_id"),
         "jersey_number": player.get("jersey_number") or target.jersey_number,
         "confidence": float(confidence),
+        "identity_confidence": float(confidence),
+        "identity_status": "propagated",
+        "identity_sources": {
+            "propagation": float(edge.composite_score),
+            "source_identity_confidence": float(source.identity_confidence or 0.0),
+            "team": float(edge.team_score),
+            "jersey": float(edge.jersey_score),
+            "temporal": float(edge.temporal_score),
+            "spatial": float(edge.spatial_score),
+            "appearance": float(edge.appearance_score),
+        },
+        "identity_risk_flags": risk_flags,
         "evidence": {
             "status": "propagated",
             "propagation_source_display_id": int(source.display_track_id),
@@ -354,6 +367,7 @@ def build_assignment(player, source, target, edge, propagation_depth):
             "team_match": bool(edge.team_match),
             "source_identity_confidence": float(source.identity_confidence or 0.0),
             "source_player_id": source.player_id,
+            "risk_flags": risk_flags,
         },
     }
 
@@ -373,6 +387,9 @@ def apply_assignment_to_tracks(tracks, target_display_id, assignment, valid_fram
             track["player_name"] = assignment["player_name"]
             track["jersey_number"] = assignment["jersey_number"]
             track["identity_confidence"] = assignment["confidence"]
+            track["identity_status"] = assignment.get("identity_status", "propagated")
+            track["identity_sources"] = assignment.get("identity_sources", {})
+            track["identity_risk_flags"] = assignment.get("identity_risk_flags", [])
             track["identity_evidence"] = assignment["evidence"]
             track["jersey_evidence"] = {
                 "status": "propagated_from_identity",
@@ -388,6 +405,21 @@ def apply_assignment_to_node(node, assignment):
     node.identity_confidence = assignment["confidence"]
     node.jersey_number = assignment["jersey_number"]
     node.propagation_depth = int(assignment["evidence"].get("propagation_depth") or 1)
+
+
+def propagation_risk_flags(confidence, source, target, edge):
+    flags = ["propagated"]
+    if float(confidence or 0.0) < 0.60:
+        flags.append("low_propagation_confidence")
+    if float(source.identity_confidence or 0.0) < 0.80:
+        flags.append("source_confidence_below_080")
+    if not edge.jersey_match:
+        flags.append("missing_jersey_match")
+    if edge.visual_similarity is None:
+        flags.append("missing_visual_similarity")
+    if int(target.num_frames or 0) < 20:
+        flags.append("short_target_tracklet")
+    return sorted(set(flags))
 
 
 def propagation_rows(diagnostics):

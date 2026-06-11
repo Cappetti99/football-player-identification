@@ -172,6 +172,10 @@ class HungarianPlayerIdentifier:
                 # Keep the best rejected candidate in diagnostics. It is useful
                 # when tuning thresholds, but it must not become a real identity.
                 assignments[track_id]["confidence"] = confidence
+                assignments[track_id]["identity_confidence"] = confidence
+                assignments[track_id]["identity_status"] = "unknown"
+                assignments[track_id]["identity_sources"] = identity_sources(details)
+                assignments[track_id]["identity_risk_flags"] = identity_risk_flags(tracklet, assignment_gate, details)
                 assignments[track_id]["evidence"].update(
                     {
                         "best_candidate": player["player_id"],
@@ -185,6 +189,10 @@ class HungarianPlayerIdentifier:
                 # Low cost alone is not enough. Without reliable jersey evidence
                 # or strong combined cues, the conservative outcome is unknown.
                 assignments[track_id]["confidence"] = confidence
+                assignments[track_id]["identity_confidence"] = confidence
+                assignments[track_id]["identity_status"] = "unknown"
+                assignments[track_id]["identity_sources"] = identity_sources(details)
+                assignments[track_id]["identity_risk_flags"] = identity_risk_flags(tracklet, assignment_gate, details)
                 assignments[track_id]["evidence"].update(
                     {
                         "best_candidate": player["player_id"],
@@ -201,6 +209,10 @@ class HungarianPlayerIdentifier:
                 "team_id": tracklet.get("team_id"),
                 "jersey_number": player.get("jersey_number") or tracklet.get("jersey_number"),
                 "confidence": confidence,
+                "identity_confidence": confidence,
+                "identity_status": "assigned",
+                "identity_sources": identity_sources(details),
+                "identity_risk_flags": identity_risk_flags(tracklet, assignment_gate, details),
                 "evidence": {
                     "status": "assigned",
                     "cost": details["cost"],
@@ -519,6 +531,10 @@ def unknown_assignments(summaries, status):
             "team_id": summary.get("team_id"),
             "jersey_number": summary.get("jersey_number"),
             "confidence": 0.0,
+            "identity_confidence": 0.0,
+            "identity_status": "unknown",
+            "identity_sources": {},
+            "identity_risk_flags": ["missing_roster"] if status == "missing_roster" else [],
             "evidence": {"status": status, "tracklet_frames": summary.get("num_frames", 0)},
         }
         for summary in summaries
@@ -536,6 +552,9 @@ def apply_assignments(tracks, assignments):
             track["player_name"] = assignment["player_name"]
             track["jersey_number"] = assignment["jersey_number"]
             track["identity_confidence"] = assignment["confidence"]
+            track["identity_status"] = assignment.get("identity_status", assignment.get("evidence", {}).get("status"))
+            track["identity_sources"] = assignment.get("identity_sources", {})
+            track["identity_risk_flags"] = assignment.get("identity_risk_flags", [])
             track["identity_evidence"] = assignment["evidence"]
 
 
@@ -616,6 +635,34 @@ def jersey_candidate_score(tracklet, expected, field="jersey_distribution"):
             votes = int(candidate.get("votes", 0) or 0)
             return confidence * min(1.0, max(1, votes) / 3.0)
     return None
+
+
+def identity_sources(details):
+    components = details.get("components") or {}
+    sources = {}
+    for key in ("team", "jersey", "position_prior", "visual", "goalkeeper_role", "tracklet_length", "crop_quality"):
+        value = float(components.get(key, 0.0) or 0.0)
+        sources[key] = float(clamp(0.5 - value, 0.0, 1.0))
+    sources["cost"] = float(details.get("cost", 1.0) or 1.0)
+    sources["confidence"] = float(details.get("confidence", 0.0) or 0.0)
+    return sources
+
+
+def identity_risk_flags(tracklet, assignment_gate, details):
+    flags = []
+    if not assignment_gate.get("pass"):
+        flags.append(str(assignment_gate.get("reason") or "assignment_gate_failed"))
+    if not tracklet.get("raw_jersey_distribution") and not tracklet.get("jersey_distribution"):
+        flags.append("missing_ocr_distribution")
+    if float(tracklet.get("mean_team_confidence") or 0.0) < 0.50:
+        flags.append("low_team_confidence")
+    if int(tracklet.get("num_frames") or 0) < 10:
+        flags.append("short_tracklet")
+    if details.get("visual_similarity") is None:
+        flags.append("missing_visual_similarity")
+    if float(details.get("confidence") or 0.0) < 0.70:
+        flags.append("low_identity_confidence")
+    return sorted(set(flags))
 
 
 def jersey_reliability(tracklet):

@@ -1075,6 +1075,12 @@ def _clear_identity(track, evidence):
     track["player_id"] = "unknown"
     track["player_name"] = "unknown"
     track["identity_confidence"] = 0.0
+    track["identity_status"] = "invalidated"
+    risk_flags = list(track.get("identity_risk_flags") or [])
+    reason = (evidence or {}).get("reason")
+    if reason:
+        risk_flags.append(str(reason))
+    track["identity_risk_flags"] = sorted(set(risk_flags + ["constraint_invalidated"]))
     track["identity_evidence"] = evidence
 
 

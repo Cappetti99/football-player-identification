@@ -15,6 +15,7 @@ from ft.features.team import TeamAssigner, team_color_ranges_by_team_from_roster
 from ft.features.visual import VisualFeatureExtractor
 from ft.identity.candidates import build_identity_candidates, apply_identity_candidates, identity_candidate_rows
 from ft.identity.constraints import enforce_identity_constraints
+from ft.identity.evidence import build_tracklet_evidence, identity_evidence_rows
 from ft.identity.hungarian import HungarianPlayerIdentifier, apply_assignments
 from ft.identity.propagation import IdentityPropagationEngine, propagation_rows
 from ft.identity.roster import load_roster, validate_unique_team_jersey
@@ -294,6 +295,10 @@ def _run_pipeline_impl(config):
         jersey_linking_diagnostics = {"enabled": False, "status": "jersey_ocr_disabled"}
         print("FT jersey OCR: disabled", flush=True)
 
+    identity_evidence = build_tracklet_evidence(player_rows, roster)
+    write_json(identity_evidence, artifacts_dir / "metadata" / f"{video_id}_identity_evidence.json")
+    write_table(identity_evidence_rows(identity_evidence), artifacts_dir / "metadata" / f"{video_id}_identity_evidence.csv")
+
     with run_diagnostics.stage("identity_assignment"):
         identifier = HungarianPlayerIdentifier(
             roster_path=config.get("roster_path"),
@@ -387,6 +392,7 @@ def _run_pipeline_impl(config):
                 "goalkeeper_only_alternate_stop_on_known_owner_conflict", True
             ),
         )
+    constraint_actions = constraint_action_rows(constraints_diagnostics)
 
     candidate_cfg = config["identity"].get("candidate_fallback", {})
     segment_candidate_diagnostics = {"enabled": False, "status": "disabled"}
@@ -440,6 +446,8 @@ def _run_pipeline_impl(config):
             "identity_candidates": {str(k): v for k, v in identity_candidates.items()},
             "segment_jersey_candidates": segment_jersey_candidates,
             "segment_candidate_fallback": segment_candidate_diagnostics,
+            "identity_evidence": identity_evidence,
+            "constraint_actions": constraint_actions,
         },
         artifacts_dir / "metadata" / f"{video_id}_identity_assignments.json",
     )
@@ -454,6 +462,10 @@ def _run_pipeline_impl(config):
         artifacts_dir / "metadata" / f"{video_id}_identity_propagation.csv",
     )
     write_json(constraints_diagnostics, artifacts_dir / "metadata" / f"{video_id}_constraints.json")
+    write_table(constraint_actions, artifacts_dir / "metadata" / f"{video_id}_identity_constraint_actions.csv")
+    identity_decisions = identity_decision_rows(final_rows)
+    write_json(identity_decisions, artifacts_dir / "metadata" / f"{video_id}_identity_decisions.json")
+    write_table(identity_decisions, artifacts_dir / "metadata" / f"{video_id}_identity_decisions.csv")
     write_json(referee_diagnostics, artifacts_dir / "metadata" / f"{video_id}_referee_colour.json")
     write_json(goalkeeper_diagnostics, artifacts_dir / "metadata" / f"{video_id}_goalkeeper_colour.json")
     write_json(jersey_linking_diagnostics, artifacts_dir / "metadata" / f"{video_id}_jersey_identity_linking.json")
@@ -504,6 +516,8 @@ def _run_pipeline_impl(config):
             "identity_candidates": len(identity_candidates),
             "segment_jersey_candidates": len(segment_jersey_candidates),
             "segment_candidate_fallback": segment_candidate_diagnostics,
+            "identity_evidence": len(identity_evidence),
+            "constraint_actions": len(constraint_actions),
         }
     )
     return {
@@ -519,6 +533,8 @@ def _run_pipeline_impl(config):
         "identity_candidates": identity_candidates,
         "segment_jersey_candidates": segment_jersey_candidates,
         "segment_candidate_fallback": segment_candidate_diagnostics,
+        "identity_evidence": identity_evidence,
+        "constraint_actions": constraint_actions,
     }
 
 
@@ -1093,6 +1109,78 @@ def percentile_jump(records, percentile):
     if not records:
         return None
     return float(np.percentile([float(item["jump_px"]) for item in records], percentile))
+
+
+def identity_decision_rows(rows):
+    grouped = {}
+    for row in rows or []:
+        if row.get("track_group", "players") != "players":
+            continue
+        tracklet_id = int(row.get("identity_tracklet_id") or row.get("display_track_id", row["track_id"]))
+        item = grouped.setdefault(
+            tracklet_id,
+            {
+                "tracklet_id": int(tracklet_id),
+                "display_track_id": row.get("display_track_id"),
+                "frames": 0,
+                "player_ids": Counter(),
+                "player_names": Counter(),
+                "identity_statuses": Counter(),
+                "identity_confidences": [],
+                "jersey_numbers": Counter(),
+                "identity_sources": row.get("identity_sources", {}),
+                "identity_risk_flags": set(),
+                "identity_evidence": row.get("identity_evidence", {}),
+            },
+        )
+        item["frames"] += 1
+        item["player_ids"][row.get("player_id", "unknown")] += 1
+        item["player_names"][row.get("player_name", "unknown")] += 1
+        item["identity_statuses"][row.get("identity_status") or "unknown"] += 1
+        item["identity_confidences"].append(float(row.get("identity_confidence", 0.0) or 0.0))
+        if row.get("jersey_number") not in (None, "", "None"):
+            item["jersey_numbers"][row.get("jersey_number")] += 1
+        for flag in row.get("identity_risk_flags") or []:
+            item["identity_risk_flags"].add(str(flag))
+    output = []
+    for item in grouped.values():
+        confidences = item["identity_confidences"]
+        output.append(
+            {
+                "tracklet_id": item["tracklet_id"],
+                "display_track_id": item["display_track_id"],
+                "frames": item["frames"],
+                "player_id": most_common(item["player_ids"]),
+                "player_name": most_common(item["player_names"]),
+                "jersey_number": most_common(item["jersey_numbers"]),
+                "identity_status": most_common(item["identity_statuses"]),
+                "identity_confidence": float(sum(confidences) / len(confidences)) if confidences else 0.0,
+                "identity_sources": item["identity_sources"],
+                "identity_risk_flags": sorted(item["identity_risk_flags"]),
+                "identity_evidence": item["identity_evidence"],
+            }
+        )
+    return sorted(output, key=lambda row: int(row["tracklet_id"]))
+
+
+def most_common(counter):
+    if not counter:
+        return None
+    return counter.most_common(1)[0][0]
+
+
+def constraint_action_rows(diagnostics):
+    rows = []
+    for action_type, items in (diagnostics or {}).items():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            row = {"action_type": action_type}
+            row.update(item)
+            rows.append(row)
+    return rows
 
 
 def _copy_row_features_to_tracks(rows, tracks):
