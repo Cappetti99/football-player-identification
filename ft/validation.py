@@ -35,6 +35,7 @@ def validate_run_config(config):
         errors.append("max_frames must be positive when provided")
 
     _validate_calibration(config.get("calibration", {}), errors)
+    _validate_detection(config.get("detection", {}), errors)
     _validate_tracking(config.get("tracking", {}), errors)
     _validate_scene_cuts(config.get("scene_cuts", {}), errors)
     _validate_jersey_ocr(config.get("jersey_ocr", {}), errors, warnings)
@@ -79,6 +80,35 @@ def _validate_calibration(calibration, errors):
         max_frame_gap = tvcalib.get("max_frame_gap")
         if max_frame_gap is not None and int(max_frame_gap) < 0:
             errors.append("calibration.tvcalib.max_frame_gap must be non-negative")
+
+
+def _validate_detection(detection, errors):
+    for key in (
+        "confidence",
+        "ball_confidence",
+        "ball_max_area_ratio",
+        "ball_size_penalty",
+        "ball_temporal_distance_penalty",
+        "ball_min_acquisition_confidence",
+        "ball_temporal_min_confidence_after_miss",
+        "ball_kalman_process_noise_scale",
+        "ball_kalman_measurement_noise_scale",
+        "ball_kalman_high_speed_threshold",
+    ):
+        if key in detection and float(detection.get(key) or 0.0) < 0.0:
+            errors.append(f"detection.{key} must be non-negative")
+    if "ball_temporal_max_distance" in detection and float(detection.get("ball_temporal_max_distance") or 0.0) <= 0.0:
+        errors.append("detection.ball_temporal_max_distance must be positive")
+    if "ball_temporal_max_distance_cap" in detection and float(detection.get("ball_temporal_max_distance_cap") or 0.0) < 0.0:
+        errors.append("detection.ball_temporal_max_distance_cap must be non-negative")
+    if "ball_low_confidence_max_distance" in detection and float(detection.get("ball_low_confidence_max_distance") or 0.0) <= 0.0:
+        errors.append("detection.ball_low_confidence_max_distance must be positive")
+    if "ball_temporal_miss_reset" in detection and int(detection.get("ball_temporal_miss_reset") or 0) < 0:
+        errors.append("detection.ball_temporal_miss_reset must be non-negative")
+    if "ball_kalman_max_lost_frames" in detection and int(detection.get("ball_kalman_max_lost_frames") or 0) < 0:
+        errors.append("detection.ball_kalman_max_lost_frames must be non-negative")
+    if "ball_kalman_high_speed_area_multiplier" in detection and float(detection.get("ball_kalman_high_speed_area_multiplier") or 0.0) < 1.0:
+        errors.append("detection.ball_kalman_high_speed_area_multiplier must be >= 1")
 
 
 def _validate_tracking(tracking, errors):
