@@ -1,6 +1,8 @@
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
+
 from ft.calibration.pitch_transform import PitchTransform
 from ft.config import load_config
 from ft.export.artifacts import ArtifactExporter, write_json, write_table
@@ -21,6 +23,7 @@ from ft.linking.tracklet_linker import TrackletLinker
 from ft.tracking.yolo_bytetrack import YoloByteTracker
 from ft.tracking.yolo_strongsort import YoloStrongSortTracker
 from ft.utils.run_diagnostics import RunDiagnostics
+from ft.utils.geometry import bbox_center
 from ft.utils.scene_cuts import (
     annotate_tracks_with_scene_segments,
     detect_scene_cuts,
@@ -443,6 +446,7 @@ def _run_pipeline_impl(config):
     write_json(linking_diagnostics, artifacts_dir / "metadata" / f"{video_id}_linking.json")
     write_json(scene_cut_diagnostics, artifacts_dir / "metadata" / f"{video_id}_scene_cuts.json")
     write_table(scene_cut_rows(scene_cut_diagnostics), artifacts_dir / "metadata" / f"{video_id}_scene_cuts.csv")
+    write_json(ball_tracking_diagnostics(tracks), artifacts_dir / "metadata" / f"{video_id}_ball_tracking.json")
     write_json(calibrator.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_calibration.json")
     write_json(identity_propagation_diagnostics, artifacts_dir / "metadata" / f"{video_id}_identity_propagation.json")
     write_table(
@@ -939,6 +943,25 @@ def build_tracker(config, model_path):
         "ball_confidence": config["detection"]["ball_confidence"],
         "ball_max_area_ratio": config["detection"]["ball_max_area_ratio"],
         "ball_size_penalty": config["detection"]["ball_size_penalty"],
+        "ball_temporal_consistency": config["detection"].get("ball_temporal_consistency", True),
+        "ball_temporal_max_distance": config["detection"].get("ball_temporal_max_distance", 120.0),
+        "ball_temporal_max_distance_cap": config["detection"].get("ball_temporal_max_distance_cap", 120.0),
+        "ball_temporal_distance_penalty": config["detection"].get("ball_temporal_distance_penalty", 0.35),
+        "ball_temporal_reject_outliers": config["detection"].get("ball_temporal_reject_outliers", True),
+        "ball_min_acquisition_confidence": config["detection"].get("ball_min_acquisition_confidence", 0.05),
+        "ball_low_confidence_max_distance": config["detection"].get("ball_low_confidence_max_distance", 30.0),
+        "ball_temporal_min_confidence_after_miss": config["detection"].get(
+            "ball_temporal_min_confidence_after_miss", 0.05
+        ),
+        "ball_temporal_miss_reset": config["detection"].get("ball_temporal_miss_reset", 12),
+        "ball_kalman_enabled": config["detection"].get("ball_kalman_enabled", False),
+        "ball_kalman_max_lost_frames": config["detection"].get("ball_kalman_max_lost_frames", 8),
+        "ball_kalman_process_noise_scale": config["detection"].get("ball_kalman_process_noise_scale", 50.0),
+        "ball_kalman_measurement_noise_scale": config["detection"].get("ball_kalman_measurement_noise_scale", 5.0),
+        "ball_kalman_high_speed_threshold": config["detection"].get("ball_kalman_high_speed_threshold", 30.0),
+        "ball_kalman_high_speed_area_multiplier": config["detection"].get(
+            "ball_kalman_high_speed_area_multiplier", 3.0
+        ),
     }
     if backend in {"bytetrack", "byte"}:
         print("FT tracking backend: bytetrack", flush=True)
@@ -948,6 +971,24 @@ def build_tracker(config, model_path):
         strongsort_args = dict(tracking_cfg)
         strongsort_args.pop("inference_mode", None)
         strongsort_args.pop("half_precision", None)
+        for key in (
+            "ball_temporal_consistency",
+            "ball_temporal_max_distance",
+            "ball_temporal_max_distance_cap",
+            "ball_temporal_distance_penalty",
+            "ball_temporal_reject_outliers",
+            "ball_min_acquisition_confidence",
+            "ball_low_confidence_max_distance",
+            "ball_temporal_min_confidence_after_miss",
+            "ball_temporal_miss_reset",
+            "ball_kalman_enabled",
+            "ball_kalman_max_lost_frames",
+            "ball_kalman_process_noise_scale",
+            "ball_kalman_measurement_noise_scale",
+            "ball_kalman_high_speed_threshold",
+            "ball_kalman_high_speed_area_multiplier",
+        ):
+            common.pop(key, None)
         strongsort_args.update(strongsort_cfg)
         return YoloStrongSortTracker(**common, **strongsort_args)
     raise ValueError(f"Unknown tracking backend: {backend}")
@@ -959,6 +1000,99 @@ def run_tracker_with_scene_cuts(tracker, frames, scene_cut_frames=None, reset_en
     if reset_enabled:
         print("FT scene cuts: tracking reset is currently supported only for ByteTrack", flush=True)
     return tracker.run(frames)
+
+
+def ball_tracking_diagnostics(tracks):
+    frames = tracks.get("ball", [])
+    detected = []
+    interpolated = 0
+    centers = []
+    detected_jumps = []
+    jump_records = []
+    gated_jump_records = []
+    reacquisition_jump_records = []
+    previous_detected = None
+    previous_detected_frame = None
+    for frame_num, frame_tracks in enumerate(frames):
+        track = frame_tracks.get(1) if isinstance(frame_tracks, dict) else None
+        if not track or len(track.get("bbox", [])) != 4:
+            continue
+        center = bbox_center(track["bbox"])
+        centers.append(center)
+        if track.get("interpolated"):
+            interpolated += 1
+            continue
+        detected.append(
+            {
+                "frame": int(frame_num),
+                "confidence": track.get("confidence"),
+                "score": track.get("score"),
+                "base_score": track.get("base_score"),
+                "temporal_distance": track.get("temporal_distance"),
+                "temporal_gap": track.get("temporal_gap"),
+                "area_ratio": track.get("area_ratio"),
+            }
+        )
+        if previous_detected is not None:
+            jump = float(np.linalg.norm(np.asarray(center) - np.asarray(previous_detected)))
+            detected_jumps.append(jump)
+            record = {
+                "from_frame": int(previous_detected_frame),
+                "to_frame": int(frame_num),
+                "frame_gap": int(frame_num) - int(previous_detected_frame),
+                "jump_px": jump,
+                "from_center": list(previous_detected),
+                "to_center": list(center),
+                "confidence": track.get("confidence"),
+                "score": track.get("score"),
+                "temporal_distance": track.get("temporal_distance"),
+            }
+            jump_records.append(record)
+            if track.get("temporal_distance") is None:
+                reacquisition_jump_records.append(record)
+            else:
+                gated_jump_records.append(record)
+        previous_detected = center
+        previous_detected_frame = frame_num
+
+    confidences = [float(item["confidence"]) for item in detected if item.get("confidence") is not None]
+    temporal_distances = [
+        float(item["temporal_distance"]) for item in detected if item.get("temporal_distance") is not None
+    ]
+    return {
+        "total_frames": len(frames),
+        "ball_frames": len(centers),
+        "detected_frames": len(detected),
+        "interpolated_frames": int(interpolated),
+        "mean_detection_confidence": float(np.mean(confidences)) if confidences else None,
+        "median_temporal_distance": float(np.median(temporal_distances)) if temporal_distances else None,
+        "p95_temporal_distance": float(np.percentile(temporal_distances, 95)) if temporal_distances else None,
+        "max_detected_jump_px": float(max(detected_jumps)) if detected_jumps else None,
+        "p95_detected_jump_px": float(np.percentile(detected_jumps, 95)) if detected_jumps else None,
+        "max_gated_detected_jump_px": max_jump(gated_jump_records),
+        "p95_gated_detected_jump_px": percentile_jump(gated_jump_records, 95),
+        "max_reacquisition_jump_px": max_jump(reacquisition_jump_records),
+        "largest_detected_jumps": sorted(jump_records, key=lambda item: item["jump_px"], reverse=True)[:20],
+        "largest_gated_detected_jumps": sorted(
+            gated_jump_records, key=lambda item: item["jump_px"], reverse=True
+        )[:20],
+        "largest_reacquisition_jumps": sorted(
+            reacquisition_jump_records, key=lambda item: item["jump_px"], reverse=True
+        )[:20],
+        "detected_samples": detected[:25],
+    }
+
+
+def max_jump(records):
+    if not records:
+        return None
+    return float(max(float(item["jump_px"]) for item in records))
+
+
+def percentile_jump(records, percentile):
+    if not records:
+        return None
+    return float(np.percentile([float(item["jump_px"]) for item in records], percentile))
 
 
 def _copy_row_features_to_tracks(rows, tracks):

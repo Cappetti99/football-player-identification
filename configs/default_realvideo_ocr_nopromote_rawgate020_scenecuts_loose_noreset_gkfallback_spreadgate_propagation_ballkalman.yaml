@@ -1,0 +1,9 @@
+base_config: default_realvideo_ocr_nopromote_rawgate020_scenecuts_loose_noreset_gkfallback_spreadgate_propagation.yaml
+
+detection:
+  ball_kalman_enabled: true
+  ball_kalman_max_lost_frames: 8
+  ball_kalman_process_noise_scale: 50.0
+  ball_kalman_measurement_noise_scale: 5.0
+  ball_kalman_high_speed_threshold: 30.0
+  ball_kalman_high_speed_area_multiplier: 3.0
