@@ -38,8 +38,20 @@ def validate_run_config(config):
     _validate_detection(config.get("detection", {}), errors)
     _validate_tracking(config.get("tracking", {}), errors)
     _validate_scene_cuts(config.get("scene_cuts", {}), errors)
+    _validate_team(config.get("team", {}), errors)
     _validate_jersey_ocr(config.get("jersey_ocr", {}), errors, warnings)
-    _validate_visual(config.get("visual", {}), errors)
+    _validate_number_region(config.get("number_region", {}), errors, warnings)
+    _validate_visual(config.get("visual", {}), config.get("prtreid", {}), errors)
+    _validate_prtreid(
+        config.get("prtreid", {}),
+        config.get("visual", {}),
+        config.get("prtreid_linking", {}),
+        config.get("prtreid_identity_bridge", {}),
+        errors,
+        warnings,
+    )
+    _validate_prtreid_linking(config, errors)
+    _validate_prtreid_identity_bridge(config, errors)
     _validate_identity(config.get("identity", {}), errors)
     _validate_identity_propagation(config.get("identity_propagation", {}), errors, warnings)
 
@@ -113,8 +125,8 @@ def _validate_detection(detection, errors):
 
 def _validate_tracking(tracking, errors):
     backend = str(tracking.get("backend", "bytetrack")).lower().replace("_", "")
-    if backend not in {"bytetrack", "byte", "strongsort", "strong"}:
-        errors.append(f"tracking.backend must be bytetrack or strongsort, got {tracking.get('backend')!r}")
+    if backend not in {"bytetrack", "byte", "strongsort", "strong", "prtreidstrongsort"}:
+        errors.append(f"tracking.backend must be bytetrack, strongsort or prtreid_strongsort, got {tracking.get('backend')!r}")
 
 
 def _validate_scene_cuts(scene_cuts, errors):
@@ -140,6 +152,12 @@ def _validate_scene_cuts(scene_cuts, errors):
     max_cuts = scene_cuts.get("max_cuts")
     if max_cuts is not None and int(max_cuts) <= 0:
         errors.append("scene_cuts.max_cuts must be positive when provided")
+
+
+def _validate_team(team, errors):
+    assignment_mode = str(team.get("assignment_mode", "color") or "color").lower()
+    if assignment_mode not in {"color", "prtreid_kmeans"}:
+        errors.append("team.assignment_mode must be color or prtreid_kmeans")
 
 
 def _validate_jersey_ocr(jersey_ocr, errors, warnings):
@@ -212,10 +230,155 @@ def _validate_jersey_ocr(jersey_ocr, errors, warnings):
         )
 
 
-def _validate_visual(visual, errors):
+def _validate_number_region(number_region, errors, warnings):
+    if not number_region.get("enabled", False):
+        return
+    if not number_region.get("audit_only", True):
+        errors.append("number_region.audit_only must remain true; identity application is not implemented")
+    if str(number_region.get("backend", "torso_heuristic")).lower() != "torso_heuristic":
+        errors.append("number_region.backend currently supports only torso_heuristic")
+    for key in ("frame_interval", "min_width", "min_height"):
+        if int(number_region.get(key) or 0) <= 0:
+            errors.append(f"number_region.{key} must be positive")
+    if int(number_region.get("max_regions_per_tracklet") or 0) < 0:
+        errors.append("number_region.max_regions_per_tracklet must be non-negative")
+    for key in ("torso_x_min", "torso_x_max", "torso_y_min", "torso_y_max"):
+        value = float(number_region.get(key, 0.0))
+        if value < 0.0 or value > 1.0:
+            errors.append(f"number_region.{key} must be between 0 and 1")
+    if float(number_region.get("torso_x_min", 0.0)) >= float(number_region.get("torso_x_max", 1.0)):
+        errors.append("number_region.torso_x_min must be lower than torso_x_max")
+    if float(number_region.get("torso_y_min", 0.0)) >= float(number_region.get("torso_y_max", 1.0)):
+        errors.append("number_region.torso_y_min must be lower than torso_y_max")
+    if float(number_region.get("padding", 0.0)) < 0.0:
+        errors.append("number_region.padding must be non-negative")
+    if not number_region.get("audit_only", True):
+        warnings.append("number_region is not isolated from identity application")
+
+
+def _validate_visual(visual, prtreid, errors):
     mode = str(visual.get("embedding_mode", "hsv") or "hsv").strip().lower().replace("-", "_")
-    if mode not in {"legacy", "hsv", "hsv_hist", "hsv_histogram", "hsv_lab_gradient", "lab_gradient", "rich", "enhanced"}:
+    if mode not in {
+        "legacy",
+        "hsv",
+        "hsv_hist",
+        "hsv_histogram",
+        "hsv_lab_gradient",
+        "lab_gradient",
+        "rich",
+        "enhanced",
+        "prtreid",
+        "prt_reid",
+        "bpbreid",
+        "prtreid_soccernet",
+    }:
         errors.append(f"visual.embedding_mode is unsupported: {visual.get('embedding_mode')!r}")
+    if mode in {"prtreid", "prt_reid", "bpbreid", "prtreid_soccernet"} and not prtreid.get("enabled", False):
+        errors.append("visual.embedding_mode=prtreid requires prtreid.enabled=true")
+
+
+def _validate_prtreid(prtreid, visual, prtreid_linking, prtreid_identity_bridge, errors, warnings):
+    if not prtreid.get("enabled", False):
+        return
+    if int(prtreid.get("batch_size") or 0) <= 0:
+        errors.append("prtreid.batch_size must be positive")
+    if int(prtreid.get("image_width") or 0) <= 0:
+        errors.append("prtreid.image_width must be positive")
+    if int(prtreid.get("image_height") or 0) <= 0:
+        errors.append("prtreid.image_height must be positive")
+    if float(prtreid.get("role_min_confidence", 0.0) or 0.0) < 0.0:
+        errors.append("prtreid.role_min_confidence must be non-negative")
+    if not prtreid.get("download_weights", False):
+        _require_existing_file(errors, prtreid.get("weights_path"), "prtreid.weights_path")
+        hrnet_dir = Path(prtreid.get("hrnet_pretrained_path") or "")
+        _require_existing_file(errors, hrnet_dir / "hrnetv2_w32_imagenet_pretrained.pth", "prtreid.hrnet_pretrained_path/hrnetv2_w32_imagenet_pretrained.pth")
+    if (
+        str(visual.get("embedding_mode", "")).lower().replace("-", "_") != "prtreid"
+        and not prtreid_linking.get("enabled", False)
+        and not prtreid_identity_bridge.get("enabled", False)
+    ):
+        warnings.append("prtreid.enabled=true but visual.embedding_mode is not prtreid; PRTReID will not run")
+
+
+def _validate_prtreid_identity_bridge(config, errors):
+    bridge = config.get("prtreid_identity_bridge", {})
+    if not bridge.get("enabled", False):
+        return
+    if not config.get("prtreid", {}).get("enabled", False):
+        errors.append("prtreid_identity_bridge.enabled=true requires prtreid.enabled=true")
+    if config.get("prtreid", {}).get("role_enabled", False):
+        errors.append("prtreid_identity_bridge requires prtreid.role_enabled=false")
+    if not config.get("team", {}).get("enabled", True):
+        errors.append("prtreid_identity_bridge requires team.enabled=true")
+    if str(config.get("team", {}).get("assignment_mode", "color")).lower() != "color":
+        errors.append("prtreid_identity_bridge requires team.assignment_mode=color")
+    if config.get("identity_propagation", {}).get("enabled", False):
+        errors.append("prtreid_identity_bridge requires identity_propagation.enabled=false")
+    if config.get("jersey_identity_linking", {}).get("enabled", False):
+        errors.append("prtreid_identity_bridge requires jersey_identity_linking.enabled=false")
+    if config.get("prtreid_linking", {}).get("enabled", False):
+        errors.append("prtreid_identity_bridge requires prtreid_linking.enabled=false for an isolated ablation")
+    if bridge.get("apply", False) and (
+        float(bridge.get("min_similarity", 0.0)) >= 1.0
+        and float(bridge.get("min_margin", 0.0)) >= 1.0
+    ):
+        errors.append("prtreid_identity_bridge.apply=true requires calibrated similarity or margin below 1")
+    for key in ("max_samples_per_tracklet", "min_samples", "max_segment_gap", "max_gap", "max_diagnostic_records"):
+        if int(bridge.get(key) or 0) <= 0:
+            errors.append(f"prtreid_identity_bridge.{key} must be positive")
+    if int(bridge.get("min_samples") or 0) > int(bridge.get("max_samples_per_tracklet") or 0):
+        errors.append("prtreid_identity_bridge.min_samples cannot exceed max_samples_per_tracklet")
+    for key in (
+        "min_crop_quality", "min_prototype_consistency", "min_source_confidence",
+        "min_team_confidence", "min_similarity", "min_margin",
+    ):
+        value = float(bridge.get(key) or 0.0)
+        if value < 0.0 or value > 1.0:
+            errors.append(f"prtreid_identity_bridge.{key} must be between 0 and 1, got {value}")
+
+
+def _validate_prtreid_linking(config, errors):
+    linking = config.get("prtreid_linking", {})
+    if not linking.get("enabled", False):
+        return
+    prtreid = config.get("prtreid", {})
+    if not prtreid.get("enabled", False):
+        errors.append("prtreid_linking.enabled=true requires prtreid.enabled=true")
+    if prtreid.get("role_enabled", False):
+        errors.append("prtreid_linking candidate requires prtreid.role_enabled=false")
+    if not config.get("linking", {}).get("enabled", True):
+        errors.append("prtreid_linking candidate requires linking.enabled=true so it remains additive")
+    if not config.get("team", {}).get("enabled", True):
+        errors.append("prtreid_linking candidate requires team.enabled=true")
+    if str(config.get("team", {}).get("assignment_mode", "color")).lower() != "color":
+        errors.append("prtreid_linking candidate requires team.assignment_mode=color")
+    if config.get("identity_propagation", {}).get("enabled", False):
+        errors.append("prtreid_linking candidate requires identity_propagation.enabled=false")
+    for key in ("max_samples_per_tracklet", "min_samples", "max_diagnostic_records"):
+        if int(linking.get(key) or 0) <= 0:
+            errors.append(f"prtreid_linking.{key} must be positive")
+    for key in ("min_crop_quality", "min_prototype_consistency", "min_team_confidence"):
+        value = float(linking.get(key) or 0.0)
+        if value < 0.0 or value > 1.0:
+            errors.append(f"prtreid_linking.{key} must be between 0 and 1, got {value}")
+    if int(linking.get("min_samples") or 0) > int(linking.get("max_samples_per_tracklet") or 0):
+        errors.append("prtreid_linking.min_samples cannot exceed max_samples_per_tracklet")
+    for policy_name in ("same_scene", "cross_scene"):
+        policy = linking.get(policy_name, {})
+        if not policy.get("enabled", False):
+            continue
+        if int(policy.get("max_gap") or 0) <= 0:
+            errors.append(f"prtreid_linking.{policy_name}.max_gap must be positive")
+        for key in ("min_similarity", "min_margin"):
+            value = float(policy.get(key) or 0.0)
+            if value < 0.0 or value > 1.0:
+                errors.append(f"prtreid_linking.{policy_name}.{key} must be between 0 and 1, got {value}")
+    same_scene = linking.get("same_scene", {})
+    if same_scene.get("enabled", False) and float(same_scene.get("max_distance") or 0.0) <= 0.0:
+        errors.append("prtreid_linking.same_scene.max_distance must be positive")
+    cross_scene = linking.get("cross_scene", {})
+    if cross_scene.get("enabled", False) and int(cross_scene.get("max_segment_gap") or 0) <= 0:
+        errors.append("prtreid_linking.cross_scene.max_segment_gap must be positive")
 
 
 def _validate_identity_propagation(identity_propagation, errors, warnings):
@@ -254,6 +417,18 @@ def _validate_identity_propagation(identity_propagation, errors, warnings):
         )
 
 def _validate_identity(identity, errors):
+    if str(identity.get("assignment_scope", "global")).lower() not in {"global", "scene_segment"}:
+        errors.append("identity.assignment_scope must be global or scene_segment")
+    for key in ("number_region_bonus_weight", "number_region_mismatch_penalty"):
+        if key in identity and float(identity.get(key) or 0.0) < 0.0:
+            errors.append(f"identity.{key} must be non-negative")
+    for key in ("number_region_min_votes", "number_region_min_consecutive_support"):
+        if key in identity and int(identity.get(key) or 0) < 0:
+            errors.append(f"identity.{key} must be non-negative")
+    if "number_region_min_mean_confidence" in identity:
+        value = float(identity.get("number_region_min_mean_confidence") or 0.0)
+        if value < 0.0 or value > 1.0:
+            errors.append(f"identity.number_region_min_mean_confidence must be between 0 and 1, got {value}")
     if "goalkeeper_only_alternate_min_confidence" in identity:
         value = float(identity.get("goalkeeper_only_alternate_min_confidence") or 0.0)
         if value < 0.0 or value > 1.0:

@@ -7,6 +7,14 @@ from ft.identity.roster import goalkeeper_numbers_by_team, roster_numbers_by_tea
 EMPTY = {"", "None", "unknown", None}
 
 
+def is_empty(value):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value in EMPTY
+    return False
+
+
 def build_tracklet_evidence(rows, roster=None):
     """Build non-authoritative identity evidence grouped by identity tracklet."""
     numbers_by_team = roster_numbers_by_team(roster or [])
@@ -21,15 +29,15 @@ def build_tracklet_evidence(rows, roster=None):
     evidence = []
     for tracklet_id, items in sorted(grouped.items()):
         frames = sorted({int(row.get("frame", 0) or 0) for row in items})
-        team_id, team_votes = mode_count(row.get("team_id") for row in items if row.get("team_id") not in EMPTY)
+        team_id, team_votes = mode_count(row.get("team_id") for row in items if not is_empty(row.get("team_id")))
         jersey_number, jersey_votes = mode_count(
-            row.get("jersey_number") for row in items if row.get("jersey_number") not in EMPTY and row.get("jersey_number") != -1
+            row.get("jersey_number") for row in items if not is_empty(row.get("jersey_number")) and row.get("jersey_number") != -1
         )
         raw_distribution = aggregate_distribution(items, ("raw_jersey_distribution", "jersey_candidates"))
         roster_distribution = aggregate_distribution(items, ("jersey_distribution",))
-        role, role_votes = mode_count(row.get("role_detection") for row in items if row.get("role_detection") not in EMPTY)
+        role, role_votes = mode_count(row.get("role_detection") for row in items if not is_empty(row.get("role_detection")))
         semantic_group, _semantic_votes = mode_count(
-            row.get("semantic_group_id") for row in items if row.get("semantic_group_id") not in EMPTY
+            row.get("semantic_group_id") for row in items if not is_empty(row.get("semantic_group_id"))
         )
         team_int = to_int(team_id)
         valid_numbers = numbers_by_team.get(team_int, set()) if team_int is not None else set()
@@ -53,7 +61,7 @@ def build_tracklet_evidence(rows, roster=None):
                 "team_evidence": {
                     "team_id": to_int(team_id),
                     "votes": int(team_votes),
-                    "mean_confidence": mean(row.get("team_confidence") for row in items if row.get("team_id") not in EMPTY),
+                    "mean_confidence": mean(row.get("team_confidence") for row in items if not is_empty(row.get("team_id"))),
                 },
                 "jersey_evidence": {
                     "winner": to_int(jersey_number),
@@ -70,6 +78,8 @@ def build_tracklet_evidence(rows, roster=None):
                 "role_evidence": {
                     "role": role,
                     "votes": int(role_votes),
+                    "reid_role": mode(row.get("reid_role_detection") for row in items if not is_empty(row.get("reid_role_detection"))),
+                    "reid_role_confidence": mean(row.get("reid_role_confidence") for row in items),
                     "semantic_group_id": to_int(semantic_group),
                     "goalkeeper_palette_fraction": mean_bool(row.get("goalkeeper_palette_match") for row in items),
                     "referee_palette_fraction": mean_bool(row.get("referee_palette_match") for row in items),
@@ -79,7 +89,9 @@ def build_tracklet_evidence(rows, roster=None):
                     "mean_image_position": mean_position(row.get("position_image") for row in items),
                 },
                 "visual_evidence": {
-                    "has_embedding": any(row.get("visual_embedding") not in EMPTY for row in items),
+                    "has_embedding": any(not is_empty(row.get("visual_embedding")) for row in items),
+                    "reid_model": mode(row.get("reid_model") for row in items if not is_empty(row.get("reid_model"))),
+                    "embedding_dim": embedding_dim(row.get("visual_embedding") for row in items),
                 },
                 "quality_evidence": {
                     "mean_crop_quality": mean(row.get("crop_quality") for row in items),
@@ -112,7 +124,11 @@ def identity_evidence_rows(evidence):
                 "jersey_confidence": jersey.get("mean_confidence"),
                 "jersey_roster_mass": jersey.get("roster_mass"),
                 "role": role.get("role"),
+                "reid_role": role.get("reid_role"),
+                "reid_role_confidence": role.get("reid_role_confidence"),
                 "semantic_group_id": role.get("semantic_group_id"),
+                "reid_model": item.get("visual_evidence", {}).get("reid_model"),
+                "visual_embedding_dim": item.get("visual_evidence", {}).get("embedding_dim"),
                 "mean_crop_quality": quality.get("mean_crop_quality"),
                 "risk_flags": item.get("risk_flags", []),
                 "raw_jersey_distribution": jersey.get("raw_distribution", []),
@@ -166,7 +182,7 @@ def risk_flags_for_tracklet(items, raw_distribution, roster_distribution, valid_
     role_name = str(role or "").lower()
     if winner is not None and winner in goalkeeper_numbers and role_name not in {"goalkeeper", "keeper", "gk"}:
         flags.append("goalkeeper_number_on_non_goalkeeper")
-    team_values = {to_int(row.get("team_id")) for row in items if row.get("team_id") not in EMPTY}
+    team_values = {to_int(row.get("team_id")) for row in items if not is_empty(row.get("team_id"))}
     if len(team_values) > 1:
         flags.append("mixed_team_votes")
     if mean(row.get("crop_quality") for row in items) < 0.10:
@@ -197,7 +213,7 @@ def mode(values):
 def mode_count(values):
     counts = defaultdict(int)
     for value in values:
-        if value in EMPTY:
+        if is_empty(value):
             continue
         counts[value] += 1
     if not counts:
@@ -209,7 +225,7 @@ def mode_count(values):
 def mean(values):
     cleaned = []
     for value in values:
-        if value in EMPTY:
+        if is_empty(value):
             continue
         try:
             cleaned.append(float(value))
@@ -219,7 +235,7 @@ def mean(values):
 
 
 def mean_bool(values):
-    cleaned = [bool(value) for value in values if value not in EMPTY]
+    cleaned = [bool(value) for value in values if not is_empty(value)]
     return float(sum(1 for value in cleaned if value) / len(cleaned)) if cleaned else 0.0
 
 
@@ -239,7 +255,7 @@ def mean_position(values):
 
 
 def parse_position(value):
-    if value in EMPTY:
+    if is_empty(value):
         return None
     if isinstance(value, str):
         try:
@@ -254,8 +270,17 @@ def parse_position(value):
         return None
 
 
+def embedding_dim(values):
+    for value in values:
+        if is_empty(value):
+            continue
+        if isinstance(value, (list, tuple)):
+            return len(value)
+    return None
+
+
 def to_int(value):
-    if value in EMPTY:
+    if is_empty(value):
         return None
     try:
         return int(value)

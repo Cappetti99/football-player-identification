@@ -1,4 +1,5 @@
 from collections import Counter
+import gc
 from pathlib import Path
 
 import numpy as np
@@ -9,18 +10,25 @@ from ft.export.artifacts import ArtifactExporter, write_json, write_table
 from ft.features.groups import SemanticGroupAssigner
 from ft.features.goalkeeper import GoalkeeperAppearanceAssigner, goalkeeper_color_ranges_by_team_from_roster
 from ft.features.jersey_ocr import JerseyOCR
+from ft.features.number_region import NumberRegionAuditor
 from ft.features.referee import RefereeAppearanceAssigner, referee_color_ranges_from_roster
 from ft.features.roster_aware_ocr import RosterAwareOCRFilter
 from ft.features.team import TeamAssigner, team_color_ranges_by_team_from_roster
 from ft.features.visual import VisualFeatureExtractor
+from ft.features.prtreid import PRTReIDFeatureExtractor
+from ft.features.visual import prtreid_extractor_config
+from ft.features.prtreid_tracklets import build_prtreid_tracklet_features
 from ft.identity.candidates import build_identity_candidates, apply_identity_candidates, identity_candidate_rows
 from ft.identity.constraints import enforce_identity_constraints
 from ft.identity.evidence import build_tracklet_evidence, identity_evidence_rows
 from ft.identity.hungarian import HungarianPlayerIdentifier, apply_assignments
+from ft.identity.gate_audit import build_identity_gate_audit
+from ft.identity.prtreid_bridge import PRTReIDIdentityBridge
 from ft.identity.propagation import IdentityPropagationEngine, propagation_rows
 from ft.identity.roster import load_roster, validate_unique_team_jersey
 from ft.linking.jersey_identity_linker import JerseyIdentityLinker
 from ft.linking.tracklet_linker import TrackletLinker
+from ft.linking.prtreid_tracklet_linker import PRTReIDTrackletLinker
 from ft.tracking.yolo_bytetrack import YoloByteTracker
 from ft.tracking.yolo_strongsort import YoloStrongSortTracker
 from ft.utils.run_diagnostics import RunDiagnostics
@@ -134,13 +142,56 @@ def _run_pipeline_impl(config):
 
     if config["linking"].get("enabled", True):
         with run_diagnostics.stage("linking"):
-            linking_cfg = {k: v for k, v in config["linking"].items() if k != "enabled"}
+            linking_cfg = {
+                k: v
+                for k, v in config["linking"].items()
+                if k not in {"enabled", "embedding_mode"}
+            }
             linker = TrackletLinker(**linking_cfg)
             linker.apply(tracks, frames=frames)
             linking_diagnostics = linker.diagnostics
     else:
         TrackletLinker.ensure_display_ids(tracks)
         linking_diagnostics = {"enabled": False, "status": "disabled"}
+
+    visual_extractor = None
+    prtreid_tracklet_features = []
+    prtreid_linking_diagnostics = {"enabled": False, "status": "disabled"}
+    prtreid_bridge_cfg = config.get("prtreid_identity_bridge", {})
+    prtreid_linking_cfg = config.get("prtreid_linking", {})
+    if prtreid_linking_cfg.get("enabled", False) or prtreid_bridge_cfg.get("enabled", False):
+        feature_cfg = prtreid_linking_cfg if prtreid_linking_cfg.get("enabled", False) else prtreid_bridge_cfg
+        with run_diagnostics.stage("prtreid_tracklet_features"):
+            prtreid_extractor = PRTReIDFeatureExtractor(
+                **prtreid_extractor_config(config.get("prtreid", {}))
+            )
+            prtreid_tracklet_features = build_prtreid_tracklet_features(
+                frames,
+                tracks,
+                prtreid_extractor,
+                max_samples_per_tracklet=feature_cfg.get("max_samples_per_tracklet", 8),
+                min_crop_quality=feature_cfg.get("min_crop_quality", 0.15),
+                min_samples=feature_cfg.get("min_samples", 3),
+            )
+    if prtreid_linking_cfg.get("enabled", False):
+        with run_diagnostics.stage("prtreid_linking"):
+            linker_cfg = {
+                key: value
+                for key, value in prtreid_linking_cfg.items()
+                if key not in {"enabled", "max_samples_per_tracklet", "min_crop_quality"}
+            }
+            prtreid_linker = PRTReIDTrackletLinker(**linker_cfg)
+            prtreid_linker.apply(tracks)
+            prtreid_linking_diagnostics = prtreid_linker.diagnostics
+            prtreid_linking_diagnostics["feature_extractor"] = prtreid_extractor.diagnostics()
+        print(
+            "FT PRTReID linking:"
+            f" features={len(prtreid_tracklet_features)}"
+            f" accepted={len(prtreid_linking_diagnostics.get('accepted_links', []))}"
+            f" displays={prtreid_linking_diagnostics.get('num_input_display_tracklets')}"
+            f"->{prtreid_linking_diagnostics.get('num_output_display_tracklets')}",
+            flush=True,
+        )
 
     # Second colour pass: linking can merge raw IDs into a display_track_id, so
     # team/referee votes are recomputed on the final tracklet grouping.
@@ -190,12 +241,67 @@ def _run_pipeline_impl(config):
 
     with run_diagnostics.stage("visual_features"):
         visual_cfg = config.get("visual", {})
-        visual_extractor = VisualFeatureExtractor(
-            cache_enabled=visual_cfg.get("cache_enabled", True),
-            embedding_mode=visual_cfg.get("embedding_mode", "hsv"),
-        )
+        if visual_extractor is None:
+            visual_extractor = VisualFeatureExtractor(
+                cache_enabled=visual_cfg.get("cache_enabled", True),
+                embedding_mode=visual_cfg.get("embedding_mode", "hsv"),
+                prtreid_config=config.get("prtreid", {}),
+            )
         visual_extractor.add_row_features(player_rows)
+        if config.get("prtreid", {}).get("role_enabled", False):
+            apply_prtreid_roles(
+                player_rows,
+                min_confidence=config.get("prtreid", {}).get("role_min_confidence", 0.60),
+                protect_existing=config.get("prtreid", {}).get("role_protect_existing", True),
+            )
+        if str(config.get("team", {}).get("assignment_mode", "color")).lower() == "prtreid_kmeans":
+            apply_prtreid_team_clusters(player_rows, tracks)
     _copy_row_features_to_tracks(player_rows, tracks)
+
+    number_region_detections = []
+    number_region_evidence = []
+    number_region_diagnostics = {"enabled": False, "audit_only": True, "status": "disabled"}
+    if config.get("number_region", {}).get("enabled", False):
+        with run_diagnostics.stage("number_region_audit"):
+            region_cfg = config["number_region"]
+            region_ocr = build_jersey_ocr(
+                config,
+                artifacts_dir,
+                video_id,
+                debug_subdir=f"{video_id}_number_regions",
+                segment_frames=0,
+                overrides={
+                    "number_roi_enabled": False,
+                    "mmocr_direct_recognition": True,
+                    "max_crops_per_tracklet": max(1, len(player_rows)),
+                    "temporal_passes": 1,
+                    "min_crop_quality": 0.0,
+                    "min_votes": 1,
+                    "roster_aware": False,
+                },
+            )
+            auditor = NumberRegionAuditor(
+                output_dir=artifacts_dir / "number_region_crops" / video_id,
+                **{
+                    key: value
+                    for key, value in region_cfg.items()
+                    if key not in {"enabled", "audit_only"}
+                },
+            )
+            number_region_detections, number_region_evidence, number_region_diagnostics = auditor.run(
+                frames,
+                player_rows,
+                region_ocr,
+            )
+            del region_ocr
+            gc.collect()
+        print(
+            "FT number-region audit:"
+            f" regions={len(number_region_detections)}"
+            f" recognized={number_region_diagnostics.get('recognized_regions', 0)}"
+            f" identity_mutations={number_region_diagnostics.get('identity_mutations', 0)}",
+            flush=True,
+        )
 
     segment_jersey_candidates = []
     segment_jersey_diagnostics = {"enabled": False, "status": "disabled"}
@@ -322,10 +428,17 @@ def _run_pipeline_impl(config):
             goalkeeper_singleton_gate=config["identity"].get("goalkeeper_singleton_gate", True),
             goalkeeper_singleton_min_team_confidence=config["identity"].get("goalkeeper_singleton_min_team_confidence", 0.75),
             goalkeeper_singleton_min_tracklet_frames=config["identity"].get("goalkeeper_singleton_min_tracklet_frames", 30),
+            number_region_cost_enabled=config["identity"].get("number_region_cost_enabled", False),
+            number_region_bonus_weight=config["identity"].get("number_region_bonus_weight", 0.20),
+            number_region_mismatch_penalty=config["identity"].get("number_region_mismatch_penalty", 0.20),
+            number_region_min_votes=config["identity"].get("number_region_min_votes", 2),
+            number_region_min_mean_confidence=config["identity"].get("number_region_min_mean_confidence", 0.20),
+            number_region_min_consecutive_support=config["identity"].get("number_region_min_consecutive_support", 1),
+            assignment_scope=config["identity"].get("assignment_scope", "global"),
         )
-        summaries = identifier.summarize(player_rows)
+        summaries = identifier.summarize(player_rows, number_region_evidence=number_region_evidence)
         assignments, candidate_scores = identifier.assign(summaries)
-        apply_assignments(tracks, assignments)
+        apply_assignments(tracks, assignments, assignment_scope=config["identity"].get("assignment_scope", "global"))
 
     identity_propagation_diagnostics = {"enabled": False, "status": "disabled"}
     propagation_cfg = config.get("identity_propagation", {})
@@ -374,25 +487,46 @@ def _run_pipeline_impl(config):
     # Hard constraints run after Hungarian because they can invalidate otherwise
     # plausible assignments when per-frame evidence exposes a contradiction.
     with run_diagnostics.stage("constraints"):
-        constraints_diagnostics = enforce_identity_constraints(
-            tracks,
-            roster,
-            frame_team_consistency=config["identity"].get("frame_team_consistency", True),
-            frame_team_min_confidence=config["identity"].get("frame_team_min_confidence", 0.70),
-            frame_team_split_enabled=config["identity"].get("frame_team_split_enabled", True),
-            frame_team_split_min_frames=config["identity"].get("frame_team_split_min_frames", 8),
-            frame_team_split_max_gap=config["identity"].get("frame_team_split_max_gap", 2),
-            global_team_jersey_owner=config["identity"].get("global_team_jersey_owner", True),
-            goalkeeper_only_alternate_enabled=config["identity"].get("goalkeeper_only_alternate_enabled", False),
-            goalkeeper_only_alternate_min_confidence=config["identity"].get("goalkeeper_only_alternate_min_confidence", 0.10),
-            goalkeeper_only_alternate_min_votes=config["identity"].get("goalkeeper_only_alternate_min_votes", 1),
-            goalkeeper_only_alternate_max_rank=config["identity"].get("goalkeeper_only_alternate_max_rank", 5),
-            goalkeeper_only_alternate_block_known_owner=config["identity"].get("goalkeeper_only_alternate_block_known_owner", True),
-            goalkeeper_only_alternate_stop_on_known_owner_conflict=config["identity"].get(
-                "goalkeeper_only_alternate_stop_on_known_owner_conflict", True
-            ),
+        constraints_diagnostics = apply_identity_constraints(config, tracks, roster)
+    constraint_actions = constraint_action_rows(constraints_diagnostics, phase="initial")
+
+    identity_gate_audit = build_identity_gate_audit(
+        summaries,
+        candidate_scores,
+        assignments,
+        roster,
+        identity_config=config.get("identity", {}),
+    )
+    if not identity_gate_audit["summary"]["strong_visual_gate_available"]:
+        print(
+            "FT identity warning: roster visual profiles=0; strong_team_visual_trajectory cannot pass",
+            flush=True,
         )
-    constraint_actions = constraint_action_rows(constraints_diagnostics)
+
+    prtreid_bridge_diagnostics = {"enabled": False, "status": "disabled", "applied_rows": 0}
+    if prtreid_bridge_cfg.get("enabled", False):
+        with run_diagnostics.stage("prtreid_identity_bridge"):
+            bridge_args = {
+                key: value
+                for key, value in prtreid_bridge_cfg.items()
+                if key not in {"enabled", "max_samples_per_tracklet", "min_crop_quality"}
+            }
+            prtreid_bridge_diagnostics = PRTReIDIdentityBridge(**bridge_args).apply(
+                tracks,
+                features=prtreid_tracklet_features,
+            )
+        if prtreid_bridge_diagnostics.get("applied_rows", 0):
+            with run_diagnostics.stage("constraints_post_prtreid_bridge"):
+                final_constraints = apply_identity_constraints(config, tracks, roster)
+            constraint_actions.extend(constraint_action_rows(final_constraints, phase="post_prtreid_bridge"))
+            constraints_diagnostics = final_constraints
+        print(
+            "FT PRTReID identity bridge:"
+            f" anchors={prtreid_bridge_diagnostics.get('anchors', 0)}"
+            f" proposed={len(prtreid_bridge_diagnostics.get('proposed_links', []))}"
+            f" applied_rows={prtreid_bridge_diagnostics.get('applied_rows', 0)}",
+            flush=True,
+        )
 
     candidate_cfg = config["identity"].get("candidate_fallback", {})
     segment_candidate_diagnostics = {"enabled": False, "status": "disabled"}
@@ -433,6 +567,8 @@ def _run_pipeline_impl(config):
             "calibration": calibrator.diagnostics(),
             "scene_cuts": scene_cut_diagnostics,
             "linking": linking_diagnostics,
+            "prtreid_linking": prtreid_linking_diagnostics,
+            "prtreid_identity_bridge": prtreid_bridge_diagnostics,
             "team_assignments": {str(k): v for k, v in team_assignments.items()},
             "referee_colour": referee_diagnostics,
             "goalkeeper_colour": goalkeeper_diagnostics,
@@ -452,6 +588,31 @@ def _run_pipeline_impl(config):
         artifacts_dir / "metadata" / f"{video_id}_identity_assignments.json",
     )
     write_json(linking_diagnostics, artifacts_dir / "metadata" / f"{video_id}_linking.json")
+    write_json(
+        prtreid_tracklet_features,
+        artifacts_dir / "metadata" / f"{video_id}_prtreid_tracklet_features.json",
+    )
+    write_json(
+        prtreid_linking_diagnostics,
+        artifacts_dir / "metadata" / f"{video_id}_prtreid_linking.json",
+    )
+    write_table(
+        prtreid_linking_diagnostics.get("accepted_links", [])
+        + prtreid_linking_diagnostics.get("rejected_links", []),
+        artifacts_dir / "metadata" / f"{video_id}_prtreid_linking.csv",
+        fieldnames=["status", "reason"],
+    )
+    write_json(
+        prtreid_bridge_diagnostics,
+        artifacts_dir / "metadata" / f"{video_id}_prtreid_identity_bridge.json",
+    )
+    write_table(
+        prtreid_bridge_diagnostics.get("proposed_links", [])
+        + prtreid_bridge_diagnostics.get("applied_links", [])
+        + prtreid_bridge_diagnostics.get("rejected_links", []),
+        artifacts_dir / "metadata" / f"{video_id}_prtreid_identity_bridge.csv",
+        fieldnames=["status", "reason"],
+    )
     write_json(scene_cut_diagnostics, artifacts_dir / "metadata" / f"{video_id}_scene_cuts.json")
     write_table(scene_cut_rows(scene_cut_diagnostics), artifacts_dir / "metadata" / f"{video_id}_scene_cuts.csv")
     write_json(ball_tracking_diagnostics(tracks), artifacts_dir / "metadata" / f"{video_id}_ball_tracking.json")
@@ -462,7 +623,11 @@ def _run_pipeline_impl(config):
         artifacts_dir / "metadata" / f"{video_id}_identity_propagation.csv",
     )
     write_json(constraints_diagnostics, artifacts_dir / "metadata" / f"{video_id}_constraints.json")
-    write_table(constraint_actions, artifacts_dir / "metadata" / f"{video_id}_identity_constraint_actions.csv")
+    write_table(
+        constraint_actions,
+        artifacts_dir / "metadata" / f"{video_id}_identity_constraint_actions.csv",
+        fieldnames=["action_type"],
+    )
     identity_decisions = identity_decision_rows(final_rows)
     write_json(identity_decisions, artifacts_dir / "metadata" / f"{video_id}_identity_decisions.json")
     write_table(identity_decisions, artifacts_dir / "metadata" / f"{video_id}_identity_decisions.csv")
@@ -471,6 +636,12 @@ def _run_pipeline_impl(config):
     write_json(jersey_linking_diagnostics, artifacts_dir / "metadata" / f"{video_id}_jersey_identity_linking.json")
     write_table(summaries, artifacts_dir / "metadata" / f"{video_id}_tracklet_summaries.csv")
     write_table(candidate_scores, artifacts_dir / "metadata" / f"{video_id}_candidate_scores.csv")
+    write_json(identity_gate_audit, artifacts_dir / "metadata" / f"{video_id}_identity_gate_audit.json")
+    write_table(
+        identity_gate_audit.get("tracklets", []),
+        artifacts_dir / "metadata" / f"{video_id}_identity_gate_audit.csv",
+        fieldnames=["tracklet_id"],
+    )
     write_table(
         identity_candidate_rows(identity_candidates),
         artifacts_dir / "metadata" / f"{video_id}_identity_candidates.csv",
@@ -491,6 +662,24 @@ def _run_pipeline_impl(config):
         artifacts_dir / "metadata" / f"{video_id}_segment_jersey_candidates.json",
     )
     write_json(jersey_diagnostics, artifacts_dir / "metadata" / f"{video_id}_jersey_ocr.json")
+    write_json(
+        {"diagnostics": number_region_diagnostics, "detections": number_region_detections},
+        artifacts_dir / "metadata" / f"{video_id}_number_region_detections.json",
+    )
+    write_table(
+        number_region_detections,
+        artifacts_dir / "metadata" / f"{video_id}_number_region_detections.csv",
+        fieldnames=["frame", "raw_track_id", "display_track_id"],
+    )
+    write_json(
+        {"diagnostics": number_region_diagnostics, "tracklets": number_region_evidence},
+        artifacts_dir / "metadata" / f"{video_id}_number_region_tracklet_evidence.json",
+    )
+    write_table(
+        number_region_evidence,
+        artifacts_dir / "metadata" / f"{video_id}_number_region_tracklet_evidence.csv",
+        fieldnames=["display_track_id"],
+    )
     write_json(exporter.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_export.json")
     write_json(visual_extractor.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_visual_features.json")
 
@@ -512,10 +701,13 @@ def _run_pipeline_impl(config):
             "export": exporter.diagnostics(),
             "scene_cuts": scene_cut_diagnostics,
             "visual_features": visual_extractor.diagnostics(),
+            "prtreid_linking": prtreid_linking_diagnostics,
+            "prtreid_identity_bridge": prtreid_bridge_diagnostics,
             "identity_propagation": identity_propagation_diagnostics,
             "identity_candidates": len(identity_candidates),
             "segment_jersey_candidates": len(segment_jersey_candidates),
             "segment_candidate_fallback": segment_candidate_diagnostics,
+            "number_region": number_region_diagnostics,
             "identity_evidence": len(identity_evidence),
             "constraint_actions": len(constraint_actions),
         }
@@ -529,10 +721,13 @@ def _run_pipeline_impl(config):
         "assignments": assignments,
         "candidate_scores": candidate_scores,
         "scene_cuts": scene_cut_diagnostics,
+        "prtreid_linking": prtreid_linking_diagnostics,
+        "prtreid_identity_bridge": prtreid_bridge_diagnostics,
         "identity_propagation": identity_propagation_diagnostics,
         "identity_candidates": identity_candidates,
         "segment_jersey_candidates": segment_jersey_candidates,
         "segment_candidate_fallback": segment_candidate_diagnostics,
+        "number_region": number_region_diagnostics,
         "identity_evidence": identity_evidence,
         "constraint_actions": constraint_actions,
     }
@@ -543,7 +738,11 @@ def run_from_config(path):
 
 
 def team_config(config, roster):
-    team_cfg = {k: v for k, v in config.get("team", {}).items() if k != "enabled"}
+    team_cfg = {
+        k: v
+        for k, v in config.get("team", {}).items()
+        if k not in {"enabled", "assignment_mode"}
+    }
     roster_color_ranges = team_color_ranges_by_team_from_roster(roster)
     if roster_color_ranges:
         configured_ranges = team_cfg.get("color_ranges_by_team") or {}
@@ -577,8 +776,8 @@ def goalkeeper_config(config, roster):
     return goalkeeper_cfg
 
 
-def build_jersey_ocr(config, artifacts_dir, video_id, debug_subdir=None, segment_frames=None):
-    jersey_cfg = config["jersey_ocr"]
+def build_jersey_ocr(config, artifacts_dir, video_id, debug_subdir=None, segment_frames=None, overrides=None):
+    jersey_cfg = {**config["jersey_ocr"], **(overrides or {})}
     debug_dir = (
         Path(artifacts_dir) / "jersey_ocr_debug" / (debug_subdir or video_id)
         if jersey_cfg.get("debug_crops", False)
@@ -1007,6 +1206,11 @@ def build_tracker(config, model_path):
             common.pop(key, None)
         strongsort_args.update(strongsort_cfg)
         return YoloStrongSortTracker(**common, **strongsort_args)
+    if backend == "prtreidstrongsort":
+        raise NotImplementedError(
+            "tracking.backend=prtreid_strongsort is reserved for the FT-native PRTReID StrongSORT backend. "
+            "Use tracking.backend=bytetrack with visual.embedding_mode=prtreid for the first PRTReID validation run."
+        )
     raise ValueError(f"Unknown tracking backend: {backend}")
 
 
@@ -1169,7 +1373,142 @@ def most_common(counter):
     return counter.most_common(1)[0][0]
 
 
-def constraint_action_rows(diagnostics):
+def apply_prtreid_roles(rows, min_confidence=0.60, protect_existing=True):
+    protected_roles = {"goalkeeper", "referee", "referee_candidate"}
+    min_confidence = float(min_confidence)
+    for row in rows or []:
+        role = row.get("reid_role_detection")
+        confidence = float(row.get("reid_role_confidence") or 0.0)
+        if not role or confidence < min_confidence:
+            continue
+        current = str(row.get("role_detection") or "").lower()
+        if protect_existing and current in protected_roles and current != str(role).lower():
+            row["reid_role_override_blocked"] = True
+            continue
+        row["previous_role_detection"] = row.get("role_detection")
+        row["role_detection"] = role
+        row["role_confidence"] = confidence
+        row["role_source"] = "prtreid"
+
+
+def apply_prtreid_team_clusters(rows, tracks):
+    assignments = prtreid_team_cluster_assignments(rows)
+    if not assignments:
+        return {}
+    for row in rows or []:
+        display_id = to_int(row.get("display_track_id"))
+        assignment = assignments.get(display_id)
+        if not assignment:
+            continue
+        row["team_id"] = assignment["team"]
+        row["team_confidence"] = assignment["confidence"]
+        row["team_evidence"] = assignment
+    for frame_tracks in tracks.get("players", []):
+        for raw_id, track in frame_tracks.items():
+            display_id = int(track.get("display_track_id", raw_id))
+            assignment = assignments.get(display_id)
+            if not assignment:
+                continue
+            track["team"] = assignment["team"]
+            track["team_confidence"] = assignment["confidence"]
+            track["team_evidence"] = assignment
+    return assignments
+
+
+def prtreid_team_cluster_assignments(rows):
+    grouped = {}
+    for row in rows or []:
+        if str(row.get("role_detection") or "").lower() not in {"", "player"}:
+            continue
+        embedding = row.get("visual_embedding")
+        display_id = to_int(row.get("display_track_id"))
+        if display_id is None or embedding is None:
+            continue
+        grouped.setdefault(display_id, {"embeddings": [], "pitch_x": []})
+        grouped[display_id]["embeddings"].append(np.asarray(embedding, dtype=np.float32))
+        position = row.get("position_pitch")
+        if isinstance(position, (list, tuple)) and position:
+            try:
+                grouped[display_id]["pitch_x"].append(float(position[0]))
+            except (TypeError, ValueError):
+                pass
+    items = []
+    for display_id, values in grouped.items():
+        if not values["embeddings"]:
+            continue
+        vector = np.mean(np.vstack(values["embeddings"]), axis=0)
+        norm = np.linalg.norm(vector)
+        if norm <= 0:
+            continue
+        items.append(
+            {
+                "display_id": int(display_id),
+                "embedding": vector / norm,
+                "pitch_x": float(np.mean(values["pitch_x"])) if values["pitch_x"] else None,
+                "samples": len(values["embeddings"]),
+            }
+        )
+    if len(items) < 2:
+        return {}
+    from sklearn.cluster import KMeans
+
+    matrix = np.vstack([item["embedding"] for item in items])
+    labels = KMeans(n_clusters=2, random_state=0, n_init=10).fit_predict(matrix)
+    cluster_pitch = {}
+    for item, label in zip(items, labels):
+        if item["pitch_x"] is not None:
+            cluster_pitch.setdefault(int(label), []).append(item["pitch_x"])
+    if len(cluster_pitch) == 2:
+        ordered = sorted(cluster_pitch.items(), key=lambda pair: float(np.mean(pair[1])))
+        cluster_to_team = {int(ordered[0][0]): 1, int(ordered[1][0]): 2}
+    else:
+        cluster_to_team = {0: 1, 1: 2}
+    assignments = {}
+    counts = Counter(int(label) for label in labels)
+    for item, label in zip(items, labels):
+        label = int(label)
+        assignments[item["display_id"]] = {
+            "team": int(cluster_to_team[label]),
+            "confidence": float(counts[label] / max(1, len(labels))),
+            "source": "prtreid_kmeans",
+            "cluster": label,
+            "samples": int(item["samples"]),
+        }
+    return assignments
+
+
+def to_int(value):
+    if value in (None, "", "None", "unknown"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_identity_constraints(config, tracks, roster):
+    identity = config["identity"]
+    return enforce_identity_constraints(
+        tracks,
+        roster,
+        frame_team_consistency=identity.get("frame_team_consistency", True),
+        frame_team_min_confidence=identity.get("frame_team_min_confidence", 0.70),
+        frame_team_split_enabled=identity.get("frame_team_split_enabled", True),
+        frame_team_split_min_frames=identity.get("frame_team_split_min_frames", 8),
+        frame_team_split_max_gap=identity.get("frame_team_split_max_gap", 2),
+        global_team_jersey_owner=identity.get("global_team_jersey_owner", True),
+        goalkeeper_only_alternate_enabled=identity.get("goalkeeper_only_alternate_enabled", False),
+        goalkeeper_only_alternate_min_confidence=identity.get("goalkeeper_only_alternate_min_confidence", 0.10),
+        goalkeeper_only_alternate_min_votes=identity.get("goalkeeper_only_alternate_min_votes", 1),
+        goalkeeper_only_alternate_max_rank=identity.get("goalkeeper_only_alternate_max_rank", 5),
+        goalkeeper_only_alternate_block_known_owner=identity.get("goalkeeper_only_alternate_block_known_owner", True),
+        goalkeeper_only_alternate_stop_on_known_owner_conflict=identity.get(
+            "goalkeeper_only_alternate_stop_on_known_owner_conflict", True
+        ),
+    )
+
+
+def constraint_action_rows(diagnostics, phase=None):
     rows = []
     for action_type, items in (diagnostics or {}).items():
         if not isinstance(items, list):
@@ -1178,6 +1517,8 @@ def constraint_action_rows(diagnostics):
             if not isinstance(item, dict):
                 continue
             row = {"action_type": action_type}
+            if phase:
+                row["constraint_phase"] = phase
             row.update(item)
             rows.append(row)
     return rows
@@ -1193,7 +1534,21 @@ def _copy_row_features_to_tracks(rows, tracks):
         for raw_id, track in frame_tracks.items():
             row = by_key.get((frame_num, int(raw_id)))
             if row:
-                track["visual_embedding"] = row.get("visual_embedding")
+                for key in (
+                    "visual_embedding",
+                    "reid_model",
+                    "reid_visibility_scores",
+                    "reid_body_masks",
+                    "reid_role_detection",
+                    "reid_role_confidence",
+                    "reid_role_override_blocked",
+                    "previous_role_detection",
+                    "role_confidence",
+                    "role_source",
+                    "role_detection",
+                ):
+                    if key in row:
+                        track[key] = row.get(key)
 
 
 def _apply_jersey(jersey_assignments, rows, tracks):

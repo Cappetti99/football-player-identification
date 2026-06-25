@@ -17,6 +17,8 @@ def main():
     parser.add_argument("--candidate-run", required=True)
     parser.add_argument("--artifacts-root", default="artifacts/costume-video")
     parser.add_argument("--output-json")
+    parser.add_argument("--assigned-floor", type=int, default=5986)
+    parser.add_argument("--unknown-ceiling", type=int, default=9133)
     args = parser.parse_args()
 
     root = Path(args.artifacts_root)
@@ -34,6 +36,13 @@ def main():
         },
         "recommendations": recommendations(candidate),
     }
+    report["promotion_checks"] = promotion_checks(
+        baseline,
+        candidate,
+        args.video_id,
+        assigned_floor=args.assigned_floor,
+        unknown_ceiling=args.unknown_ceiling,
+    )
     print_report(report)
     if args.output_json:
         path = Path(args.output_json)
@@ -47,13 +56,21 @@ def load_run(root, run, video_id):
     players = [row for row in tracklets if row.get("track_group", "players") == "players"]
     constraints = read_json(metadata / f"{video_id}_constraints.json")
     propagation = read_json(metadata / f"{video_id}_identity_propagation.json")
-    evidence_rows = read_csv(metadata / f"{video_id}_identity_evidence.csv")
-    decision_rows = read_csv(metadata / f"{video_id}_identity_decisions.csv")
-    constraint_actions = read_csv(metadata / f"{video_id}_identity_constraint_actions.csv")
+    prtreid_linking_path = metadata / f"{video_id}_prtreid_linking.json"
+    prtreid_linking = read_json(prtreid_linking_path)
+    prtreid_bridge_path = metadata / f"{video_id}_prtreid_identity_bridge.json"
+    prtreid_bridge = read_json(prtreid_bridge_path)
+    scene_cuts = read_json(metadata / f"{video_id}_scene_cuts.json")
+    evidence_path = metadata / f"{video_id}_identity_evidence.csv"
+    decisions_path = metadata / f"{video_id}_identity_decisions.csv"
+    constraint_actions_path = metadata / f"{video_id}_identity_constraint_actions.csv"
+    evidence_rows = read_csv(evidence_path)
+    decision_rows = read_csv(decisions_path)
+    constraint_actions = read_csv(constraint_actions_path)
     assigned = [row for row in players if row.get("player_id") not in ("", "None", "unknown", None)]
     unknown = [row for row in players if row.get("player_id") in ("", "None", "unknown", None)]
     jersey = [row for row in players if row.get("jersey_number") not in ("", "None", None)]
-    propagated = [row for row in players if row.get("identity_status") == "propagated"]
+    propagated = [row for row in players if row_is_propagated(row)]
     return {
         "overview": {
             "player_rows": len(players),
@@ -71,12 +88,28 @@ def load_run(root, run, video_id):
         "risk_flags": risk_flag_counts(players, evidence_rows, decision_rows),
         "constraint_actions": Counter(row.get("action_type") for row in constraint_actions),
         "weak_propagations": weak_propagations(propagation),
+        "prtreid_linking": {
+            "enabled": bool(prtreid_linking.get("enabled", False)),
+            "accepted_links": len(prtreid_linking.get("accepted_links", [])),
+            "same_scene_links": sum(row.get("link_type") == "same_scene" for row in prtreid_linking.get("accepted_links", [])),
+            "cross_scene_links": sum(row.get("link_type") == "cross_scene" for row in prtreid_linking.get("accepted_links", [])),
+        },
+        "prtreid_identity_bridge": {
+            "enabled": bool(prtreid_bridge.get("enabled", False)),
+            "apply": bool(prtreid_bridge.get("apply", False)),
+            "proposed_links": len(prtreid_bridge.get("proposed_links", [])),
+            "applied_links": len(prtreid_bridge.get("applied_links", [])),
+            "applied_rows": int(prtreid_bridge.get("applied_rows", 0) or 0),
+        },
+        "scene_cut_frames": scene_cuts.get("cut_frames", []),
         "unknown_high_quality": unknown_high_quality_display_ids(unknown),
         "low_confidence_decisions": low_confidence_decisions(decision_rows),
         "artifact_presence": {
-            "identity_evidence": bool(evidence_rows),
-            "identity_decisions": bool(decision_rows),
-            "constraint_actions": bool(constraint_actions),
+            "identity_evidence": evidence_path.exists(),
+            "identity_decisions": decisions_path.exists(),
+            "constraint_actions": constraint_actions_path.exists(),
+            "prtreid_linking": prtreid_linking_path.exists(),
+            "prtreid_identity_bridge": prtreid_bridge_path.exists(),
         },
     }
 
@@ -87,6 +120,18 @@ def risk_flag_counts(players, evidence_rows, decision_rows):
         for flag in parse_list(row.get("identity_risk_flags") or row.get("risk_flags")):
             counts[str(flag)] += 1
     return dict(counts.most_common())
+
+
+def row_is_propagated(row):
+    if row.get("identity_status") == "propagated":
+        return True
+    evidence = row.get("identity_evidence")
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence = None
+    return isinstance(evidence, dict) and evidence.get("status") == "propagated"
 
 
 def weak_propagations(propagation):
@@ -157,6 +202,29 @@ def recommendations(candidate):
     return recs
 
 
+def promotion_checks(baseline, candidate, video_id, assigned_floor=5986, unknown_ceiling=9133):
+    baseline_overview = baseline["overview"]
+    candidate_overview = candidate["overview"]
+    checks = {
+        "assigned_not_lower": candidate_overview["assigned_rows"] >= baseline_overview["assigned_rows"],
+        "unknown_not_higher": candidate_overview["unknown_rows"] <= baseline_overview["unknown_rows"],
+        "duplicates_zero": not any(candidate["duplicates"].values()),
+        "propagation_disabled": candidate_overview["propagated_rows"] == 0,
+    }
+    bridge = candidate.get("prtreid_identity_bridge", {})
+    if bridge.get("apply", False):
+        assigned_delta = candidate_overview["assigned_rows"] - baseline_overview["assigned_rows"]
+        unknown_delta = baseline_overview["unknown_rows"] - candidate_overview["unknown_rows"]
+        checks["bridge_rows_match_assigned_delta"] = assigned_delta == int(bridge.get("applied_rows", 0))
+        checks["bridge_rows_match_unknown_delta"] = unknown_delta == int(bridge.get("applied_rows", 0))
+    if video_id == "Int-Ata":
+        checks["expected_scene_cuts"] = candidate.get("scene_cut_frames") == [294, 517, 715, 925, 1052]
+        checks[f"assigned_at_least_{int(assigned_floor)}"] = candidate_overview["assigned_rows"] >= int(assigned_floor)
+        checks[f"unknown_at_most_{int(unknown_ceiling)}"] = candidate_overview["unknown_rows"] <= int(unknown_ceiling)
+    checks["metadata_gate_pass"] = all(checks.values())
+    return checks
+
+
 def print_report(report):
     print(f"=== {report['video_id']} ===")
     print(f"baseline:  {report['baseline_run']}")
@@ -165,6 +233,7 @@ def print_report(report):
     for side in ("baseline", "candidate"):
         print(side, report[side]["overview"])
     print("delta", report["delta"])
+    print("promotion_checks", report["promotion_checks"])
     print("\n-- candidate duplicates --")
     print(report["candidate"]["duplicates"])
     print("\n-- candidate risk flags --")

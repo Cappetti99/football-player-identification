@@ -377,6 +377,7 @@ def _clear_duplicate_team_jerseys(frame_num, frame_tracks, diagnostics):
                 continue
             diagnostics["duplicate_team_jersey"].append(
                 {
+                    "reason": "duplicate_team_jersey_same_frame",
                     "frame": int(frame_num),
                     "team_id": int(team),
                     "jersey_number": int(jersey),
@@ -388,6 +389,14 @@ def _clear_duplicate_team_jerseys(frame_num, frame_tracks, diagnostics):
                     "kept_player_id": keep_track.get("player_id", "unknown"),
                     "cleared_rank": jersey_rank(track),
                     "kept_rank": jersey_rank(keep_track),
+                    "cleared_identity_confidence": identity_confidence_value(track),
+                    "kept_identity_confidence": identity_confidence_value(keep_track),
+                    "cleared_jersey_confidence": jersey_confidence_value(track),
+                    "kept_jersey_confidence": jersey_confidence_value(keep_track),
+                    "cleared_jersey_votes": jersey_votes_value(track),
+                    "kept_jersey_votes": jersey_votes_value(keep_track),
+                    "cleared_jersey_winner_margin": jersey_winner_margin_value(track),
+                    "kept_jersey_winner_margin": jersey_winner_margin_value(keep_track),
                 }
             )
             _clear_jersey(
@@ -456,6 +465,9 @@ def _enforce_global_team_jersey_owners(tracks, diagnostics):
                 continue
             cleared_display_ids = sorted(int(display_id) for display_id in owner_key)
             cleared_rank = global_jersey_owner_rank(items)
+            cleared_frames = {int(frame_num) for frame_num, _raw_id, _track in items}
+            kept_frames = {int(frame_num) for frame_num, _raw_id, _track in keep_items}
+            overlap_frames = sorted(cleared_frames & kept_frames)
             diagnostics["global_team_jersey_owners"].append(
                 {
                     "reason": "global_duplicate_team_jersey_owner",
@@ -471,6 +483,20 @@ def _enforce_global_team_jersey_owners(tracks, diagnostics):
                     "kept_num_rows": int(len(keep_items)),
                     "cleared_frame_span": frame_span(items),
                     "kept_frame_span": frame_span(keep_items),
+                    "overlap_frame_count": int(len(overlap_frames)),
+                    "overlap_frames": overlap_frames,
+                    "cleared_row_keys": [
+                        {"frame": int(frame_num), "raw_track_id": int(raw_id)}
+                        for frame_num, raw_id, _track in items
+                    ],
+                    "cleared_identity_confidence": mean_metric(items, identity_confidence_value),
+                    "kept_identity_confidence": mean_metric(keep_items, identity_confidence_value),
+                    "cleared_jersey_confidence": max_metric(items, jersey_confidence_value),
+                    "kept_jersey_confidence": max_metric(keep_items, jersey_confidence_value),
+                    "cleared_jersey_votes": max_metric(items, jersey_votes_value),
+                    "kept_jersey_votes": max_metric(keep_items, jersey_votes_value),
+                    "cleared_jersey_winner_margin": max_metric(items, jersey_winner_margin_value),
+                    "kept_jersey_winner_margin": max_metric(keep_items, jersey_winner_margin_value),
                     "cleared_rank": cleared_rank,
                     "kept_rank": kept_rank,
                 }
@@ -528,6 +554,16 @@ def group_global_jersey_owners(by_display):
     for display_id, items in unknown.items():
         groups[(int(display_id),)] = list(items)
     return groups
+
+
+def mean_metric(items, metric):
+    values = [float(metric(track)) for _frame_num, _raw_id, track in items]
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def max_metric(items, metric):
+    values = [float(metric(track)) for _frame_num, _raw_id, track in items]
+    return float(max(values)) if values else 0.0
 
 
 def _clear_duplicate_player_ids(frame_num, frame_tracks, player_roster, diagnostics):
@@ -636,6 +672,15 @@ def global_jersey_owner_rank(items):
 def jersey_confidence_value(track):
     evidence = track.get("jersey_evidence") or {}
     return float(evidence.get("confidence", track.get("jersey_confidence", 0.0)) or 0.0)
+
+
+def identity_confidence_value(track):
+    return float(track.get("identity_confidence", 0.0) or 0.0)
+
+
+def jersey_votes_value(track):
+    evidence = track.get("jersey_evidence") or {}
+    return int(evidence.get("votes", track.get("jersey_votes", 0)) or 0)
 
 
 def jersey_head_confidence_value(track):

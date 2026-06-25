@@ -1,0 +1,4 @@
+base_config: default_realvideo_identity_evidence_v1_prtreid.yaml
+
+tracking:
+  backend: prtreid_strongsort

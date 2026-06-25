@@ -1,0 +1,16 @@
+base_config: default_realvideo_identity_evidence_v1_prtreid_linking_additive_cutsensitive_resetbytetrack.yaml
+
+# Experimental single-video calibration. Do not promote without a second-video
+# audit and leave-one-video-out validation.
+prtreid_linking:
+  same_scene:
+    enabled: false
+    min_similarity: 1.0
+    min_margin: 1.0
+  cross_scene:
+    enabled: true
+    max_segment_gap: 1
+    max_gap: 60
+    min_similarity: 0.92511475086212158
+    min_margin: 0.042288899421691895
+    mutual_nearest: true

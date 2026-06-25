@@ -1,0 +1,14 @@
+base_config: default_realvideo_identity_evidence_v1_prtreid.yaml
+
+scene_cuts:
+  enabled: true
+  tracking_reset_enabled: true
+  threshold: 0.08
+  hard_cut_threshold: 0.12
+  min_gap: 40
+
+team:
+  assignment_mode: color
+
+identity_propagation:
+  enabled: false

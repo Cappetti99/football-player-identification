@@ -63,6 +63,7 @@ class ArtifactExporter:
                     "previous_display_track_id": track.get("previous_display_track_id"),
                     "jersey_link_previous_display_track_id": track.get("jersey_link_previous_display_track_id"),
                     "display_track_id": int(track.get("display_track_id", raw_track_id)),
+                    "prtreid_link_previous_display_track_id": track.get("prtreid_link_previous_display_track_id"),
                     "identity_tracklet_id": track.get("identity_tracklet_id"),
                     "scene_segment_id": track.get("scene_segment_id"),
                     "scene_cut_boundary": bool(track.get("scene_cut_boundary", False)),
@@ -100,6 +101,20 @@ class ArtifactExporter:
                     "jersey_roster_mass": float(track.get("jersey_roster_mass", 0.0)),
                     "jersey_constraint": track.get("jersey_constraint"),
                     "visual_embedding": track.get("visual_embedding"),
+                    "reid_model": track.get("reid_model"),
+                    "reid_visibility_scores": track.get("reid_visibility_scores"),
+                    "reid_body_masks": track.get("reid_body_masks"),
+                    "reid_role_detection": track.get("reid_role_detection"),
+                    "reid_role_confidence": track.get("reid_role_confidence"),
+                    "reid_role_override_blocked": bool(track.get("reid_role_override_blocked", False)),
+                    "reid_sample_count": track.get("reid_sample_count"),
+                    "reid_prototype_eligible": track.get("reid_prototype_eligible"),
+                    "reid_prototype_consistency": track.get("reid_prototype_consistency"),
+                    "reid_mean_crop_quality": track.get("reid_mean_crop_quality"),
+                    "reid_sampled_frames": track.get("reid_sampled_frames"),
+                    "role_confidence": track.get("role_confidence"),
+                    "role_source": track.get("role_source"),
+                    "previous_role_detection": track.get("previous_role_detection"),
                     "player_id": track.get("player_id", "unknown"),
                     "player_name": track.get("player_name", "unknown"),
                     "identity_confidence": float(track.get("identity_confidence", 0.0)),
@@ -198,10 +213,14 @@ class ArtifactExporter:
             json.dump(payload, f, indent=2)
 
     @staticmethod
-    def write_csv(rows, path):
-        if not rows:
+    def write_csv(rows, path, fieldnames=None):
+        if not rows and not fieldnames:
             return
-        fields = list(rows[0].keys())
+        fields = list(fieldnames or rows[0].keys())
+        for row in rows:
+            for key in row.keys():
+                if key not in fields:
+                    fields.append(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -238,8 +257,8 @@ def to_float_list(value):
     return [float(v) for v in value]
 
 
-def write_table(rows, path):
-    ArtifactExporter.write_csv(rows, Path(path))
+def write_table(rows, path, fieldnames=None):
+    ArtifactExporter.write_csv(rows, Path(path), fieldnames=fieldnames)
 
 
 def write_json(payload, path):

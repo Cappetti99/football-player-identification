@@ -204,6 +204,13 @@ identity:
   goalkeeper_singleton_gate: true
   goalkeeper_singleton_min_team_confidence: 0.75
   goalkeeper_singleton_min_tracklet_frames: 30
+  assignment_scope: global
+  number_region_cost_enabled: false
+  number_region_bonus_weight: 0.20
+  number_region_mismatch_penalty: 0.20
+  number_region_min_votes: 2
+  number_region_min_mean_confidence: 0.20
+  number_region_min_consecutive_support: 1
   frame_team_consistency: true
   frame_team_min_confidence: 0.70
   frame_team_split_enabled: true

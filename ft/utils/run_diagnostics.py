@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import platform
 import subprocess
@@ -47,6 +49,7 @@ class RunDiagnostics:
             )
 
     def write_manifest(self, config):
+        provenance = source_provenance(config)
         payload = {
             "video_id": self.video_id,
             "started_at": self.started_at,
@@ -57,8 +60,10 @@ class RunDiagnostics:
             },
             "git": git_snapshot(),
             "config": config,
+            "source_provenance": provenance,
         }
         write_json(payload, self.metadata_dir / f"{self.video_id}_run_manifest.json")
+        write_json(provenance, self.metadata_dir / f"{self.video_id}_source_provenance.json")
 
     def write_summary(self, extra=None):
         finished_at = datetime.now(timezone.utc).isoformat()
@@ -114,3 +119,43 @@ def _git(args):
     if result.returncode != 0:
         return None
     return result.stdout.strip()
+
+
+def source_provenance(config):
+    project_root = Path(__file__).resolve().parents[2]
+    sources = (
+        "ft/identity/constraints.py",
+        "ft/identity/hungarian.py",
+        "ft/linking/jersey_identity_linker.py",
+        "ft/identity/gate_audit.py",
+        "ft/identity/prtreid_bridge.py",
+    )
+    return {
+        "config_sha256": sha256_bytes(canonical_json(config).encode("utf-8")),
+        "sources": {
+            relative_path: {
+                "sha256": sha256_file(project_root / relative_path),
+                "exists": (project_root / relative_path).is_file(),
+            }
+            for relative_path in sources
+        },
+    }
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def sha256_file(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()

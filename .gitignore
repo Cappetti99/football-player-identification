@@ -17,9 +17,12 @@ venv/
 # Local data and generated outputs
 artifacts/
 output_videos/
+evaluation_outputs/
 logs/
 wandb/
 runs/
+handoff.md
+basketball_ai_how_to_detect_track_and_identify_basketball_players.ipynb
 
 # Custom local inputs. Keep only the placeholder/readme.
 costume-video/**

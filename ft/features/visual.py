@@ -1,6 +1,9 @@
 import numpy as np
 
 
+from ft.features.prtreid import PRTReIDFeatureExtractor
+
+
 class VisualFeatureExtractor:
     """Lightweight visual descriptor for color/appearance continuity.
 
@@ -9,9 +12,12 @@ class VisualFeatureExtractor:
     Hungarian assignment a weak physical/visual cue.
     """
 
-    def __init__(self, cache_enabled=True, embedding_mode="hsv"):
+    def __init__(self, cache_enabled=True, embedding_mode="hsv", prtreid_config=None):
         self.cache_enabled = bool(cache_enabled)
         self.embedding_mode = normalize_embedding_mode(embedding_mode)
+        self.prtreid = None
+        if self.embedding_mode == "prtreid":
+            self.prtreid = PRTReIDFeatureExtractor(**prtreid_extractor_config(prtreid_config or {}))
         self._cache = {}
         self.stats = {
             "cache_enabled": self.cache_enabled,
@@ -21,6 +27,10 @@ class VisualFeatureExtractor:
         }
 
     def add_row_features(self, rows):
+        if self.prtreid is not None:
+            self.prtreid.add_row_features(rows)
+            self.stats.update(self.prtreid.diagnostics())
+            return rows
         for row in rows:
             crop_path = row.get("crop_path")
             row["visual_embedding"] = self.extract_cached(crop_path) if crop_path else None
@@ -73,6 +83,8 @@ def extract_from_crop(crop, mode="hsv"):
     if crop is None or crop.size == 0:
         return None
     mode = normalize_embedding_mode(mode)
+    if mode == "prtreid":
+        raise ValueError("PRTReID extraction requires PRTReIDFeatureExtractor.add_row_features")
     if mode == "hsv_lab_gradient":
         return extract_hsv_lab_gradient_from_crop(crop)
     return extract_hsv_from_crop(crop)
@@ -134,7 +146,27 @@ def normalize_embedding_mode(mode):
         return "hsv"
     if value in {"hsv_lab_gradient", "lab_gradient", "rich", "enhanced"}:
         return "hsv_lab_gradient"
+    if value in {"prtreid", "prt_reid", "bpbreid", "prtreid_soccernet"}:
+        return "prtreid"
     raise ValueError(f"Unknown visual embedding mode: {mode!r}")
+
+
+def prtreid_extractor_config(config):
+    allowed = {
+        "enabled",
+        "weights_path",
+        "hrnet_pretrained_path",
+        "device",
+        "batch_size",
+        "image_width",
+        "image_height",
+        "test_embeddings",
+        "download_weights",
+        "role_enabled",
+        "extractor_factory",
+        "extract_embeddings_fn",
+    }
+    return {key: value for key, value in config.items() if key in allowed}
 
 
 def mean_embedding(values):

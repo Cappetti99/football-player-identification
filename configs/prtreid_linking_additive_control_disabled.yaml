@@ -1,0 +1,4 @@
+base_config: default_realvideo_identity_evidence_v1_prtreid_linking_additive_cutsensitive_resetbytetrack.yaml
+
+prtreid_linking:
+  enabled: false

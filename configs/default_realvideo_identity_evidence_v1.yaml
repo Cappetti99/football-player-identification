@@ -1,5 +1,11 @@
 base_config: default_realvideo_ocr_nopromote_rawgate020_scenecuts_loose_noreset_gkfallback_spreadgate_propagation_ballkalman.yaml
 
+visual:
+  embedding_mode: hsv_lab_gradient
+
+linking:
+  embedding_mode: hsv_lab_gradient
+
 jersey_identity_linking:
   enabled: false
 

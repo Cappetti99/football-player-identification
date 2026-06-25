@@ -1,0 +1,29 @@
+base_config: prtreid_linking_additive_control_disabled.yaml
+
+# Audit-only ablation. This source exports localized OCR evidence but cannot
+# alter jersey fields, identity assignments, linking, propagation or constraints.
+identity_propagation:
+  enabled: false
+
+prtreid_linking:
+  enabled: false
+
+prtreid_identity_bridge:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: false
+
+number_region:
+  enabled: true
+  audit_only: true
+  backend: torso_heuristic
+  frame_interval: 5
+  torso_x_min: 0.15
+  torso_x_max: 0.85
+  torso_y_min: 0.12
+  torso_y_max: 0.62
+  padding: 0.08
+  min_width: 8
+  min_height: 8
+  max_regions_per_tracklet: 0
