@@ -66,6 +66,142 @@ def test_hungarian_assignment_prefers_jersey_over_uncertain_team():
     assert scores[0]["player_id"] == "p7"
 
 
+def test_number_region_cost_enters_hungarian_matrix_without_gate():
+    identifier = HungarianPlayerIdentifier(
+        roster_path=None,
+        unknown_threshold=0.0,
+        number_region_cost_enabled=True,
+        number_region_bonus_weight=0.20,
+        number_region_mismatch_penalty=0.20,
+    )
+    identifier.roster = [
+        {"player_id": "p7", "name": "P7", "team_id": 1, "jersey_number": 7, "position_prior": None},
+        {"player_id": "p9", "name": "P9", "team_id": 1, "jersey_number": 9, "position_prior": None},
+    ]
+    tracklet = {
+        "track_id": 4,
+        "team_id": 1,
+        "mean_team_confidence": 0.8,
+        "jersey_number": None,
+        "num_frames": 40,
+        "mean_crop_quality": 0.4,
+        "mean_pitch_position": None,
+        "visual_embedding": None,
+        "number_region_evidence": {
+            "winner": "7",
+            "winner_votes": 3,
+            "winner_mean_confidence": 0.80,
+            "max_consecutive_support": 2,
+            "raw_distribution": [{"value": "7", "votes": 3, "mean_confidence": 0.80}],
+        },
+    }
+
+    p7 = identifier.cost_details(tracklet, identifier.roster[0])
+    p9 = identifier.cost_details(tracklet, identifier.roster[1])
+    gate = identifier.assignment_gate(tracklet, identifier.roster[0], p7)
+
+    assert p7["components"]["number_region"] < 0.0
+    assert p9["components"]["number_region"] > 0.0
+    assert p7["cost"] < p9["cost"]
+    assert gate["pass"] is False
+
+
+def test_summarize_attaches_number_region_evidence_by_display_id():
+    identifier = HungarianPlayerIdentifier(roster_path=None)
+    rows = [
+        {
+            "track_id": 1,
+            "display_track_id": 42,
+            "raw_track_id": 1,
+            "frame": 10,
+            "track_group": "players",
+            "team_id": 1,
+            "team_confidence": 0.9,
+            "crop_quality": 0.5,
+        }
+    ]
+    evidence = [
+        {
+            "display_track_id": 42,
+            "winner": "17",
+            "winner_votes": 2,
+            "winner_mean_confidence": 0.7,
+            "max_consecutive_support": 1,
+            "raw_distribution": [{"value": "17", "votes": 2, "mean_confidence": 0.7}],
+        }
+    ]
+
+    summary = identifier.summarize(rows, number_region_evidence=evidence)[0]
+
+    assert summary["number_region_evidence"]["winner"] == "17"
+    assert summary["number_region_evidence"]["raw_distribution"][0]["value"] == "17"
+
+
+def test_scene_segment_assignment_scope_resets_roster_competition():
+    identifier = HungarianPlayerIdentifier(
+        roster_path=None,
+        unknown_threshold=0.0,
+        assignment_scope="scene_segment",
+    )
+    identifier.roster = [
+        {"player_id": "p7", "name": "P7", "team_id": 1, "jersey_number": 7, "position_prior": None},
+    ]
+    rows = [
+        {
+            "frame": 10,
+            "track_id": 1,
+            "display_track_id": 4,
+            "scene_segment_id": 0,
+            "track_group": "players",
+            "team_id": 1,
+            "team_confidence": 0.9,
+            "jersey_number": 7,
+            "jersey_confidence": 0.8,
+            "jersey_head_confidence": 0.9,
+            "jersey_winner_margin": 0.4,
+            "jersey_votes": 8,
+            "raw_jersey_distribution": [{"jersey_number": 7, "confidence": 0.8, "votes": 8}],
+            "crop_quality": 0.4,
+            "role_detection": "player",
+        },
+        {
+            "frame": 310,
+            "track_id": 2,
+            "display_track_id": 5,
+            "scene_segment_id": 1,
+            "track_group": "players",
+            "team_id": 1,
+            "team_confidence": 0.9,
+            "jersey_number": 7,
+            "jersey_confidence": 0.8,
+            "jersey_head_confidence": 0.9,
+            "jersey_winner_margin": 0.4,
+            "jersey_votes": 8,
+            "raw_jersey_distribution": [{"jersey_number": 7, "confidence": 0.8, "votes": 8}],
+            "crop_quality": 0.4,
+            "role_detection": "player",
+        },
+    ]
+    summaries = identifier.summarize(rows)
+    assignments, _scores = identifier.assign(summaries)
+    tracks = {
+        "players": [
+            {1: {"display_track_id": 4, "scene_segment_id": 0}},
+            {2: {"display_track_id": 5, "scene_segment_id": 1}},
+        ]
+    }
+
+    apply_assignments(tracks, assignments, assignment_scope="scene_segment")
+
+    assert sorted(assignments) == [400000, 500001]
+    assert assignments[400000]["player_id"] == "p7"
+    assert assignments[500001]["player_id"] == "p7"
+    assert tracks["players"][0][1]["identity_tracklet_id"] == 400000
+    assert tracks["players"][1][2]["identity_tracklet_id"] == 500001
+    assert tracks["players"][0][1]["player_id"] == "p7"
+    assert tracks["players"][1][2]["player_id"] == "p7"
+
+
 def test_unique_team_jersey_constraint_rejects_duplicate_roster_numbers():
     roster = [
         {"player_id": "a", "team_id": 1, "jersey_number": 7},
@@ -854,6 +990,10 @@ def test_jersey_identity_linker_links_reliable_same_number_continuation():
 
     assert diagnostics["accepted_links"][0]["from_display_track_id"] == 9
     assert diagnostics["accepted_links"][0]["to_display_track_id"] == 59
+    assert diagnostics["accepted_links"][0]["from_start_frame"] == 0
+    assert diagnostics["accepted_links"][0]["from_end_frame"] == 1
+    assert diagnostics["accepted_links"][0]["to_start_frame"] == 3
+    assert diagnostics["accepted_links"][0]["to_end_frame"] == 4
     assert tracks["players"][3][2]["display_track_id"] == 9
     assert rows[1]["display_track_id"] == 9
     assert rows[1]["jersey_link_previous_display_track_id"] == 59
@@ -886,6 +1026,68 @@ def test_jersey_identity_linker_rejects_far_same_number_tracklet():
     assert diagnostics["accepted_links"] == []
     assert tracks["players"][3][2]["display_track_id"] == 59
     assert diagnostics["rejection_counts"]["distance"] >= 1
+
+
+def test_jersey_identity_linker_rejects_team_jersey_mismatch_and_weak_ocr():
+    reliable = {
+        "display_track_id": 9,
+        "team": 1,
+        "team_confidence": 0.9,
+        "jersey_number": 6,
+        "jersey_votes": 5,
+        "jersey_evidence": {"confidence": 0.82, "head_confidence": 0.90, "winner_margin": 0.35, "votes": 5},
+    }
+    wrong_team = dict(reliable, display_track_id=59, team=2)
+    wrong_jersey = dict(reliable, display_track_id=59, jersey_number=7)
+    weak_ocr = dict(
+        reliable,
+        display_track_id=59,
+        jersey_votes=2,
+        jersey_evidence={"confidence": 0.82, "head_confidence": 0.90, "winner_margin": 0.35, "votes": 2},
+    )
+
+    team_diagnostics = JerseyIdentityLinker(max_gap=10, max_distance=20, min_frames=1).apply(
+        two_tracklets(reliable, wrong_team)
+    )
+    jersey_diagnostics = JerseyIdentityLinker(max_gap=10, max_distance=20, min_frames=1).apply(
+        two_tracklets(reliable, wrong_jersey)
+    )
+    weak_diagnostics = JerseyIdentityLinker(max_gap=10, max_distance=20, min_frames=1).apply(
+        two_tracklets(reliable, weak_ocr)
+    )
+
+    assert team_diagnostics["accepted_links"] == []
+    assert team_diagnostics["rejection_counts"]["team_or_jersey"] >= 1
+    assert jersey_diagnostics["accepted_links"] == []
+    assert jersey_diagnostics["rejection_counts"]["team_or_jersey"] >= 1
+    assert weak_diagnostics["accepted_links"] == []
+
+
+def test_jersey_identity_linker_rejects_temporal_overlap():
+    evidence = {
+        "team": 1,
+        "team_confidence": 0.9,
+        "jersey_number": 6,
+        "jersey_votes": 5,
+        "jersey_evidence": {"confidence": 0.82, "head_confidence": 0.90, "winner_margin": 0.35, "votes": 5},
+        "position": (10.0, 10.0),
+        "bbox": [0, 0, 10, 20],
+    }
+    tracks = {
+        "players": [
+            {1: dict(evidence, display_track_id=9)},
+            {
+                1: dict(evidence, display_track_id=9),
+                2: dict(evidence, display_track_id=59),
+            },
+            {2: dict(evidence, display_track_id=59)},
+        ]
+    }
+
+    diagnostics = JerseyIdentityLinker(max_gap=10, max_distance=20, min_frames=1).apply(tracks)
+
+    assert diagnostics["accepted_links"] == []
+    assert diagnostics["rejection_counts"]["gap"] >= 1
 
 
 def test_strongsort_core_uses_appearance_to_keep_identity():
@@ -1254,6 +1456,8 @@ def test_constraints_clear_duplicate_team_jersey_in_same_frame():
     assert tracks["players"][0][1]["jersey_number"] == 1
     assert tracks["players"][0][2]["jersey_number"] is None
     assert diagnostics["duplicate_team_jersey_count"] == 1
+    assert diagnostics["duplicate_team_jersey"][0]["reason"] == "duplicate_team_jersey_same_frame"
+    assert diagnostics["duplicate_team_jersey"][0]["cleared_jersey_votes"] == 1
 
 
 def test_constraints_preserve_same_player_global_team_jersey_fragments():
@@ -1348,6 +1552,11 @@ def test_constraints_clear_competing_global_team_jersey_owner():
     assert diagnostics["global_team_jersey_owner_count"] == 1
     assert diagnostics["global_team_jersey_owners"][0]["kept_display_track_id"] == 59
     assert diagnostics["global_team_jersey_owners"][0]["cleared_display_track_id"] == 9
+    assert diagnostics["global_team_jersey_owners"][0]["overlap_frame_count"] == 0
+    assert diagnostics["global_team_jersey_owners"][0]["cleared_row_keys"] == [
+        {"frame": 0, "raw_track_id": 9},
+        {"frame": 1, "raw_track_id": 9},
+    ]
 
 
 def test_constraints_clear_unknown_global_team_jersey_competitor():
@@ -2026,6 +2235,9 @@ if __name__ == "__main__":
     test_hungarian_uses_preserved_dropped_candidate_evidence()
     test_hungarian_summary_marks_preserved_dropped_evidence()
     test_hungarian_uses_jersey_distribution_candidate()
+    test_number_region_cost_enters_hungarian_matrix_without_gate()
+    test_summarize_attaches_number_region_evidence_by_display_id()
+    test_scene_segment_assignment_scope_resets_roster_competition()
     test_jersey_ocr_segment_group_key_uses_frame_window()
     test_hungarian_identity_tracklet_id_keeps_segment_assignments_local()
     test_hungarian_prefers_raw_distribution_for_jersey_cost()

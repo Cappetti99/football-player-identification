@@ -1,0 +1,18 @@
+base_config: default_realvideo_identity_evidence_v1_prtreid_linking_additive_cutsensitive_resetbytetrack.yaml
+
+# Validated on the 1200-frame Int-Ata audit: two correct cross-cut bridges,
+# zero false merges, zero duplicate identities, and no regression relative to
+# the matched propagation-disabled control. Keep this profile scoped to
+# Int-Ata until another video with actual scene cuts is labeled.
+prtreid_linking:
+  same_scene:
+    enabled: false
+    min_similarity: 1.0
+    min_margin: 1.0
+  cross_scene:
+    enabled: true
+    max_segment_gap: 1
+    max_gap: 60
+    min_similarity: 0.92511475086212158
+    min_margin: 0.042288899421691895
+    mutual_nearest: true

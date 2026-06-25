@@ -1,0 +1,19 @@
+base_config: prtreid_linking_additive_control_disabled.yaml
+
+# Audit-only: exports anchor-to-unknown candidates but cannot change identity.
+prtreid_identity_bridge:
+  enabled: true
+  apply: false
+  max_samples_per_tracklet: 8
+  min_crop_quality: 0.15
+  min_samples: 3
+  min_prototype_consistency: 0.90
+  min_source_confidence: 0.75
+  require_team_match: true
+  min_team_confidence: 0.55
+  max_segment_gap: 1
+  max_gap: 60
+  min_similarity: 1.0
+  min_margin: 1.0
+  mutual_nearest: true
+  max_diagnostic_records: 5000

@@ -24,9 +24,10 @@ video
   -> referee and goalkeeper colour cues from roster metadata
   -> semantic groups
   -> crop and metadata export
+  -> optional localized number-region OCR
   -> jersey OCR with EasyOCR / MMOCR fallback and template matching
   -> roster-aware OCR filtering
-  -> Hungarian tracklet-to-player assignment
+  -> Hungarian tracklet-to-player assignment, optionally scoped by scene cuts
   -> hard identity constraints
   -> annotated video and diagnostics
 ```
@@ -59,6 +60,7 @@ The pipeline separates the two real teams from richer semantic groups.
 - YOLO + ByteTrack tracking for `person` and `ball` detectors.
 - Experimental StrongSORT-style tracker for comparison, not the recommended default.
 - Tracklet linking with gates on temporal overlap, distance, team consistency and visual appearance.
+- Scene-cut detection with optional tracker and identity-assignment reset.
 - Team assignment from visual crop colours, with per-frame team evidence for detecting ID switches.
 - Referee detection from roster-provided kit colours, for example `yellow` or `light_blue`.
 - Goalkeeper detection from roster-provided kit colours, with optional team correction when the colour evidence is strong.
@@ -72,7 +74,12 @@ The pipeline separates the two real teams from richer semantic groups.
 - Roster-aware OCR filtering:
   - removes or degrades jersey numbers that do not exist in the roster for that team;
   - can promote a valid roster candidate from the OCR distribution.
-- Hungarian assignment from tracklets to roster players.
+- Localized number-region OCR:
+  - samples candidate number regions inside player boxes;
+  - stores raw detections and per-tracklet evidence separately from legacy OCR;
+  - can contribute an optional cost term to identity assignment.
+- PRTReID-based tracklet descriptors for conservative linking experiments.
+- Hungarian assignment from tracklets to roster players, with optional per-scene assignment scope.
 - Identity constraints:
   - no duplicate `player_id` in the same frame;
   - no duplicate `(team_id, jersey_number)` in the same frame;
@@ -347,6 +354,13 @@ For a run under `artifacts/costume-video/<run_name>/metadata/`:
 *_tracklet_summaries.csv         one row per display_track_id
 *_candidate_scores.csv           Hungarian assignment candidate costs
 *_identity_candidates.csv/json   diagnostic best candidate for unknown tracks
+*_identity_evidence.csv/json     grouped evidence before identity assignment
+*_identity_decisions.csv/json    assignment decisions after constraints
+*_number_region_detections.*     localized number-region OCR detections
+*_number_region_tracklet_evidence.*
+                                  number-region evidence aggregated by tracklet
+*_prtreid_tracklet_features.json PRTReID tracklet descriptors when enabled
+*_prtreid_linking.csv/json       PRTReID linker diagnostics when enabled
 *_run_manifest.json              resolved config, environment and git snapshot
 *_run_diagnostics.json           timing and artifact disk delta by stage
 *_identity_assignments.json      final tracklet identity assignments
@@ -371,6 +385,11 @@ The cache key includes the crop contents and OCR/template configuration, so
 reruns reuse expensive OCR calls while config changes naturally miss the cache.
 The `pre_identity` export skips the large JSON file by default and keeps CSV
 plus crops; the final export still writes both CSV and JSON.
+
+Number-region OCR is intended as an additional evidence source rather than a
+direct identity rule. In the conservative setup it is evaluated through the
+Hungarian cost matrix and can be scoped to detected scene segments, so separate
+actions do not compete for the same one-to-one roster assignment.
 
 Useful high-level diagnostics:
 
@@ -443,6 +462,7 @@ The detector is only the first stage. Better detection can improve crops and tra
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 tests/test_identity.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 tests/test_number_region.py
 python3 -m ft.cli --help
 python3 -m ft.cli run --help
 ```
@@ -453,6 +473,8 @@ python3 -m ft.cli run --help
 - ByteTrack IDs are not true player identities.
 - Long videos should be evaluated by action segment or scene cut when possible.
 - The StrongSORT wrapper is experimental and currently not the recommended tracker.
+- PRTReID and number-region OCR are opt-in experimental components and should be
+  validated per video before being used for identity decisions.
 - OCR remains sensitive to crop quality, pose, motion blur and occlusion.
 - MMOCR improves OCR evidence when installed, but it adds a heavy dependency
   stack and should be kept separate from the lightweight runtime environment.

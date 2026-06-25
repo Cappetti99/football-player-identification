@@ -1,0 +1,4 @@
+base_config: default_realvideo_identity_evidence_v1_prtreid_cutsensitive_resetbytetrack_colorteam.yaml
+
+prtreid:
+  role_enabled: false

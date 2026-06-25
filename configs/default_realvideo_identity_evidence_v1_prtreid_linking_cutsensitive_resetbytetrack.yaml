@@ -1,0 +1,36 @@
+base_config: default_realvideo_identity_evidence_v1_prtreid_colorteam_norole_cutsensitive_resetbytetrack.yaml
+
+visual:
+  embedding_mode: hsv_lab_gradient
+
+team:
+  assignment_mode: color
+
+prtreid:
+  role_enabled: false
+
+prtreid_linking:
+  enabled: true
+  max_samples_per_tracklet: 8
+  min_crop_quality: 0.15
+  min_samples: 3
+  min_prototype_consistency: 0.90
+  require_team_match: true
+  min_team_confidence: 0.55
+  same_scene:
+    enabled: true
+    max_gap: 180
+    max_distance: 220.0
+    min_similarity: 0.99
+    min_margin: 0.01
+    mutual_nearest: true
+  cross_scene:
+    enabled: false
+    max_segment_gap: 1
+    max_gap: 60
+    min_similarity: 0.995
+    min_margin: 0.02
+    mutual_nearest: true
+
+identity_propagation:
+  enabled: false

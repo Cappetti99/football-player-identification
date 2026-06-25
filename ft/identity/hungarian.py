@@ -39,6 +39,13 @@ class HungarianPlayerIdentifier:
         goalkeeper_singleton_gate=True,
         goalkeeper_singleton_min_team_confidence=0.75,
         goalkeeper_singleton_min_tracklet_frames=30,
+        number_region_cost_enabled=False,
+        number_region_bonus_weight=0.20,
+        number_region_mismatch_penalty=0.20,
+        number_region_min_votes=2,
+        number_region_min_mean_confidence=0.20,
+        number_region_min_consecutive_support=1,
+        assignment_scope="global",
     ):
         self.roster = load_roster(roster_path)
         self.unknown_threshold = float(unknown_threshold)
@@ -61,14 +68,22 @@ class HungarianPlayerIdentifier:
         self.goalkeeper_singleton_gate = bool(goalkeeper_singleton_gate)
         self.goalkeeper_singleton_min_team_confidence = float(goalkeeper_singleton_min_team_confidence)
         self.goalkeeper_singleton_min_tracklet_frames = int(goalkeeper_singleton_min_tracklet_frames)
+        self.number_region_cost_enabled = bool(number_region_cost_enabled)
+        self.number_region_bonus_weight = float(number_region_bonus_weight)
+        self.number_region_mismatch_penalty = float(number_region_mismatch_penalty)
+        self.number_region_min_votes = int(number_region_min_votes)
+        self.number_region_min_mean_confidence = float(number_region_min_mean_confidence)
+        self.number_region_min_consecutive_support = int(number_region_min_consecutive_support)
+        self.assignment_scope = str(assignment_scope or "global").lower()
         if self.enforce_unique_team_jersey:
             validate_unique_team_jersey(self.roster)
 
-    def summarize(self, rows):
+    def summarize(self, rows, number_region_evidence=None):
         """Collapse per-frame rows into the evidence unit used by Hungarian."""
+        number_regions = number_region_evidence_by_display(number_region_evidence)
         grouped = defaultdict(list)
         for row in rows:
-            grouped[int(row.get("identity_tracklet_id") or row.get("display_track_id", row["track_id"]))].append(row)
+            grouped[self.summary_group_key(row)].append(row)
         summaries = []
         for track_id, items in sorted(grouped.items()):
             if is_non_player_tracklet(items):
@@ -97,6 +112,7 @@ class HungarianPlayerIdentifier:
             summary = {
                 "track_id": int(track_id),
                 "display_track_id": mode([row.get("display_track_id") for row in items if row.get("display_track_id") is not None]),
+                "scene_segment_id": mode([row.get("scene_segment_id") for row in items if row.get("scene_segment_id") is not None]),
                 "jersey_segment_index": mode([row.get("jersey_segment_index") for row in items if row.get("jersey_segment_index") is not None]),
                 "raw_track_ids": sorted({int(row.get("raw_track_id", row["track_id"])) for row in items}),
                 "role_detection": mode(roles),
@@ -146,14 +162,40 @@ class HungarianPlayerIdentifier:
                 "visual_embedding": mean_embedding(visual_values),
                 "crop_paths": [row["crop_path"] for row in items if row.get("crop_path")],
             }
+            display_id = summary.get("display_track_id")
+            if display_id is not None and int(display_id) in number_regions:
+                summary["number_region_evidence"] = number_regions[int(display_id)]
             summaries.append(summary)
         return summaries
+
+    def summary_group_key(self, row):
+        if self.assignment_scope in {"scene_segment", "scene", "segment"}:
+            display_id = row.get("display_track_id", row.get("track_id"))
+            segment_id = row.get("scene_segment_id")
+            if display_id is not None and segment_id is not None:
+                return scene_identity_tracklet_id(display_id, segment_id)
+        return int(row.get("identity_tracklet_id") or row.get("display_track_id", row["track_id"]))
 
     def assign(self, summaries):
         if not summaries:
             return {}, []
         if not self.roster:
             return unknown_assignments(summaries, "missing_roster"), []
+        if self.assignment_scope in {"scene_segment", "scene", "segment"}:
+            assignments = unknown_assignments(summaries, "below_threshold")
+            scores = []
+            grouped = defaultdict(list)
+            for summary in summaries:
+                grouped[summary.get("scene_segment_id")].append(summary)
+            for _segment_id, segment_summaries in sorted(grouped.items(), key=lambda item: (-1 if item[0] is None else int(item[0]))):
+                segment_assignments, segment_scores = self._assign_one_scope(segment_summaries)
+                assignments.update(segment_assignments)
+                scores.extend(segment_scores)
+            scores.sort(key=lambda row: (row["track_id"], row["cost"], row["player_id"]))
+            return assignments, scores
+        return self._assign_one_scope(summaries)
+
+    def _assign_one_scope(self, summaries):
         scores = self.candidate_scores(summaries)
         cost_matrix = np.asarray(
             [[self.cost_details(tracklet, player, allow_preserved_evidence=False)["cost"] for player in self.roster] for tracklet in summaries],
@@ -172,6 +214,10 @@ class HungarianPlayerIdentifier:
                 # Keep the best rejected candidate in diagnostics. It is useful
                 # when tuning thresholds, but it must not become a real identity.
                 assignments[track_id]["confidence"] = confidence
+                assignments[track_id]["identity_confidence"] = confidence
+                assignments[track_id]["identity_status"] = "unknown"
+                assignments[track_id]["identity_sources"] = identity_sources(details)
+                assignments[track_id]["identity_risk_flags"] = identity_risk_flags(tracklet, assignment_gate, details)
                 assignments[track_id]["evidence"].update(
                     {
                         "best_candidate": player["player_id"],
@@ -185,6 +231,10 @@ class HungarianPlayerIdentifier:
                 # Low cost alone is not enough. Without reliable jersey evidence
                 # or strong combined cues, the conservative outcome is unknown.
                 assignments[track_id]["confidence"] = confidence
+                assignments[track_id]["identity_confidence"] = confidence
+                assignments[track_id]["identity_status"] = "unknown"
+                assignments[track_id]["identity_sources"] = identity_sources(details)
+                assignments[track_id]["identity_risk_flags"] = identity_risk_flags(tracklet, assignment_gate, details)
                 assignments[track_id]["evidence"].update(
                     {
                         "best_candidate": player["player_id"],
@@ -201,6 +251,10 @@ class HungarianPlayerIdentifier:
                 "team_id": tracklet.get("team_id"),
                 "jersey_number": player.get("jersey_number") or tracklet.get("jersey_number"),
                 "confidence": confidence,
+                "identity_confidence": confidence,
+                "identity_status": "assigned",
+                "identity_sources": identity_sources(details),
+                "identity_risk_flags": identity_risk_flags(tracklet, assignment_gate, details),
                 "evidence": {
                     "status": "assigned",
                     "cost": details["cost"],
@@ -234,6 +288,11 @@ class HungarianPlayerIdentifier:
                         "tracklet_raw_jersey_distribution": tracklet.get("raw_jersey_distribution"),
                         "tracklet_jersey_raw_candidates": tracklet.get("jersey_raw_candidates"),
                         "tracklet_jersey_roster_mass": tracklet.get("jersey_roster_mass"),
+                        "tracklet_number_region_winner": (tracklet.get("number_region_evidence") or {}).get("winner"),
+                        "tracklet_number_region_distribution": (tracklet.get("number_region_evidence") or {}).get("raw_distribution"),
+                        "tracklet_number_region_votes": (tracklet.get("number_region_evidence") or {}).get("winner_votes"),
+                        "tracklet_number_region_confidence": (tracklet.get("number_region_evidence") or {}).get("winner_mean_confidence"),
+                        "tracklet_number_region_consecutive_support": (tracklet.get("number_region_evidence") or {}).get("max_consecutive_support"),
                         "tracklet_frames": tracklet.get("num_frames"),
                         "mean_crop_quality": tracklet.get("mean_crop_quality"),
                         "mean_pitch_position": tracklet.get("mean_pitch_position"),
@@ -256,6 +315,7 @@ class HungarianPlayerIdentifier:
             "team": 0.0,
             "jersey": 0.0,
             "team_jersey_constraint": 0.0,
+            "number_region": 0.0,
             "goalkeeper_number_one_prior": 0.0,
             "position_prior": 0.0,
             "visual": 0.0,
@@ -315,6 +375,18 @@ class HungarianPlayerIdentifier:
             # Missing jersey is a weak penalty, not a blocker. Many broadcast
             # crops never expose a readable back number.
             components["jersey"] = 0.35
+
+        if self.number_region_cost_enabled and expected is not None:
+            number_region_score = number_region_candidate_score(
+                tracklet,
+                expected,
+                min_votes=self.number_region_min_votes,
+                min_mean_confidence=self.number_region_min_mean_confidence,
+            )
+            if number_region_score is not None:
+                components["number_region"] = -self.number_region_bonus_weight * number_region_score
+            elif self._has_reliable_number_region(tracklet):
+                components["number_region"] = self.number_region_mismatch_penalty * number_region_reliability(tracklet)
 
         position_prior_distance = None
         if tracklet.get("mean_pitch_position") is not None and player.get("position_prior") is not None:
@@ -435,6 +507,19 @@ class HungarianPlayerIdentifier:
         observed = tracklet.get("jersey_number")
         return observed is not None and int(observed) == int(expected) and self._has_reliable_jersey(tracklet)
 
+    def _has_reliable_number_region(self, tracklet):
+        evidence = tracklet.get("number_region_evidence") or {}
+        winner = evidence.get("winner")
+        if winner is None or "?" in str(winner):
+            return False
+        if int(evidence.get("winner_votes") or 0) < self.number_region_min_votes:
+            return False
+        if float(evidence.get("winner_mean_confidence") or 0.0) < self.number_region_min_mean_confidence:
+            return False
+        if int(evidence.get("max_consecutive_support") or 0) < self.number_region_min_consecutive_support:
+            return False
+        return True
+
     def _has_goalkeeper_singleton_match(self, tracklet, player):
         if not self.goalkeeper_singleton_gate:
             return False
@@ -519,24 +604,41 @@ def unknown_assignments(summaries, status):
             "team_id": summary.get("team_id"),
             "jersey_number": summary.get("jersey_number"),
             "confidence": 0.0,
+            "identity_confidence": 0.0,
+            "identity_status": "unknown",
+            "identity_sources": {},
+            "identity_risk_flags": ["missing_roster"] if status == "missing_roster" else [],
             "evidence": {"status": status, "tracklet_frames": summary.get("num_frames", 0)},
         }
         for summary in summaries
     }
 
 
-def apply_assignments(tracks, assignments):
+def apply_assignments(tracks, assignments, assignment_scope="global"):
+    assignment_scope = str(assignment_scope or "global").lower()
     for frame_tracks in tracks.get("players", []):
         for raw_id, track in frame_tracks.items():
-            tracklet_id = int(track.get("identity_tracklet_id") or track.get("display_track_id", raw_id))
+            if assignment_scope in {"scene_segment", "scene", "segment"} and track.get("scene_segment_id") is not None:
+                tracklet_id = scene_identity_tracklet_id(track.get("display_track_id", raw_id), track.get("scene_segment_id"))
+            else:
+                tracklet_id = int(track.get("identity_tracklet_id") or track.get("display_track_id", raw_id))
             assignment = assignments.get(tracklet_id)
             if not assignment:
                 continue
+            if assignment_scope in {"scene_segment", "scene", "segment"}:
+                track["identity_tracklet_id"] = int(tracklet_id)
             track["player_id"] = assignment["player_id"]
             track["player_name"] = assignment["player_name"]
             track["jersey_number"] = assignment["jersey_number"]
             track["identity_confidence"] = assignment["confidence"]
+            track["identity_status"] = assignment.get("identity_status", assignment.get("evidence", {}).get("status"))
+            track["identity_sources"] = assignment.get("identity_sources", {})
+            track["identity_risk_flags"] = assignment.get("identity_risk_flags", [])
             track["identity_evidence"] = assignment["evidence"]
+
+
+def scene_identity_tracklet_id(display_id, scene_segment_id):
+    return int(display_id) * 100000 + int(scene_segment_id)
 
 
 def mode(values):
@@ -607,6 +709,83 @@ def aggregate_jersey_distribution(items, fields=("jersey_distribution", "jersey_
     ]
 
 
+def number_region_evidence_by_display(evidence):
+    output = {}
+    for row in evidence or []:
+        try:
+            display_id = int(row.get("display_track_id"))
+        except Exception:
+            continue
+        output[display_id] = {
+            "display_track_id": display_id,
+            "winner": row.get("winner"),
+            "winner_votes": int(row.get("winner_votes") or 0),
+            "winner_mean_confidence": float(row.get("winner_mean_confidence") or 0.0),
+            "recognized_regions": int(row.get("recognized_regions") or 0),
+            "sampled_regions": int(row.get("sampled_regions") or 0),
+            "frame_diversity": int(row.get("frame_diversity") or 0),
+            "max_consecutive_support": int(row.get("max_consecutive_support") or 0),
+            "raw_distribution": row.get("raw_distribution") or [],
+            "localization_source": row.get("localization_source"),
+            "audit_only": bool(row.get("audit_only", True)),
+        }
+    return output
+
+
+def number_region_candidate_score(tracklet, expected, min_votes=2, min_mean_confidence=0.20):
+    if expected is None:
+        return None
+    evidence = tracklet.get("number_region_evidence") or {}
+    best = None
+    for candidate in evidence.get("raw_distribution") or []:
+        value = candidate.get("value")
+        compatibility = number_region_value_compatibility(value, expected)
+        if compatibility <= 0.0:
+            continue
+        votes = int(candidate.get("votes", 0) or 0)
+        mean_confidence = clamp(candidate.get("mean_confidence", 0.0), 0.0, 1.0)
+        if votes < int(min_votes) or mean_confidence < float(min_mean_confidence):
+            continue
+        score = compatibility * mean_confidence * min(1.0, max(1, votes) / 3.0)
+        best = score if best is None else max(best, score)
+    return best
+
+
+def number_region_value_compatibility(value, expected):
+    try:
+        expected_text = str(int(expected))
+    except Exception:
+        return 0.0
+    observed = str(value or "").strip()
+    if not observed:
+        return 0.0
+    if "?" not in observed:
+        try:
+            return 1.0 if int(observed) == int(expected) else 0.0
+        except Exception:
+            return 0.0
+    if len(observed) != len(expected_text):
+        return 0.0
+    known = 0
+    for observed_digit, expected_digit in zip(observed, expected_text):
+        if observed_digit == "?":
+            continue
+        known += 1
+        if observed_digit != expected_digit:
+            return 0.0
+    return 0.5 if known else 0.0
+
+
+def number_region_reliability(tracklet):
+    evidence = tracklet.get("number_region_evidence") or {}
+    confidence = clamp(evidence.get("winner_mean_confidence", 0.0), 0.0, 1.0)
+    votes = int(evidence.get("winner_votes") or 0)
+    consecutive = int(evidence.get("max_consecutive_support") or 0)
+    vote_score = min(1.0, max(1, votes) / 3.0)
+    consecutive_score = min(1.0, max(1, consecutive) / 2.0)
+    return clamp(confidence * vote_score * consecutive_score, 0.0, 1.0)
+
+
 def jersey_candidate_score(tracklet, expected, field="jersey_distribution"):
     if expected is None:
         return None
@@ -616,6 +795,36 @@ def jersey_candidate_score(tracklet, expected, field="jersey_distribution"):
             votes = int(candidate.get("votes", 0) or 0)
             return confidence * min(1.0, max(1, votes) / 3.0)
     return None
+
+
+def identity_sources(details):
+    components = details.get("components") or {}
+    sources = {}
+    for key in ("team", "jersey", "number_region", "position_prior", "visual", "goalkeeper_role", "tracklet_length", "crop_quality"):
+        value = float(components.get(key, 0.0) or 0.0)
+        sources[key] = float(clamp(0.5 - value, 0.0, 1.0))
+    sources["cost"] = float(details.get("cost", 1.0) or 1.0)
+    sources["confidence"] = float(details.get("confidence", 0.0) or 0.0)
+    return sources
+
+
+def identity_risk_flags(tracklet, assignment_gate, details):
+    flags = []
+    if not assignment_gate.get("pass"):
+        flags.append(str(assignment_gate.get("reason") or "assignment_gate_failed"))
+    if not tracklet.get("raw_jersey_distribution") and not tracklet.get("jersey_distribution"):
+        flags.append("missing_ocr_distribution")
+    if tracklet.get("number_region_evidence") is not None and not (tracklet.get("number_region_evidence") or {}).get("raw_distribution"):
+        flags.append("missing_number_region_distribution")
+    if float(tracklet.get("mean_team_confidence") or 0.0) < 0.50:
+        flags.append("low_team_confidence")
+    if int(tracklet.get("num_frames") or 0) < 10:
+        flags.append("short_tracklet")
+    if details.get("visual_similarity") is None:
+        flags.append("missing_visual_similarity")
+    if float(details.get("confidence") or 0.0) < 0.70:
+        flags.append("low_identity_confidence")
+    return sorted(set(flags))
 
 
 def jersey_reliability(tracklet):

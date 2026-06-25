@@ -1,0 +1,21 @@
+base_config: prtreid_linking_additive_control_disabled.yaml
+
+# Int-Ata-only ablation. Keep propagation and PRTReID linking disabled so the
+# effect of conservative jersey-based display linking remains isolated.
+identity_propagation:
+  enabled: false
+
+prtreid_linking:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: true
+  max_gap: 90
+  max_distance: 140.0
+  min_frames: 3
+  min_confidence: 0.20
+  min_head_confidence: 0.55
+  min_winner_margin: 0.10
+  min_votes: 5
+  team_gate_min_confidence: 0.60
+  max_rejection_records: 5000

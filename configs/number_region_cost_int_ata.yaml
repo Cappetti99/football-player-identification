@@ -1,0 +1,11 @@
+base_config: number_region_audit_int_ata.yaml
+
+# Experimental cost-only integration. Number-region evidence changes the
+# Hungarian cost matrix but does not act as an assignment gate by itself.
+identity:
+  number_region_cost_enabled: true
+  number_region_bonus_weight: 0.20
+  number_region_mismatch_penalty: 0.20
+  number_region_min_votes: 2
+  number_region_min_mean_confidence: 0.20
+  number_region_min_consecutive_support: 1
