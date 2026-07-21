@@ -1,4 +1,3 @@
-import os
 from contextlib import nullcontext
 
 import numpy as np
@@ -6,11 +5,8 @@ import pandas as pd
 
 from ft.utils.geometry import bbox_center, bbox_foot
 from ft.tracking.ball_kalman import BallKalmanTracker
-
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
+from ft.tracking.observations import BALL_CLASSES, PLAYER_CLASSES, REFEREE_CLASSES
+from ft.tracking.yolo_detector import YoloDetectionStage
 
 try:
     import supervision as sv
@@ -21,11 +17,6 @@ try:
     import torch
 except ImportError:
     torch = None
-
-
-PLAYER_CLASSES = {"person", "player", "goalkeeper"}
-REFEREE_CLASSES = {"referee"}
-BALL_CLASSES = {"ball", "sports ball"}
 
 
 class YoloByteTracker:
@@ -67,14 +58,11 @@ class YoloByteTracker:
         progress_every=250,
         inference_mode=True,
         half_precision=False,
+        detection_enricher=None,
     ):
-        if YOLO is None:
-            raise ImportError("Missing ultralytics. Install FT requirements first.")
         if sv is None:
             raise ImportError("Missing supervision. Install FT requirements first.")
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"YOLO model not found: {model_path}")
-        self.model = YOLO(model_path)
+        self.detector = YoloDetectionStage(model_path, confidence=ball_confidence)
         self.detection_confidence = float(detection_confidence)
         self.ball_confidence = float(ball_confidence)
         self.ball_max_area_ratio = float(ball_max_area_ratio)
@@ -120,6 +108,10 @@ class YoloByteTracker:
         self.progress_every = int(progress_every or 0)
         self.inference_mode = bool(inference_mode)
         self.half_precision = bool(half_precision)
+        # Optional detection-level features are intentionally not consumed by
+        # ByteTrack. They prepare the common record for a future appearance
+        # association backend without changing the validated default path.
+        self.detection_enricher = detection_enricher
 
     @staticmethod
     def _build_tracker(
@@ -157,7 +149,9 @@ class YoloByteTracker:
 
     def run(self, frames, batch_size=20, scene_cut_frames=None):
         """Track frames sequentially, optionally resetting at shot boundaries."""
-        tracks = {"players": [], "referees": [], "ball": []}
+        tracks = {"players": [], "referees": [], "ball": [], "detections": []}
+        if self.detection_enricher is not None and hasattr(self.detection_enricher, "reset"):
+            self.detection_enricher.reset()
         scene_cut_frames = {int(frame) for frame in (scene_cut_frames or []) if int(frame) > 0}
         current_id_offset = 0
         max_seen_track_id = 0
@@ -168,13 +162,17 @@ class YoloByteTracker:
             for start in range(0, len(frames), batch_size):
                 # Detection is batched for GPU throughput, but ByteTrack still
                 # receives frames in order so its temporal state remains valid.
-                results = self.model.predict(
+                detections_batch = self.detector.detect_batch(
                     frames[start : start + batch_size],
-                    conf=self.ball_confidence,
-                    verbose=False,
+                    frame_offset=start,
                     half=self.half_precision,
                 )
-                for local_index, result in enumerate(results):
+                if self.detection_enricher is not None:
+                    detections_batch = self.detection_enricher.enrich_batch(
+                        frames[start : start + batch_size],
+                        detections_batch,
+                    )
+                for local_index, frame_detections in enumerate(detections_batch):
                     frame_num = start + local_index
                     scene_cut_reset = frame_num in scene_cut_frames
                     if scene_cut_reset:
@@ -183,14 +181,16 @@ class YoloByteTracker:
                         current_id_offset = max_seen_track_id
                         scene_segment_id += 1
                     frame_tracks = self._process_frame(
-                        result,
+                        frame_detections,
                         frame_num=frame_num,
                         id_offset=current_id_offset,
                         scene_segment_id=scene_segment_id,
                         scene_cut_reset=scene_cut_reset,
                     )
                     for key in tracks:
-                        tracks[key].append(frame_tracks[key])
+                        tracks[key].append(
+                            frame_tracks.get(key, [] if key == "detections" else {})
+                        )
                     max_seen_track_id = max(max_seen_track_id, max_frame_track_id(frame_tracks))
                     if self.progress_every > 0 and (frame_num + 1) % self.progress_every == 0:
                         print(
@@ -201,11 +201,19 @@ class YoloByteTracker:
         self.add_positions(tracks)
         tracks["ball"] = self.interpolate_ball(tracks["ball"])
         self.add_positions(tracks)
+        tracks["detection_enrichment"] = (
+            self.detection_enricher.diagnostics()
+            if self.detection_enricher is not None
+            else {"enabled": False, "status": "disabled"}
+        )
         return tracks
 
-    def _process_frame(self, result, frame_num=None, id_offset=0, scene_segment_id=0, scene_cut_reset=False):
+    def _process_frame(self, frame_detections, frame_num=None, id_offset=0, scene_segment_id=0, scene_cut_reset=False):
+        result = frame_detections.native_result
+        observations = frame_detections.observations
         names = {int(k): str(v).lower() for k, v in result.names.items()}
         detections = sv.Detections.from_ultralytics(result)
+        raw_detections = [item.athlete_payload() for item in observations if item.is_athlete]
         if len(detections) > 0:
             keep = []
             for class_id, confidence in zip(detections.class_id, detections.confidence):
@@ -230,15 +238,22 @@ class YoloByteTracker:
             tracked_input = tracked_input[np.asarray(keep_track, dtype=bool)]
 
         tracked = self.tracker.update_with_detections(tracked_input)
-        output = {"players": {}, "referees": {}, "ball": {}}
+        output = {
+            "players": {},
+            "referees": {},
+            "ball": {},
+            "detections": raw_detections,
+        }
         for item in tracked:
             bbox = item[0].tolist()
+            confidence = float(item[2]) if item[2] is not None else None
             class_id = int(item[3])
             local_track_id = int(item[4])
             track_id = local_track_id + int(id_offset)
             class_name = names[class_id]
             payload = {
                 "bbox": bbox,
+                "detection_confidence": confidence,
                 "role_detection": "goalkeeper" if class_name == "goalkeeper" else "player",
                 "raw_track_id": local_track_id,
                 "scene_segment_id": int(scene_segment_id),
@@ -252,13 +267,11 @@ class YoloByteTracker:
                 output["referees"][track_id] = payload
 
         ball_candidates = []
-        frame_height, frame_width = result.orig_shape
+        frame_height, frame_width = frame_detections.image_shape
         frame_area = float(frame_height * frame_width)
-        for bbox, class_id, confidence in zip(
-            detections.xyxy, detections.class_id, detections.confidence
-        ):
-            if names[int(class_id)] in BALL_CLASSES:
-                ball_candidates.append((bbox.tolist(), float(confidence)))
+        for observation in observations:
+            if observation.is_ball and observation.confidence >= self.ball_confidence:
+                ball_candidates.append((observation.bbox, observation.confidence))
         predicted_ball = self._predict_ball_kalman()
         dynamic_area_ratio = self.ball_max_area_ratio
         if (

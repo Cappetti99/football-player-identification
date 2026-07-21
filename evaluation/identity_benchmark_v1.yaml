@@ -1,0 +1,36 @@
+version: "1"
+seed: 20260702
+max_frames: 1200
+anchors_per_unit: 8
+second_review_fraction: 0.20
+merge_iou_threshold: 0.50
+merge_min_shared_frames: 3
+merge_min_overlap_fraction: 0.20
+rejected_near_miss_per_stratum: 20
+
+artifacts_root: artifacts/costume-video
+output_dir: evaluation_outputs/identity_benchmark_v1
+
+videos:
+  - video_id: Int-Ata
+    split: development
+    roster_path: costume-video/Int-Ata/Int-Ata.json
+    source_runs:
+      - Int-Ata_identity_evidence_v1_resetbytetrack_cutsensitive_1200f
+      - Int-Ata_prtreid_conservative_final_1200f
+    pair_sources:
+      - run: Int-Ata_prtreid_conservative_final_1200f
+        mechanism: prtreid_linking
+
+  - video_id: Inter-Juve
+    split: test
+    roster_path: costume-video/Inter-Juve/Inter-Juve.json
+    source_runs:
+      - Inter-Juve_scenecuts_loose_noreset_gkfallback_spreadgate_propagation_strict_linker_legacyappearance_1200f
+      - Inter-Juve_identity_evidence_patch_1200f
+
+  - video_id: Inter-Atalanta
+    split: external
+    roster_path: costume-video/Inter-Atalanta/Inter-Atalanta.json
+    source_runs:
+      - Inter-Atalanta_identity_evidence_v1_resetbytetrack_full

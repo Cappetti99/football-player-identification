@@ -1,4 +1,77 @@
-from ft.validation import _validate_prtreid_identity_bridge, _validate_prtreid_linking, validate_run_config
+from ft.validation import (
+    _validate_activity_segmentation,
+    _validate_jersey_frame_selection,
+    _validate_prtreid,
+    _validate_prtreid_identity_bridge,
+    _validate_prtreid_linking,
+    _validate_scene_cuts,
+    _validate_tracking,
+    validate_run_config,
+)
+
+
+def test_jersey_back_validation_rejects_apply_and_bad_score():
+    errors = []
+    _validate_jersey_frame_selection(
+        {
+            "enabled": True,
+            "model_type": "jersey_back_yolo11s_cls",
+            "mode": "apply",
+            "checkpoint": "model.pth",
+            "checkpoint_sha256": "a" * 64,
+            "batch_size": 1,
+            "top_k": 1,
+            "min_winner_votes": 1,
+            "min_frame_gap": 0,
+            "min_legibility_score": 0.5,
+            "min_selection_score": 1.1,
+            "min_margin": 0.0,
+            "allowed_roles": ["player"],
+        },
+        errors,
+    )
+    assert "jersey back YOLO classifier supports only audit/propose" in errors
+    assert "jersey_frame_selection.min_selection_score must be between 0 and 1" in errors
+
+
+def test_jersey_back_yolo_validation_accepts_propose():
+    errors = []
+    _validate_jersey_frame_selection(
+        {
+            "enabled": True,
+            "model_type": "jersey_back_yolo11s_cls",
+            "mode": "propose",
+            "checkpoint": "/tmp/model.pt",
+            "checkpoint_sha256": "a" * 64,
+            "batch_size": 32,
+            "top_k": 5,
+            "min_winner_votes": 2,
+            "min_frame_gap": 5,
+            "min_legibility_score": 0.5,
+            "min_selection_score": 0.0,
+            "min_margin": 0.0,
+            "allowed_roles": ["player"],
+        },
+        errors,
+    )
+    assert errors == []
+
+
+def test_activity_segmentation_validation_rejects_unsafe_values():
+    errors = []
+    _validate_activity_segmentation(
+        {
+            "enabled": True,
+            "smoothing_window": 0,
+            "count_change_threshold": 0,
+            "persistence_frames": 0,
+            "persistence_ratio": 0.4,
+            "min_segment_frames": 0,
+        },
+        errors,
+    )
+
+    assert len(errors) == 5
 
 
 def test_validation_reports_missing_inputs():
@@ -30,6 +103,51 @@ def test_validation_reports_missing_inputs():
     assert "calibration.tvcalib.path not found" in message
     assert "tracking.backend" in message
     assert "max_frames must be positive" in message
+
+
+def test_validation_rejects_removed_tracker_and_unsupported_scene_reset():
+    errors = []
+    _validate_tracking({"backend": "prtreid_strongsort"}, errors)
+    _validate_scene_cuts(
+        {"enabled": True, "tracking_reset_enabled": True, "threshold": 0.1},
+        {"backend": "strongsort"},
+        errors,
+    )
+
+    assert "tracking.backend must be bytetrack, got 'prtreid_strongsort'" in errors
+    assert "scene_cuts.tracking_reset_enabled=true requires tracking.backend=bytetrack" in errors
+
+
+def test_tracking_detection_enrichment_requires_prtreid():
+    errors = []
+    _validate_tracking(
+        {"backend": "bytetrack", "prtreid_detection_enrichment": True},
+        errors,
+        prtreid={"enabled": False},
+    )
+    assert errors == [
+        "tracking.prtreid_detection_enrichment=true requires prtreid.enabled=true"
+    ]
+
+
+def test_prtreid_detection_enrichment_suppresses_not_used_warning():
+    warnings = []
+    _validate_prtreid(
+        {
+            "enabled": True,
+            "batch_size": 1,
+            "image_width": 128,
+            "image_height": 256,
+            "download_weights": True,
+        },
+        {"embedding_mode": "hsv"},
+        {"enabled": False},
+        {"enabled": False},
+        [],
+        warnings,
+        tracking={"prtreid_detection_enrichment": True},
+    )
+    assert warnings == []
 
 
 def test_validation_can_reject_unknown_config_keys(tmp_path):

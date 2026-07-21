@@ -9,6 +9,19 @@ from ft.calibration.tvcalib_adapter import (
 )
 
 
+def test_gsr_centered_pitch_coordinate_conversion():
+    import importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "evaluate_ft_gsr.py"
+    spec = importlib.util.spec_from_file_location("evaluate_ft_gsr", script)
+    evaluator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluator)
+
+    assert evaluator.normalize_gt_pitch_point([0.0, 0.0], "soccernet_centered") == [52.5, 34.0]
+    assert evaluator.normalize_gt_pitch_point([-52.5, -34.0], "soccernet_centered") == [0.0, 0.0]
+
+
 def test_tvcalib_centered_homography_shifts_to_ft_pitch():
     h = tvcalib_homography_to_pitch(np.eye(3), pitch_length=105.0, pitch_width=68.0)
 

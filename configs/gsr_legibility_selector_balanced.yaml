@@ -1,0 +1,18 @@
+base_config: gsr_evaluation_control.yaml
+
+# Research-only upstream checkpoint, licensed CC BY-NC 3.0. This frozen
+# propose profile must be evaluated on GSR test without threshold tuning.
+jersey_frame_selection:
+  enabled: true
+  mode: propose
+  checkpoint: /home/cappetti/tools/jersey-number-pipeline/models/legibility_resnet34_soccer_20240215.pth
+  checkpoint_sha256: b9c61dabaea4a6ec99528c5ae394f5875aecb8207de38484eccb0f977a373e41
+  device: cuda
+  batch_size: 32
+  top_k: 5
+  min_legibility_score: 0.50
+  min_frame_gap: 5
+  min_winner_votes: 2
+  min_margin: 0.0
+  allowed_roles: [player]
+  gate_each_frame_role: true

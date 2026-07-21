@@ -1,0 +1,34 @@
+base_config: number_region_scene_reset_control_int_ata.yaml
+
+# Frozen best-known Int-Ata behaviour. Keep later experiments out of this
+# profile so it remains a reproducible reference configuration.
+scene_cuts:
+  enabled: true
+  threshold: 0.08
+  hard_cut_threshold: 0.12
+  min_gap: 40
+  tracking_reset_enabled: true
+  tracking_reset_hard_only: false
+
+activity_segmentation:
+  enabled: false
+
+identity:
+  assignment_scope: scene_segment
+  number_region_cost_enabled: false
+
+number_region:
+  enabled: true
+  audit_only: true
+
+identity_propagation:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: false
+
+prtreid_linking:
+  enabled: false
+
+prtreid_identity_bridge:
+  enabled: false

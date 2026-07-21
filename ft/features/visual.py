@@ -12,12 +12,14 @@ class VisualFeatureExtractor:
     Hungarian assignment a weak physical/visual cue.
     """
 
-    def __init__(self, cache_enabled=True, embedding_mode="hsv", prtreid_config=None):
+    def __init__(self, cache_enabled=True, embedding_mode="hsv", prtreid_config=None, prtreid_extractor=None):
         self.cache_enabled = bool(cache_enabled)
         self.embedding_mode = normalize_embedding_mode(embedding_mode)
         self.prtreid = None
         if self.embedding_mode == "prtreid":
-            self.prtreid = PRTReIDFeatureExtractor(**prtreid_extractor_config(prtreid_config or {}))
+            self.prtreid = prtreid_extractor or PRTReIDFeatureExtractor(
+                **prtreid_extractor_config(prtreid_config or {})
+            )
         self._cache = {}
         self.stats = {
             "cache_enabled": self.cache_enabled,

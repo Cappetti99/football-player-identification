@@ -1,13 +1,43 @@
 import numpy as np
 
 import ft.features.prtreid as prtreid_module
-from ft.features.prtreid import PRTReIDFeatureExtractor
+from ft.features.prtreid import PRTReIDFeatureExtractor, role_confidence
 from ft.features.visual import VisualFeatureExtractor, normalize_embedding_mode
 
 
 def test_visual_mode_accepts_prtreid():
     assert normalize_embedding_mode("prtreid") == "prtreid"
     assert normalize_embedding_mode("prt-reid") == "prtreid"
+
+
+def test_prtreid_role_confidence_is_softmax_probability():
+    logits = np.asarray([[0.0, 1.0, 3.0]], dtype=np.float32)
+    confidence = role_confidence(logits, 0)
+    expected = np.exp(3.0) / np.exp(logits[0]).sum()
+
+    assert 0.0 <= confidence <= 1.0
+    assert np.isclose(confidence, expected)
+
+
+def test_visual_extractor_reuses_injected_prtreid_model():
+    class ExistingExtractor:
+        def add_row_features(self, rows):
+            rows[0]["visual_embedding"] = [1.0, 0.0]
+
+        def diagnostics(self):
+            return {"backend": "prtreid", "computed": 1}
+
+    existing = ExistingExtractor()
+    extractor = VisualFeatureExtractor(
+        embedding_mode="prtreid",
+        prtreid_extractor=existing,
+    )
+    rows = [{}]
+
+    extractor.add_row_features(rows)
+
+    assert extractor.prtreid is existing
+    assert rows[0]["visual_embedding"] == [1.0, 0.0]
 
 
 def test_prtreid_extractor_populates_embedding_and_role(monkeypatch):

@@ -1,0 +1,6 @@
+base_config: gsr_jersey_back_yolo11s_propose_v1.yaml
+
+# Ranking-only ablation: same YOLO scores and top-k, but OCR receives the
+# original full-player crop. Compare this with the torso-crop configuration.
+jersey_frame_selection:
+  use_torso_crop: false

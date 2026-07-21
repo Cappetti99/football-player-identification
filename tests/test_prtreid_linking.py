@@ -43,8 +43,9 @@ def test_tracklet_prototype_is_attached_and_reused():
     assert features[0]["sample_count"] == 3
     assert features[0]["eligible"] is True
     for frame_tracks in tracks["players"]:
-        assert frame_tracks[1]["visual_embedding"] == [1.0, 0.0]
-        assert frame_tracks[1]["reid_sample_count"] == 3
+        assert frame_tracks[1]["prtreid_tracklet_embedding"] == [1.0, 0.0]
+        assert frame_tracks[1]["prtreid_tracklet_sample_count"] == 3
+        assert "visual_embedding" not in frame_tracks[1]
 
 
 def test_same_scene_link_requires_similarity_margin_and_mutual_nearest():
@@ -110,10 +111,9 @@ def make_tracks(rows, sample_count=4):
     for frame, track_id, embedding, segment, position in rows:
         frames[frame][track_id] = {
             "display_track_id": track_id,
-            "visual_embedding": embedding,
-            "reid_model": "prtreid" if embedding is not None else None,
-            "reid_sample_count": sample_count,
-            "reid_prototype_consistency": 0.99 if embedding is not None else None,
+            "prtreid_tracklet_embedding": embedding,
+            "prtreid_tracklet_sample_count": sample_count,
+            "prtreid_tracklet_consistency": 0.99 if embedding is not None else None,
             "team": 1,
             "team_confidence": 0.9,
             "scene_segment_id": segment,

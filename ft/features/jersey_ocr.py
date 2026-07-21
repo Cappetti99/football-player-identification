@@ -42,6 +42,8 @@ class JerseyOCR:
         mmocr_device=None,
         mmocr_det="dbnet_resnet18_fpnc_1200e_icdar2015",
         mmocr_rec="SAR",
+        mmocr_rec_weights=None,
+        mmocr_rec_weights_sha256=None,
         mmocr_batch_size=8,
         mmocr_direct_recognition=None,
         progress_every=5,
@@ -60,7 +62,14 @@ class JerseyOCR:
         demote_direct_only_single_digits=True,
         prefer_two_digit_candidates=True,
         digit_confusion_overrides=None,
+        strict_numeric_only=False,
+        frame_selector=None,
+        subject_filter=None,
+        prefix_consolidator=None,
     ):
+        # Backend configuration controls how candidates are proposed. It must
+        # remain separate from the voting thresholds that decide whether a
+        # proposal is strong enough to propagate over a display track.
         self.requested_backend_name = backend
         self.backend_name = backend
         self.min_confidence = float(min_confidence)
@@ -87,6 +96,22 @@ class JerseyOCR:
         self.mmocr_device = mmocr_device
         self.mmocr_det = str(mmocr_det)
         self.mmocr_rec = str(mmocr_rec)
+        self.mmocr_rec_weights = str(mmocr_rec_weights) if mmocr_rec_weights else None
+        self.mmocr_rec_weights_sha256 = (
+            str(mmocr_rec_weights_sha256).lower() if mmocr_rec_weights_sha256 else None
+        )
+        if self.mmocr_rec_weights:
+            weights_path = Path(self.mmocr_rec_weights)
+            if not weights_path.is_file():
+                raise FileNotFoundError(f"MMOCR recognizer weights not found: {weights_path}")
+            actual_sha256 = hash_file(weights_path)
+            if not self.mmocr_rec_weights_sha256:
+                raise ValueError("mmocr_rec_weights_sha256 is required with custom recognizer weights")
+            if actual_sha256.lower() != self.mmocr_rec_weights_sha256:
+                raise ValueError(
+                    "MMOCR recognizer weights SHA-256 mismatch: "
+                    f"expected {self.mmocr_rec_weights_sha256}, got {actual_sha256}"
+                )
         self.mmocr_batch_size = int(mmocr_batch_size)
         self.mmocr_direct_recognition = (
             bool(number_roi_enabled) if mmocr_direct_recognition is None else bool(mmocr_direct_recognition)
@@ -108,6 +133,12 @@ class JerseyOCR:
         self.demote_direct_only_single_digits = bool(demote_direct_only_single_digits)
         self.prefer_two_digit_candidates = bool(prefer_two_digit_candidates)
         self.digit_confusion_overrides = normalize_digit_confusion_overrides(digit_confusion_overrides)
+        self.strict_numeric_only = bool(strict_numeric_only)
+        self.frame_selector = frame_selector
+        self.subject_filter = subject_filter
+        self.prefix_consolidator = prefix_consolidator
+        # Cache OCR proposals, not final identities. Changing downstream voting
+        # can therefore reuse expensive recognition without freezing decisions.
         self.cache = JsonDiskCache(self.cache_dir, "jersey_ocr") if self.cache_enabled else DisabledCache()
         self.backend = None
         self.message = None
@@ -116,6 +147,14 @@ class JerseyOCR:
         self.template_message = None
 
     def recognize(self, rows):
+        """Read candidate crops and return conservative display-track votes.
+
+        ``rows`` are pre-identity artifact rows. The returned assignments are
+        keyed by display track (and optionally temporal segment); diagnostics
+        retain every raw detection so selection mistakes remain auditable.
+        """
+        # 1. Load only available recognizers. Missing optional dependencies do
+        # not crash the pipeline when another OCR/template backend can run.
         self.backends = self._load_backends()
         self.backend = self.backends[0]["reader"] if self.backends else None
         self.template_matcher = self._load_template_matcher()
@@ -131,9 +170,27 @@ class JerseyOCR:
                 "template_matching": self._template_diagnostics(),
                 "tracklets": {},
             }
+        # 2. Group by the stable display identity, never by the raw tracker ID.
+        # With segment_frames > 0, long tracks are deliberately split so scene
+        # changes cannot vote as one uninterrupted observation.
+        recognition_rows = list(rows)
+        if self.subject_filter is not None:
+            by_display = defaultdict(list)
+            for row in recognition_rows:
+                if row.get("crop_path"):
+                    display_id = int(row.get("display_track_id", row.get("track_id", 0)))
+                    by_display[display_id].append(row)
+            effective_ids = set()
+            for display_id, display_rows in sorted(by_display.items()):
+                effective_ids.update(id(row) for row in self.subject_filter.filter(display_id, display_rows))
+            recognition_rows = [
+                row for row in recognition_rows
+                if not row.get("crop_path") or id(row) in effective_ids
+            ]
         grouped = defaultdict(list)
-        for row in rows:
-            if row.get("crop_path") and is_ocr_player_row(row):
+        for row in recognition_rows:
+            selector_enabled = self.frame_selector is not None
+            if row.get("crop_path") and (selector_enabled or is_ocr_player_row(row)):
                 grouped[jersey_group_key(row, self.segment_frames)].append(row)
         assignments = {}
         diagnostics = {}
@@ -146,18 +203,26 @@ class JerseyOCR:
         )
         for index, (track_id, items) in enumerate(grouped_items, start=1):
             display_id, segment_index = split_jersey_group_key(track_id)
+            # 3. Select temporally spread crops. Consecutive video frames are
+            # highly correlated and should not count as independent evidence.
             usable_items = filter_quality_items(items, self.min_crop_quality)
             selected = []
             detections = []
-            for pass_index in range(self.temporal_passes):
+            selector_rows = None
+            if self.frame_selector is not None:
+                selector_rows = self.frame_selector.select(
+                    display_id, items, min_crop_quality=self.min_crop_quality
+                )
+            use_selector = self.frame_selector is not None and self.frame_selector.mode in {"propose", "apply"}
+            legacy_usable_items = [row for row in usable_items if is_ocr_player_row(row)]
+            passes = 1 if use_selector else self.temporal_passes
+            for pass_index in range(passes):
                 # Each pass samples a different temporal offset. This gives long
                 # tracklets several chances to expose the jersey without reading
                 # every crop in a long broadcast sequence.
-                pass_rows = select_spread_crops(
-                    usable_items,
-                    self.max_crops_per_tracklet,
-                    pass_index=pass_index,
-                    pass_count=self.temporal_passes,
+                pass_rows = selector_rows if use_selector else select_spread_crops(
+                    legacy_usable_items, self.max_crops_per_tracklet,
+                    pass_index=pass_index, pass_count=self.temporal_passes,
                 )
                 for row in pass_rows:
                     selected.append((pass_index, row))
@@ -169,12 +234,34 @@ class JerseyOCR:
                 min_weight=self.crop_quality_min_vote_weight,
                 power=self.crop_quality_vote_power,
             )
+            # 4. Collapse augmentations/backends at crop level before voting;
+            # otherwise one image processed five ways would look like five
+            # independent observations of the jersey.
             voting_detections = self._voting_detections(detections)
             voted = vote_numbers(
                 voting_detections,
                 min_raw_confidence=self.min_raw_confidence,
                 digit_confusion_overrides=self.digit_confusion_overrides,
             )
+            if self.prefix_consolidator is not None:
+                prefix_min_margin = (
+                    self.frame_selector.min_margin
+                    if use_selector else self.min_winner_margin
+                )
+                prefix_min_votes = (
+                    self.frame_selector.min_winner_votes
+                    if use_selector else self.min_votes
+                )
+                voted = self.prefix_consolidator.consolidate(
+                    display_id,
+                    voting_detections,
+                    vote_numbers,
+                    min_raw_confidence=self.min_raw_confidence,
+                    digit_confusion_overrides=self.digit_confusion_overrides,
+                    min_margin=prefix_min_margin,
+                    min_votes=prefix_min_votes,
+                    segment_index=segment_index,
+                )
             decision = ocr_decision_diagnostics(
                 detections,
                 voting_detections,
@@ -182,6 +269,11 @@ class JerseyOCR:
                 min_votes=self.min_votes,
                 min_raw_confidence=self.min_raw_confidence,
             )
+            selector_accepted = None
+            if self.frame_selector is not None:
+                selector_accepted = self.frame_selector.accept_decision(
+                    display_id, voted if use_selector else None, len(selector_rows or [])
+                )
             diagnostics[diagnostic_key(track_id)] = {
                 "display_track_id": int(display_id),
                 "segment_index": segment_index,
@@ -209,7 +301,12 @@ class JerseyOCR:
                 "voted": voted,
                 "decision": decision,
             }
-            if voted and voted["votes"] >= self.min_votes:
+            # 5. Abstain unless independent evidence reaches the configured
+            # minimum. Unknown is safer than propagating one accidental digit.
+            accepted = bool(voted and voted["votes"] >= self.min_votes)
+            if use_selector:
+                accepted = bool(selector_accepted)
+            if accepted:
                 voted["display_track_id"] = int(display_id)
                 voted["segment_index"] = segment_index
                 voted["segment_start_frame"] = segment_start_frame(segment_index, self.segment_frames)
@@ -247,6 +344,8 @@ class JerseyOCR:
                 "device": self.mmocr_device,
                 "det": self.mmocr_det,
                 "rec": self.mmocr_rec,
+                "rec_weights": self.mmocr_rec_weights,
+                "rec_weights_sha256": self.mmocr_rec_weights_sha256,
                 "batch_size": self.mmocr_batch_size,
                 "direct_recognition": self.mmocr_direct_recognition,
             },
@@ -267,6 +366,7 @@ class JerseyOCR:
             },
             "segment_frames": self.segment_frames,
             "voting_policy": {
+                "strict_numeric_only": self.strict_numeric_only,
                 "demote_direct_only_single_digits": self.demote_direct_only_single_digits,
                 "prefer_two_digit_candidates": self.prefer_two_digit_candidates,
                 "digit_confusion_overrides": self.digit_confusion_overrides,
@@ -278,6 +378,18 @@ class JerseyOCR:
             "template_matching": self._template_diagnostics(),
             "tracklets": diagnostics,
             "assigned_tracklets": {diagnostic_key(k): v for k, v in assignments.items()},
+            "frame_selection": (
+                self.frame_selector.diagnostics() if self.frame_selector is not None
+                else {"enabled": False, "status": "disabled"}
+            ),
+            "subject_filter": (
+                self.subject_filter.diagnostics() if self.subject_filter is not None
+                else {"enabled": False, "status": "disabled"}
+            ),
+            "prefix_consolidation": (
+                self.prefix_consolidator.diagnostics() if self.prefix_consolidator is not None
+                else {"enabled": False, "status": "disabled"}
+            ),
         }
 
     def _voting_detections(self, detections):
@@ -324,6 +436,7 @@ class JerseyOCR:
                 device=self.mmocr_device or ("cuda:0" if self.easyocr_gpu else "cpu"),
                 det=self.mmocr_det,
                 rec=self.mmocr_rec,
+                rec_weights=self.mmocr_rec_weights,
                 batch_size=self.mmocr_batch_size,
                 direct_recognition=self.mmocr_direct_recognition,
             )
@@ -331,6 +444,7 @@ class JerseyOCR:
             return MMOCRRecognitionBackend(
                 device=self.mmocr_device or ("cuda:0" if self.easyocr_gpu else "cpu"),
                 rec=self.mmocr_rec,
+                rec_weights=self.mmocr_rec_weights,
                 batch_size=self.mmocr_batch_size,
             )
         if backend == "easyocr":
@@ -523,8 +637,11 @@ class JerseyOCR:
             "template_max_candidates": self.template_max_candidates,
             "mmocr_det": self.mmocr_det,
             "mmocr_rec": self.mmocr_rec,
+            "mmocr_rec_weights": self.mmocr_rec_weights,
+            "mmocr_rec_weights_sha256": self.mmocr_rec_weights_sha256,
             "mmocr_direct_recognition": self.mmocr_direct_recognition,
             "direct_recognition_variant_policy": "number_roi_regions_v2",
+            "strict_numeric_only": self.strict_numeric_only,
             "demote_direct_only_single_digits": self.demote_direct_only_single_digits,
             "prefer_two_digit_candidates": self.prefer_two_digit_candidates,
             "number_roi_enabled": self.number_roi_enabled,
@@ -586,7 +703,7 @@ class JerseyOCR:
                 raw = []
             for item in raw:
                 text, confidence, ocr_channel = normalize_ocr_result(item)
-                number = parse_number(text)
+                number = parse_number(text, strict_numeric_only=self.strict_numeric_only)
                 detections.append(
                     {
                         "source": backend_name,
@@ -678,12 +795,14 @@ class MMOCRBackend:
         device="cuda:0",
         det="dbnet_resnet18_fpnc_1200e_icdar2015",
         rec="SAR",
+        rec_weights=None,
         batch_size=8,
         direct_recognition=False,
     ):
         self.device = device
         self.det = normalize_mmocr_model_name(det, task="det")
         self.rec = normalize_mmocr_model_name(rec, task="rec")
+        self.rec_weights = str(rec_weights) if rec_weights else None
         self.batch_size = int(batch_size)
         self.direct_recognition = bool(direct_recognition)
         self.mode = "mmocr_inferencer"
@@ -694,14 +813,19 @@ class MMOCRBackend:
             # end-to-end text detection + recognition in MMOCR 1.x. It also
             # returns serializable rec_texts/rec_scores, which keeps our OCR
             # diagnostics independent from MMOCR's internal datasample objects.
-            self.inferencer = MMOCRInferencer(det=self.det, rec=self.rec, device=device)
+            self.inferencer = MMOCRInferencer(
+                det=self.det, rec=self.rec,
+                rec_weights=self.rec_weights, device=device,
+            )
         except Exception:
             self.mode = "standard_inferencers"
             from mmocr.apis import TextDetInferencer, TextRecInferencer
             from mmocr.utils import bbox2poly, crop_img, poly2bbox
 
             self.textdetinferencer = TextDetInferencer(self.det, device=device)
-            self.textrecinferencer = TextRecInferencer(self.rec, device=device)
+            self.textrecinferencer = TextRecInferencer(
+                model=self.rec, weights=self.rec_weights, device=device
+            )
             self.bbox2poly = bbox2poly
             self.crop_img = crop_img
             self.poly2bbox = poly2bbox
@@ -783,20 +907,25 @@ class MMOCRBackend:
 class MMOCRRecognitionBackend:
     uses_text_detection = False
 
-    def __init__(self, device="cuda:0", rec="SAR", batch_size=8):
+    def __init__(self, device="cuda:0", rec="SAR", rec_weights=None, batch_size=8):
         self.device = device
         self.rec = normalize_mmocr_model_name(rec, task="rec")
+        self.rec_weights = str(rec_weights) if rec_weights else None
         self.batch_size = int(batch_size)
         try:
             from mmocr.apis import MMOCRInferencer
 
             self.mode = "mmocr_inferencer"
-            self.inferencer = MMOCRInferencer(rec=self.rec, device=device)
+            self.inferencer = MMOCRInferencer(
+                rec=self.rec, rec_weights=self.rec_weights, device=device
+            )
         except Exception:
             self.mode = "standard_inferencer"
             from mmocr.apis import TextRecInferencer
 
-            self.textrecinferencer = TextRecInferencer(self.rec, device=device)
+            self.textrecinferencer = TextRecInferencer(
+                model=self.rec, weights=self.rec_weights, device=device
+            )
 
     def read(self, image):
         image = np.asarray(image)
@@ -926,7 +1055,9 @@ def call_mmocr_inferencer_quiet(inferencer, inputs, **kwargs):
     }
     try:
         return inferencer(inputs, **quiet_kwargs)
-    except TypeError:
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and "unknown argument" not in str(exc).lower():
+            raise
         return inferencer(inputs, **kwargs)
 
 
@@ -1384,17 +1515,22 @@ def diagnostic_key(key):
     return str(int(key))
 
 
-def parse_number(text):
+def parse_number(text, strict_numeric_only=False):
     if text is None:
         return None
-    # MMOCR's SoccerNet baseline keeps digit characters and truncates to two
-    # digits because football jersey numbers are bounded to 1..99. Doing the
-    # same here lets reads like "17I" still contribute "17" without accepting
-    # zero or impossible jersey values.
-    match = re.search(r"\d+", str(text))
-    if not match:
-        return None
-    value = int(match.group(0)[:2])
+    normalized = str(text).strip()
+    if strict_numeric_only:
+        # EasyOCR/Tesseract decode with a numeric allowlist. MMOCR/SAR uses a
+        # generic pretrained dictionary that cannot be replaced without a new
+        # classifier head/checkpoint, so reject mixed or overlong strings here.
+        if re.fullmatch(r"\d{1,2}", normalized) is None:
+            return None
+        value = int(normalized)
+    else:
+        match = re.search(r"\d+", normalized)
+        if not match:
+            return None
+        value = int(match.group(0)[:2])
     if value < 1 or value > 99:
         return None
     return value

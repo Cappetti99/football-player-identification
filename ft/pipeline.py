@@ -1,4 +1,18 @@
+"""End-to-end orchestration for football tracking and player identity.
+
+The main data flow is intentionally linear::
+
+    video -> detections/tracks -> stable display tracks -> semantic evidence
+          -> jersey/visual evidence -> conservative identity -> artifacts
+
+Most domain algorithms live in dedicated modules. This file coordinates their
+order, copies results between frame rows and tracks, and records diagnostics.
+When reading the project, start with ``run_pipeline`` and follow the stage
+blocks in ``_run_pipeline_impl`` from top to bottom.
+"""
+
 from collections import Counter
+from dataclasses import dataclass
 import gc
 from pathlib import Path
 
@@ -9,7 +23,11 @@ from ft.config import load_config
 from ft.export.artifacts import ArtifactExporter, write_json, write_table
 from ft.features.groups import SemanticGroupAssigner
 from ft.features.goalkeeper import GoalkeeperAppearanceAssigner, goalkeeper_color_ranges_by_team_from_roster
-from ft.features.jersey_ocr import JerseyOCR
+from ft.features.jersey_ocr import JerseyOCR, diagnostic_key
+from ft.features.jersey_prefix_consolidation import JerseyPrefixConsolidator
+from ft.features.jersey_region_ctc_audit import JerseyRegionCTCAuditor
+from ft.features.jersey_subject_filter import JerseySubjectFilter
+from ft.features.jersey_frame_selector import JerseyFrameSelector, predicted_role
 from ft.features.number_region import NumberRegionAuditor
 from ft.features.referee import RefereeAppearanceAssigner, referee_color_ranges_from_roster
 from ft.features.roster_aware_ocr import RosterAwareOCRFilter
@@ -22,26 +40,56 @@ from ft.identity.candidates import build_identity_candidates, apply_identity_can
 from ft.identity.constraints import enforce_identity_constraints
 from ft.identity.evidence import build_tracklet_evidence, identity_evidence_rows
 from ft.identity.hungarian import HungarianPlayerIdentifier, apply_assignments
-from ft.identity.gate_audit import build_identity_gate_audit
+from ft.identity.gate_audit import build_final_identity_states, build_identity_gate_audit
 from ft.identity.prtreid_bridge import PRTReIDIdentityBridge
 from ft.identity.propagation import IdentityPropagationEngine, propagation_rows
 from ft.identity.roster import load_roster, validate_unique_team_jersey
 from ft.linking.jersey_identity_linker import JerseyIdentityLinker
-from ft.linking.tracklet_linker import TrackletLinker
+from ft.linking.tracklet_linker import TrackletLinker, tracklet_linker_config
 from ft.linking.prtreid_tracklet_linker import PRTReIDTrackletLinker
 from ft.tracking.yolo_bytetrack import YoloByteTracker
-from ft.tracking.yolo_strongsort import YoloStrongSortTracker
+from ft.tracking.prtreid_enricher import PRTReIDDetectionEnricher
 from ft.utils.run_diagnostics import RunDiagnostics
 from ft.utils.geometry import bbox_center
+from ft.utils.activity_segments import (
+    activity_segment_rows,
+    annotate_tracks_with_activity_segments,
+    detect_activity_segments,
+)
 from ft.utils.scene_cuts import (
     annotate_tracks_with_scene_segments,
     detect_scene_cuts,
     scene_cut_rows,
+    select_tracking_reset_frames,
 )
 from ft.utils.video import read_video, save_video
 from ft.utils.wandb_logger import WandbLogger
 from ft.validation import validate_run_config
 from ft.visualization.overlay import draw_overlay
+
+
+@dataclass(frozen=True)
+class RunSetup:
+    """Immutable resources established before video processing starts."""
+
+    video_path: str
+    model_path: str
+    output_path: str
+    artifacts_dir: Path
+    video_id: str
+    roster: list
+    diagnostics: RunDiagnostics
+
+
+@dataclass(frozen=True)
+class TemporalAnalysis:
+    """Scene boundaries consumed by tracking and activity segmentation."""
+
+    diagnostics: dict
+    scene_cut_frames: list
+    tracking_reset_frames: list
+    hard_scene_cut_frames: list
+    soft_scene_cut_frames: list
 
 
 def run_pipeline(config):
@@ -64,60 +112,178 @@ def run_pipeline(config):
     return result
 
 
-def _run_pipeline_impl(config):
+def initialize_run(config):
+    """Validate inputs and create immutable resources shared by all phases."""
     video_path = config["video_path"]
-    model_path = config["model_path"]
-    output_path = config["output_path"]
     artifacts_dir = Path(config["artifacts_dir"])
     video_id = Path(video_path).stem
     if config.get("run", {}).get("validate_inputs", True):
         validate_run_config(config)
-    run_diagnostics = RunDiagnostics(artifacts_dir, video_id)
-    run_diagnostics.write_manifest(config)
 
+    diagnostics = RunDiagnostics(artifacts_dir, video_id)
+    diagnostics.write_manifest(config)
     roster = load_roster(config.get("roster_path"))
     if config["identity"].get("enforce_unique_team_jersey", True):
         validate_unique_team_jersey(roster)
 
-    print(f"FT video: {video_path}", flush=True)
-    print(f"FT model: {model_path}", flush=True)
-    with run_diagnostics.stage("read_video"):
-        frames = read_video(video_path, max_frames=config.get("max_frames"))
-    if not frames:
-        raise RuntimeError(f"No frames read from {video_path}")
-    print(f"FT video frames: {len(frames)}", flush=True)
+    return RunSetup(
+        video_path=video_path,
+        model_path=config["model_path"],
+        output_path=config["output_path"],
+        artifacts_dir=artifacts_dir,
+        video_id=video_id,
+        roster=roster,
+        diagnostics=diagnostics,
+    )
 
-    scene_cut_diagnostics = {"enabled": False, "status": "disabled", "cuts": [], "cut_frames": [], "segments": []}
+
+def read_video_phase(config, setup):
+    """Load frames once; downstream phases share the same in-memory images."""
+    print(f"FT video: {setup.video_path}", flush=True)
+    print(f"FT model: {setup.model_path}", flush=True)
+    with setup.diagnostics.stage("read_video"):
+        frames = read_video(setup.video_path, max_frames=config.get("max_frames"))
+    if not frames:
+        raise RuntimeError(f"No frames read from {setup.video_path}")
+    print(f"FT video frames: {len(frames)}", flush=True)
+    return frames
+
+
+def analyze_temporal_structure(config, frames, run_diagnostics):
+    """Detect scene boundaries and derive reset/hard/soft frame sets."""
+    diagnostics = {
+        "enabled": False,
+        "status": "disabled",
+        "cuts": [],
+        "cut_frames": [],
+        "segments": [],
+    }
     scene_cut_frames = []
-    if config.get("scene_cuts", {}).get("enabled", False):
+    scene_cfg = config.get("scene_cuts", {})
+    if scene_cfg.get("enabled", False):
         with run_diagnostics.stage("scene_cuts"):
-            scene_cut_diagnostics = detect_scene_cuts(frames, **scene_cut_config(config))
-            scene_cut_frames = [int(frame) for frame in scene_cut_diagnostics.get("cut_frames", [])]
+            diagnostics = detect_scene_cuts(frames, **scene_cut_config(config))
+            scene_cut_frames = [
+                int(frame) for frame in diagnostics.get("cut_frames", [])
+            ]
         print(
             "FT scene cuts:"
             f" cuts={len(scene_cut_frames)}"
-            f" reset_tracking={config.get('scene_cuts', {}).get('tracking_reset_enabled', False)}",
+            f" reset_tracking={scene_cfg.get('tracking_reset_enabled', False)}",
             flush=True,
         )
 
+    tracking_reset_frames = select_tracking_reset_frames(
+        diagnostics,
+        hard_only=scene_cfg.get("tracking_reset_hard_only", False),
+    )
+    hard_scene_cut_frames = select_tracking_reset_frames(diagnostics, hard_only=True)
+    soft_scene_cut_frames = sorted(
+        set(scene_cut_frames) - set(hard_scene_cut_frames)
+    )
+    if scene_cfg.get("tracking_reset_enabled", False):
+        print(
+            "FT scene cuts:"
+            f" tracker_reset_frames={len(tracking_reset_frames)}"
+            f" hard_only={scene_cfg.get('tracking_reset_hard_only', False)}",
+            flush=True,
+        )
+    return TemporalAnalysis(
+        diagnostics=diagnostics,
+        scene_cut_frames=scene_cut_frames,
+        tracking_reset_frames=tracking_reset_frames,
+        hard_scene_cut_frames=hard_scene_cut_frames,
+        soft_scene_cut_frames=soft_scene_cut_frames,
+    )
+
+
+def tracking_phase(config, frames, model_path, temporal, run_diagnostics):
+    """Run tracking, then annotate scene and activity segment membership."""
+    # A raw track_id belongs to the tracker; later linking may map several raw
+    # IDs to one stable display_track_id.
     with run_diagnostics.stage("tracking"):
         tracker = build_tracker(config, model_path)
         tracks = run_tracker_with_scene_cuts(
             tracker,
             frames,
-            scene_cut_frames=scene_cut_frames,
-            reset_enabled=config.get("scene_cuts", {}).get("tracking_reset_enabled", False),
+            scene_cut_frames=temporal.tracking_reset_frames,
+            reset_enabled=config.get("scene_cuts", {}).get(
+                "tracking_reset_enabled", False
+            ),
         )
     annotate_tracks_with_scene_segments(
         tracks,
-        scene_cut_frames,
-        scene_cut_lookup={int(row["frame"]): row for row in scene_cut_diagnostics.get("cuts", [])},
+        temporal.scene_cut_frames,
+        scene_cut_lookup={
+            int(row["frame"]): row
+            for row in temporal.diagnostics.get("cuts", [])
+        },
     )
+    with run_diagnostics.stage("activity_segmentation"):
+        activity_diagnostics = detect_activity_segments(
+            tracks,
+            hard_boundary_frames=temporal.hard_scene_cut_frames,
+            soft_boundary_frames=temporal.soft_scene_cut_frames,
+            **config.get("activity_segmentation", {}),
+        )
+        annotate_tracks_with_activity_segments(tracks, activity_diagnostics)
+    print(
+        "FT activity segments:"
+        f" segments={len(activity_diagnostics.get('segments', []))}"
+        f" hard={activity_diagnostics.get('hard_boundary_count', 0)}"
+        f" soft={activity_diagnostics.get('soft_boundary_count', 0)}",
+        flush=True,
+    )
+    return tracks, activity_diagnostics
 
+
+def calibration_phase(config, frames, tracks, run_diagnostics):
+    """Attach pitch coordinates to tracks while preserving pixel geometry."""
     with run_diagnostics.stage("calibration"):
         calibrator = PitchTransform.from_config(config["calibration"], frames)
         calibrator.apply_tracks(tracks)
     print(f"FT calibration: {calibrator.source}", flush=True)
+    return calibrator
+
+
+def render_output_phase(config, frames, tracks, output_path, run_diagnostics):
+    """Draw the final overlay and encode the annotated video."""
+    with run_diagnostics.stage("overlay"):
+        output_frames = draw_overlay(frames, tracks, config=config.get("overlay", {}))
+    with run_diagnostics.stage("save_video"):
+        save_video(
+            output_frames,
+            output_path,
+            fps=config["tracking"].get("frame_rate", 25),
+        )
+
+
+def _run_pipeline_impl(config):
+    """Execute one video run; each diagnostics stage is a pipeline phase."""
+    setup = initialize_run(config)
+    frames = read_video_phase(config, setup)
+    temporal = analyze_temporal_structure(config, frames, setup.diagnostics)
+    tracks, activity_diagnostics = tracking_phase(
+        config,
+        frames,
+        setup.model_path,
+        temporal,
+        setup.diagnostics,
+    )
+    calibrator = calibration_phase(config, frames, tracks, setup.diagnostics)
+
+    # Keep frequently used immutable resources local in the orchestrator. The
+    # phase functions above return their products instead of mutating a global
+    # context object.
+    video_path = setup.video_path
+    model_path = setup.model_path
+    output_path = setup.output_path
+    artifacts_dir = setup.artifacts_dir
+    video_id = setup.video_id
+    roster = setup.roster
+    run_diagnostics = setup.diagnostics
+    scene_cut_diagnostics = temporal.diagnostics
+    scene_cut_frames = temporal.scene_cut_frames
 
     # First colour pass: gives the linker early team/role context. These labels
     # are allowed to be imperfect because a second pass runs after display IDs
@@ -142,11 +308,8 @@ def _run_pipeline_impl(config):
 
     if config["linking"].get("enabled", True):
         with run_diagnostics.stage("linking"):
-            linking_cfg = {
-                k: v
-                for k, v in config["linking"].items()
-                if k not in {"enabled", "embedding_mode"}
-            }
+            linking_cfg = tracklet_linker_config(config["linking"])
+            linking_cfg["calibration_source"] = calibrator.source
             linker = TrackletLinker(**linking_cfg)
             linker.apply(tracks, frames=frames)
             linking_diagnostics = linker.diagnostics
@@ -154,7 +317,10 @@ def _run_pipeline_impl(config):
         TrackletLinker.ensure_display_ids(tracks)
         linking_diagnostics = {"enabled": False, "status": "disabled"}
 
+    # Phase 4 — optional linking/re-identification. These components are kept
+    # behind feature flags because a weak merge is harder to undo than a split.
     visual_extractor = None
+    prtreid_extractor = None
     prtreid_tracklet_features = []
     prtreid_linking_diagnostics = {"enabled": False, "status": "disabled"}
     prtreid_bridge_cfg = config.get("prtreid_identity_bridge", {})
@@ -217,6 +383,8 @@ def _run_pipeline_impl(config):
             flush=True,
         )
 
+    # Phase 5 — settle the semantic group before extracting identity evidence.
+    # OCR must not treat referees or unrelated detections as ordinary players.
     with run_diagnostics.stage("semantic_groups"):
         semantic_groups = SemanticGroupAssigner().apply(tracks)
 
@@ -229,6 +397,17 @@ def _run_pipeline_impl(config):
         save_crops=config.get("export", {}).get("save_crops", True),
         deduplicate_crops=config.get("export", {}).get("deduplicate_crops", True),
     )
+    if (
+        config.get("export", {}).get("save_detections_json", False)
+        or config.get("export", {}).get("save_detections_csv", False)
+    ):
+        with run_diagnostics.stage("export_detections"):
+            exporter.export_detections(
+                frames,
+                tracks,
+                save_json=config.get("export", {}).get("save_detections_json", False),
+                save_csv=config.get("export", {}).get("save_detections_csv", False),
+            )
     with run_diagnostics.stage("export_pre_identity"):
         rows = exporter.export_tracklets(
             frames,
@@ -246,6 +425,7 @@ def _run_pipeline_impl(config):
                 cache_enabled=visual_cfg.get("cache_enabled", True),
                 embedding_mode=visual_cfg.get("embedding_mode", "hsv"),
                 prtreid_config=config.get("prtreid", {}),
+                prtreid_extractor=prtreid_extractor,
             )
         visual_extractor.add_row_features(player_rows)
         if config.get("prtreid", {}).get("role_enabled", False):
@@ -258,6 +438,8 @@ def _run_pipeline_impl(config):
             apply_prtreid_team_clusters(player_rows, tracks)
     _copy_row_features_to_tracks(player_rows, tracks)
 
+    # Phase 6 — evidence extraction. Number-region audit is diagnostic; the
+    # regular jersey OCR path below is the source that may update tracks.
     number_region_detections = []
     number_region_evidence = []
     number_region_diagnostics = {"enabled": False, "audit_only": True, "status": "disabled"}
@@ -273,12 +455,16 @@ def _run_pipeline_impl(config):
                 overrides={
                     "number_roi_enabled": False,
                     "mmocr_direct_recognition": True,
-                    "max_crops_per_tracklet": max(1, len(player_rows)),
+                    "max_crops_per_tracklet": (
+                        int(region_cfg.get("max_regions_per_tracklet") or 0)
+                        or max(1, len(player_rows))
+                    ),
                     "temporal_passes": 1,
                     "min_crop_quality": 0.0,
                     "min_votes": 1,
                     "roster_aware": False,
                 },
+                research_filters=False,
             )
             auditor = NumberRegionAuditor(
                 output_dir=artifacts_dir / "number_region_crops" / video_id,
@@ -305,6 +491,8 @@ def _run_pipeline_impl(config):
 
     segment_jersey_candidates = []
     segment_jersey_diagnostics = {"enabled": False, "status": "disabled"}
+    secondary_ocr_diagnostics = {"enabled": False, "status": "disabled"}
+    region_ctc_diagnostics = {"enabled": False, "status": "disabled", "identity_mutations": 0}
     if config["jersey_ocr"].get("enabled", False):
         with run_diagnostics.stage("jersey_ocr"):
             ocr = build_jersey_ocr(
@@ -315,6 +503,74 @@ def _run_pipeline_impl(config):
                 segment_frames=config["jersey_ocr"].get("segment_frames", 0),
             )
             jersey_assignments, jersey_diagnostics = ocr.recognize(player_rows)
+            secondary_cfg = config.get("jersey_ocr_secondary_audit", {})
+            if secondary_cfg.get("enabled", False):
+                with run_diagnostics.stage("jersey_ocr_secondary_audit"):
+                    secondary_ocr = build_jersey_ocr(
+                        config,
+                        artifacts_dir,
+                        video_id,
+                        debug_subdir=f"{video_id}_secondary_audit",
+                        segment_frames=config["jersey_ocr"].get("segment_frames", 0),
+                        overrides={
+                            key: value
+                            for key, value in secondary_cfg.items()
+                            if key not in {"enabled", "mode"}
+                        },
+                        research_filters=False,
+                    )
+                    secondary_assignments, secondary_ocr_diagnostics = secondary_ocr.recognize(
+                        player_rows
+                    )
+                    secondary_ocr_diagnostics["mode"] = str(
+                        secondary_cfg.get("mode", "audit")
+                    ).lower()
+                    secondary_ocr_diagnostics["identity_mutations"] = 0
+                    secondary_ocr_diagnostics["proposal_policy"] = {
+                        "min_votes": int(secondary_cfg.get("min_votes", 4)),
+                        "min_winner_margin": float(
+                            secondary_cfg.get("min_winner_margin", 0.08)
+                        ),
+                    }
+                    secondary_proposals = secondary_ocr_proposals(
+                        secondary_assignments,
+                        min_votes=secondary_cfg.get("min_votes", 4),
+                        min_winner_margin=secondary_cfg.get("min_winner_margin", 0.08),
+                    )
+                    secondary_ocr_diagnostics["proposals"] = secondary_proposals
+                    secondary_ocr_diagnostics["comparison_to_primary"] = compare_ocr_assignments(
+                        jersey_assignments, secondary_proposals
+                    )
+                    print(
+                        "FT secondary jersey OCR:"
+                        f" mode={secondary_ocr_diagnostics['mode']}"
+                        f" proposals={len(secondary_ocr_diagnostics['proposals'])}"
+                        " identity_mutations=0",
+                        flush=True,
+                    )
+            region_ctc_cfg = config.get("jersey_region_ctc_audit", {})
+            if region_ctc_cfg.get("enabled", False):
+                with run_diagnostics.stage("jersey_region_ctc_audit"):
+                    region_ctc_auditor = JerseyRegionCTCAuditor(**{
+                        key: value
+                        for key, value in region_ctc_cfg.items()
+                        if key not in {"enabled", "mode", "audit_only"}
+                    })
+                    region_ctc_diagnostics = region_ctc_auditor.run(
+                        jersey_diagnostics,
+                        jersey_assignments,
+                        frame_selection_rows=list(
+                            getattr(getattr(ocr, "frame_selector", None), "selection_rows", [])
+                        ),
+                    )
+                    print(
+                        "FT jersey region CTC audit:"
+                        f" selected={region_ctc_diagnostics.get('selected_crops', 0)}"
+                        f" regions={region_ctc_diagnostics.get('detected_regions', 0)}"
+                        f" tracklets={region_ctc_diagnostics.get('tracklets_with_prediction', 0)}"
+                        " identity_mutations=0",
+                        flush=True,
+                    )
             for assignment in (jersey_assignments or {}).values():
                 if assignment.get("raw_jersey_distribution") is None:
                     assignment["raw_jersey_distribution"] = assignment.get("candidates")
@@ -339,7 +595,48 @@ def _run_pipeline_impl(config):
                 apply_to_goalkeepers=config["jersey_ocr"].get("apply_to_goalkeepers", False),
             )
             jersey_diagnostics["goalkeeper_ocr_filter"] = goalkeeper_ocr_diagnostics
-            _apply_jersey(jersey_assignments, player_rows, tracks)
+            selector_cfg = config.get("jersey_frame_selection", {})
+            selector_mode = str(selector_cfg.get("mode", "audit")).lower()
+            subject_cfg = config.get("jersey_subject_filter", {})
+            prefix_cfg = config.get("jersey_prefix_consolidation", {})
+            observational_propose = any(
+                cfg.get("enabled", False) and str(cfg.get("mode", "audit")).lower() == "propose"
+                for cfg in (selector_cfg, subject_cfg, prefix_cfg)
+            )
+            if not observational_propose and (
+                not selector_cfg.get("enabled", False) or selector_mode in {"audit", "apply"}
+            ):
+                _apply_jersey(
+                    jersey_assignments,
+                    player_rows,
+                    tracks,
+                    allowed_roles=(
+                        selector_cfg.get("allowed_roles", ["player"])
+                        if selector_cfg.get("enabled", False)
+                        and selector_mode == "apply"
+                        and selector_cfg.get("gate_each_frame_role", True)
+                        else None
+                    ),
+                )
+            frame_selector = getattr(ocr, "frame_selector", None)
+            if frame_selector is not None:
+                allowed = set(selector_cfg.get("allowed_roles", ["player"]))
+                applied_lookup = build_jersey_assignment_lookup(jersey_assignments)
+                for decision in frame_selector.decision_rows:
+                    decision["applied_rows"] = (
+                        sum(
+                            str(row.get("display_track_id", row.get("track_id")))
+                            == str(decision["display_track_id"])
+                            and row_jersey_assignment(row, applied_lookup) is not None
+                            and (
+                                not selector_cfg.get("gate_each_frame_role", True)
+                                or predicted_role(row) in allowed
+                            )
+                            for row in player_rows
+                        )
+                        if selector_mode == "apply" and decision.get("accepted")
+                        else 0
+                    )
             print(
                 "FT jersey OCR:"
                 f" status={jersey_diagnostics.get('status')}"
@@ -349,6 +646,19 @@ def _run_pipeline_impl(config):
                 flush=True,
             )
         segment_candidate_frames = int(config["jersey_ocr"].get("segment_candidate_frames") or 0)
+        if (
+            any(
+                cfg.get("enabled", False) and str(cfg.get("mode", "audit")).lower() == "propose"
+                for cfg in (
+                    config.get("jersey_frame_selection", {}),
+                    config.get("jersey_subject_filter", {}),
+                    config.get("jersey_prefix_consolidation", {}),
+                )
+            )
+        ):
+            # Propose mode is observational: it must not feed the later segment
+            # identity fallback even when a parent config enables that stage.
+            segment_candidate_frames = 0
         if segment_candidate_frames > 0:
             with run_diagnostics.stage("segment_jersey_candidates"):
                 segment_ocr = build_jersey_ocr(
@@ -401,10 +711,14 @@ def _run_pipeline_impl(config):
         jersey_linking_diagnostics = {"enabled": False, "status": "jersey_ocr_disabled"}
         print("FT jersey OCR: disabled", flush=True)
 
+    # Phase 7 — fuse per-frame observations into tracklet-level evidence.
+    # Identity assignment consumes these summaries instead of raw OCR outputs.
     identity_evidence = build_tracklet_evidence(player_rows, roster)
     write_json(identity_evidence, artifacts_dir / "metadata" / f"{video_id}_identity_evidence.json")
     write_table(identity_evidence_rows(identity_evidence), artifacts_dir / "metadata" / f"{video_id}_identity_evidence.csv")
 
+    # Hungarian assignment is allowed to return unknown. A low-cost assignment
+    # is not accepted automatically unless the configured evidence gates pass.
     with run_diagnostics.stage("identity_assignment"):
         identifier = HungarianPlayerIdentifier(
             roster_path=config.get("roster_path"),
@@ -484,24 +798,16 @@ def _run_pipeline_impl(config):
             f" hops={identity_propagation_diagnostics.get('hops', {})}",
             flush=True,
         )
+    preconstraint_state_rows = identity_state_rows(
+        tracks,
+        phase="post_assignment_pre_constraints",
+        video_id=video_id,
+    )
     # Hard constraints run after Hungarian because they can invalidate otherwise
     # plausible assignments when per-frame evidence exposes a contradiction.
     with run_diagnostics.stage("constraints"):
         constraints_diagnostics = apply_identity_constraints(config, tracks, roster)
     constraint_actions = constraint_action_rows(constraints_diagnostics, phase="initial")
-
-    identity_gate_audit = build_identity_gate_audit(
-        summaries,
-        candidate_scores,
-        assignments,
-        roster,
-        identity_config=config.get("identity", {}),
-    )
-    if not identity_gate_audit["summary"]["strong_visual_gate_available"]:
-        print(
-            "FT identity warning: roster visual profiles=0; strong_team_visual_trajectory cannot pass",
-            flush=True,
-        )
 
     prtreid_bridge_diagnostics = {"enabled": False, "status": "disabled", "applied_rows": 0}
     if prtreid_bridge_cfg.get("enabled", False):
@@ -516,6 +822,13 @@ def _run_pipeline_impl(config):
                 features=prtreid_tracklet_features,
             )
         if prtreid_bridge_diagnostics.get("applied_rows", 0):
+            preconstraint_state_rows.extend(
+                identity_state_rows(
+                    tracks,
+                    phase="post_prtreid_bridge_pre_constraints",
+                    video_id=video_id,
+                )
+            )
             with run_diagnostics.stage("constraints_post_prtreid_bridge"):
                 final_constraints = apply_identity_constraints(config, tracks, roster)
             constraint_actions.extend(constraint_action_rows(final_constraints, phase="post_prtreid_bridge"))
@@ -527,6 +840,11 @@ def _run_pipeline_impl(config):
             f" applied_rows={prtreid_bridge_diagnostics.get('applied_rows', 0)}",
             flush=True,
         )
+    write_table(
+        preconstraint_state_rows,
+        artifacts_dir / "metadata" / f"{video_id}_identity_preconstraint_state.csv",
+        fieldnames=["video_id", "phase", "frame", "raw_track_id", "display_track_id"],
+    )
 
     candidate_cfg = config["identity"].get("candidate_fallback", {})
     segment_candidate_diagnostics = {"enabled": False, "status": "disabled"}
@@ -554,6 +872,22 @@ def _run_pipeline_impl(config):
             only_unknown_identity=candidate_cfg.get("segment_only_unknown_identity", True),
         )
 
+    identity_gate_audit = build_identity_gate_audit(
+        summaries,
+        candidate_scores,
+        assignments,
+        roster,
+        identity_config=config.get("identity", {}),
+        final_identity_states=build_final_identity_states(tracks),
+    )
+    if not identity_gate_audit["summary"]["strong_visual_gate_available"]:
+        print(
+            "FT identity warning: roster visual profiles=0; strong_team_visual_trajectory cannot pass",
+            flush=True,
+        )
+
+    # Phase 8 — persist final state and diagnostics before rendering. Artifacts
+    # are the reproducible interface used by audits and GSR evaluation scripts.
     with run_diagnostics.stage("export_final"):
         final_rows = exporter.export_tracklets(
             frames,
@@ -574,6 +908,16 @@ def _run_pipeline_impl(config):
             "goalkeeper_colour": goalkeeper_diagnostics,
             "semantic_groups": semantic_groups,
             "jersey_ocr": jersey_diagnostics,
+            **(
+                {"jersey_ocr_secondary_audit": secondary_ocr_diagnostics}
+                if config.get("jersey_ocr_secondary_audit", {}).get("enabled", False)
+                else {}
+            ),
+            **(
+                {"jersey_region_ctc_audit": region_ctc_diagnostics}
+                if config.get("jersey_region_ctc_audit", {}).get("enabled", False)
+                else {}
+            ),
             "jersey_identity_linking": jersey_linking_diagnostics,
             "constraints": constraints_diagnostics,
             "identity_propagation": identity_propagation_diagnostics,
@@ -615,7 +959,30 @@ def _run_pipeline_impl(config):
     )
     write_json(scene_cut_diagnostics, artifacts_dir / "metadata" / f"{video_id}_scene_cuts.json")
     write_table(scene_cut_rows(scene_cut_diagnostics), artifacts_dir / "metadata" / f"{video_id}_scene_cuts.csv")
+    compact_activity_diagnostics = {
+        key: value
+        for key, value in activity_diagnostics.items()
+        if key != "frame_stats"
+    }
+    write_json(
+        compact_activity_diagnostics,
+        artifacts_dir / "metadata" / f"{video_id}_activity_segments.json",
+    )
+    write_table(
+        activity_segment_rows(activity_diagnostics),
+        artifacts_dir / "metadata" / f"{video_id}_activity_segments.csv",
+        fieldnames=["segment_index", "start_frame", "end_frame"],
+    )
+    write_table(
+        activity_diagnostics.get("frame_stats", []),
+        artifacts_dir / "metadata" / f"{video_id}_activity_frame_stats.csv",
+        fieldnames=["frame", "activity_segment_id"],
+    )
     write_json(ball_tracking_diagnostics(tracks), artifacts_dir / "metadata" / f"{video_id}_ball_tracking.json")
+    write_json(
+        tracks.get("detection_enrichment", {"enabled": False, "status": "disabled"}),
+        artifacts_dir / "metadata" / f"{video_id}_detection_enrichment.json",
+    )
     write_json(calibrator.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_calibration.json")
     write_json(identity_propagation_diagnostics, artifacts_dir / "metadata" / f"{video_id}_identity_propagation.json")
     write_table(
@@ -662,6 +1029,61 @@ def _run_pipeline_impl(config):
         artifacts_dir / "metadata" / f"{video_id}_segment_jersey_candidates.json",
     )
     write_json(jersey_diagnostics, artifacts_dir / "metadata" / f"{video_id}_jersey_ocr.json")
+    if config.get("jersey_ocr_secondary_audit", {}).get("enabled", False):
+        write_json(
+            secondary_ocr_diagnostics,
+            artifacts_dir / "metadata" / f"{video_id}_jersey_ocr_secondary_audit.json",
+        )
+    if config.get("jersey_region_ctc_audit", {}).get("enabled", False):
+        write_json(
+            region_ctc_diagnostics,
+            artifacts_dir / "metadata" / f"{video_id}_jersey_region_ctc_audit.json",
+        )
+        write_table(
+            region_ctc_diagnostics.get("crops", []),
+            artifacts_dir / "metadata" / f"{video_id}_jersey_region_ctc_crops.csv",
+        )
+    frame_selection = jersey_diagnostics.get("frame_selection", {})
+    frame_selector = getattr(locals().get("ocr", None), "frame_selector", None)
+    frame_scores = list(getattr(frame_selector, "score_rows", []))
+    frame_selections = list(getattr(frame_selector, "selection_rows", []))
+    frame_decisions = list(getattr(frame_selector, "decision_rows", []))
+    for name, rows in (
+        ("scores", frame_scores),
+        ("selection", frame_selections),
+        ("decisions", frame_decisions),
+    ):
+        write_table(rows, artifacts_dir / "metadata" / f"{video_id}_jersey_frame_{name}.csv")
+        write_json(
+            {"diagnostics": frame_selection, "rows": rows},
+            artifacts_dir / "metadata" / f"{video_id}_jersey_frame_{name}.json",
+        )
+    subject_filter = getattr(locals().get("ocr", None), "subject_filter", None)
+    subject_diagnostics = jersey_diagnostics.get("subject_filter", {})
+    subject_artifacts = (
+        ("scores", list(getattr(subject_filter, "score_rows", []))),
+        ("tracks", list(getattr(subject_filter, "track_rows", []))),
+    )
+    for name, rows in subject_artifacts:
+        write_table(
+            rows,
+            artifacts_dir / "metadata" / f"{video_id}_jersey_subject_filter_{name}.csv",
+        )
+        write_json(
+            {"diagnostics": subject_diagnostics, "rows": rows},
+            artifacts_dir / "metadata" / f"{video_id}_jersey_subject_filter_{name}.json",
+        )
+    prefix_consolidator = getattr(locals().get("ocr", None), "prefix_consolidator", None)
+    prefix_rows = list(getattr(prefix_consolidator, "counterfactual_rows", []))
+    prefix_diagnostics = jersey_diagnostics.get("prefix_consolidation", {})
+    write_table(
+        prefix_rows,
+        artifacts_dir / "metadata" / f"{video_id}_jersey_prefix_counterfactuals.csv",
+    )
+    write_json(
+        {"diagnostics": prefix_diagnostics, "rows": prefix_rows},
+        artifacts_dir / "metadata" / f"{video_id}_jersey_prefix_counterfactuals.json",
+    )
     write_json(
         {"diagnostics": number_region_diagnostics, "detections": number_region_detections},
         artifacts_dir / "metadata" / f"{video_id}_number_region_detections.json",
@@ -683,10 +1105,7 @@ def _run_pipeline_impl(config):
     write_json(exporter.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_export.json")
     write_json(visual_extractor.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_visual_features.json")
 
-    with run_diagnostics.stage("overlay"):
-        output_frames = draw_overlay(frames, tracks, config=config.get("overlay", {}))
-    with run_diagnostics.stage("save_video"):
-        save_video(output_frames, output_path, fps=config["tracking"].get("frame_rate", 25))
+    render_output_phase(config, frames, tracks, output_path, run_diagnostics)
 
     print(f"FT output video: {output_path}", flush=True)
     print(f"FT artifacts: {artifacts_dir}", flush=True)
@@ -700,6 +1119,7 @@ def _run_pipeline_impl(config):
             "assigned_rows": len(assigned),
             "export": exporter.diagnostics(),
             "scene_cuts": scene_cut_diagnostics,
+            "activity_segmentation": compact_activity_diagnostics,
             "visual_features": visual_extractor.diagnostics(),
             "prtreid_linking": prtreid_linking_diagnostics,
             "prtreid_identity_bridge": prtreid_bridge_diagnostics,
@@ -721,6 +1141,7 @@ def _run_pipeline_impl(config):
         "assignments": assignments,
         "candidate_scores": candidate_scores,
         "scene_cuts": scene_cut_diagnostics,
+        "activity_segmentation": activity_diagnostics,
         "prtreid_linking": prtreid_linking_diagnostics,
         "prtreid_identity_bridge": prtreid_bridge_diagnostics,
         "identity_propagation": identity_propagation_diagnostics,
@@ -754,7 +1175,7 @@ def scene_cut_config(config):
     return {
         key: value
         for key, value in config.get("scene_cuts", {}).items()
-        if key != "tracking_reset_enabled"
+        if key not in {"tracking_reset_enabled", "tracking_reset_hard_only"}
     }
 
 
@@ -776,13 +1197,89 @@ def goalkeeper_config(config, roster):
     return goalkeeper_cfg
 
 
-def build_jersey_ocr(config, artifacts_dir, video_id, debug_subdir=None, segment_frames=None, overrides=None):
+def secondary_ocr_proposals(assignments, min_votes=4, min_winner_margin=0.08):
+    """Return conservative secondary OCR proposals without applying them."""
+    proposals = {}
+    for track_id, assignment in (assignments or {}).items():
+        votes = int(assignment.get("votes") or 0)
+        margin = float(assignment.get("winner_margin") or 0.0)
+        if votes < int(min_votes) or margin < float(min_winner_margin):
+            continue
+        proposals[diagnostic_key(track_id)] = {
+            **assignment,
+            "selection_reason": "secondary_audit_thresholds_passed",
+            "applied": False,
+        }
+    return proposals
+
+
+def compare_ocr_assignments(primary, secondary):
+    """Summarize agreement without feeding secondary evidence downstream."""
+    primary = {diagnostic_key(key): value for key, value in (primary or {}).items()}
+    secondary = {diagnostic_key(key): value for key, value in (secondary or {}).items()}
+    keys = sorted(set(primary) | set(secondary))
+    counts = {
+        "tracklets": len(keys),
+        "agreement": 0,
+        "disagreement": 0,
+        "primary_only": 0,
+        "secondary_only": 0,
+        "both_abstain": 0,
+    }
+    rows = []
+    for key in keys:
+        primary_number = (primary.get(key) or {}).get("jersey_number")
+        secondary_number = (secondary.get(key) or {}).get("jersey_number")
+        if primary_number is None and secondary_number is None:
+            transition = "both_abstain"
+        elif primary_number is None:
+            transition = "secondary_only"
+        elif secondary_number is None:
+            transition = "primary_only"
+        elif int(primary_number) == int(secondary_number):
+            transition = "agreement"
+        else:
+            transition = "disagreement"
+        counts[transition] += 1
+        rows.append({
+            "tracklet": key,
+            "primary_number": primary_number,
+            "secondary_number": secondary_number,
+            "transition": transition,
+        })
+    return {**counts, "rows": rows}
+
+
+def build_jersey_ocr(
+    config, artifacts_dir, video_id, debug_subdir=None, segment_frames=None,
+    overrides=None, research_filters=True,
+):
     jersey_cfg = {**config["jersey_ocr"], **(overrides or {})}
     debug_dir = (
         Path(artifacts_dir) / "jersey_ocr_debug" / (debug_subdir or video_id)
         if jersey_cfg.get("debug_crops", False)
         else None
     )
+    selector_cfg = config.get("jersey_frame_selection", {})
+    frame_selector = None
+    if selector_cfg.get("enabled", False):
+        frame_selector = JerseyFrameSelector(**{
+            key: value for key, value in selector_cfg.items() if key != "enabled"
+        })
+    subject_filter = None
+    subject_cfg = config.get("jersey_subject_filter", {})
+    if research_filters and subject_cfg.get("enabled", False):
+        prtreid_cfg = config.get("prtreid", {})
+        subject_filter = JerseySubjectFilter(**{
+            **{key: value for key, value in subject_cfg.items() if key != "enabled"},
+            "hrnet_pretrained_path": prtreid_cfg.get("hrnet_pretrained_path", "models/reid"),
+        })
+    prefix_consolidator = None
+    prefix_cfg = config.get("jersey_prefix_consolidation", {})
+    if research_filters and prefix_cfg.get("enabled", False):
+        prefix_consolidator = JerseyPrefixConsolidator(**{
+            key: value for key, value in prefix_cfg.items() if key != "enabled"
+        })
     return JerseyOCR(
         backend=jersey_cfg["backend"],
         min_confidence=jersey_cfg["min_confidence"],
@@ -809,6 +1306,8 @@ def build_jersey_ocr(config, artifacts_dir, video_id, debug_subdir=None, segment
         mmocr_device=jersey_cfg.get("mmocr_device"),
         mmocr_det=jersey_cfg.get("mmocr_det", "dbnet_resnet18_fpnc_1200e_icdar2015"),
         mmocr_rec=jersey_cfg.get("mmocr_rec", "SAR"),
+        mmocr_rec_weights=jersey_cfg.get("mmocr_rec_weights"),
+        mmocr_rec_weights_sha256=jersey_cfg.get("mmocr_rec_weights_sha256"),
         mmocr_batch_size=jersey_cfg.get("mmocr_batch_size", 8),
         mmocr_direct_recognition=jersey_cfg.get("mmocr_direct_recognition"),
         progress_every=jersey_cfg.get("progress_every", 5),
@@ -827,6 +1326,10 @@ def build_jersey_ocr(config, artifacts_dir, video_id, debug_subdir=None, segment
         demote_direct_only_single_digits=jersey_cfg.get("demote_direct_only_single_digits", True),
         prefer_two_digit_candidates=jersey_cfg.get("prefer_two_digit_candidates", True),
         digit_confusion_overrides=jersey_cfg.get("digit_confusion_overrides"),
+        strict_numeric_only=jersey_cfg.get("strict_numeric_only", False),
+        frame_selector=frame_selector,
+        subject_filter=subject_filter,
+        prefix_consolidator=prefix_consolidator,
     )
 
 
@@ -1151,7 +1654,7 @@ def apply_jersey_identity_linking(config, tracks, rows):
 def build_tracker(config, model_path):
     tracking_cfg = dict(config.get("tracking", {}))
     backend = str(tracking_cfg.pop("backend", "bytetrack")).lower().replace("_", "")
-    strongsort_cfg = tracking_cfg.pop("strongsort", {}) or {}
+    enrich_detections = bool(tracking_cfg.pop("prtreid_detection_enrichment", False))
     common = {
         "model_path": model_path,
         "detection_confidence": config["detection"]["confidence"],
@@ -1178,39 +1681,16 @@ def build_tracker(config, model_path):
             "ball_kalman_high_speed_area_multiplier", 3.0
         ),
     }
+    if enrich_detections:
+        prtreid_cfg = prtreid_extractor_config(config.get("prtreid", {}))
+        if not prtreid_cfg.get("enabled", False):
+            raise ValueError(
+                "tracking.prtreid_detection_enrichment=true requires prtreid.enabled=true"
+            )
+        common["detection_enricher"] = PRTReIDDetectionEnricher(**prtreid_cfg)
     if backend in {"bytetrack", "byte"}:
         print("FT tracking backend: bytetrack", flush=True)
         return YoloByteTracker(**common, **tracking_cfg)
-    if backend in {"strongsort", "strong"}:
-        print("FT tracking backend: strongsort", flush=True)
-        strongsort_args = dict(tracking_cfg)
-        strongsort_args.pop("inference_mode", None)
-        strongsort_args.pop("half_precision", None)
-        for key in (
-            "ball_temporal_consistency",
-            "ball_temporal_max_distance",
-            "ball_temporal_max_distance_cap",
-            "ball_temporal_distance_penalty",
-            "ball_temporal_reject_outliers",
-            "ball_min_acquisition_confidence",
-            "ball_low_confidence_max_distance",
-            "ball_temporal_min_confidence_after_miss",
-            "ball_temporal_miss_reset",
-            "ball_kalman_enabled",
-            "ball_kalman_max_lost_frames",
-            "ball_kalman_process_noise_scale",
-            "ball_kalman_measurement_noise_scale",
-            "ball_kalman_high_speed_threshold",
-            "ball_kalman_high_speed_area_multiplier",
-        ):
-            common.pop(key, None)
-        strongsort_args.update(strongsort_cfg)
-        return YoloStrongSortTracker(**common, **strongsort_args)
-    if backend == "prtreidstrongsort":
-        raise NotImplementedError(
-            "tracking.backend=prtreid_strongsort is reserved for the FT-native PRTReID StrongSORT backend. "
-            "Use tracking.backend=bytetrack with visual.embedding_mode=prtreid for the first PRTReID validation run."
-        )
     raise ValueError(f"Unknown tracking backend: {backend}")
 
 
@@ -1524,6 +2004,33 @@ def constraint_action_rows(diagnostics, phase=None):
     return rows
 
 
+def identity_state_rows(tracks, phase, video_id=None):
+    rows = []
+    for frame, frame_tracks in enumerate(tracks.get("players", [])):
+        for raw_id, track in frame_tracks.items():
+            evidence = track.get("identity_evidence")
+            source = evidence.get("source") if isinstance(evidence, dict) else None
+            rows.append({
+                "video_id": video_id,
+                "phase": str(phase),
+                "frame": int(frame),
+                "raw_track_id": int(track.get("raw_track_id", raw_id)),
+                "display_track_id": int(track.get("display_track_id", raw_id)),
+                "identity_tracklet_id": track.get("identity_tracklet_id"),
+                "scene_segment_id": track.get("scene_segment_id"),
+                "bbox": track.get("bbox"),
+                "team_id": track.get("team"),
+                "jersey_number": track.get("jersey_number"),
+                "player_id": track.get("player_id", "unknown"),
+                "identity_confidence": float(track.get("identity_confidence", 0.0) or 0.0),
+                "identity_status": track.get("identity_status") or "unknown",
+                "identity_source": source,
+                "identity_sources": track.get("identity_sources", {}),
+                "identity_evidence": evidence or {},
+            })
+    return rows
+
+
 def _copy_row_features_to_tracks(rows, tracks):
     by_key = {
         (int(row["frame"]), int(row["track_id"])): row
@@ -1551,9 +2058,11 @@ def _copy_row_features_to_tracks(rows, tracks):
                         track[key] = row.get(key)
 
 
-def _apply_jersey(jersey_assignments, rows, tracks):
+def _apply_jersey(jersey_assignments, rows, tracks, allowed_roles=None):
     assignment_lookup = build_jersey_assignment_lookup(jersey_assignments)
     for row in rows:
+        if allowed_roles is not None and predicted_role(row) not in set(allowed_roles):
+            continue
         assignment = row_jersey_assignment(row, assignment_lookup)
         if not assignment:
             continue
@@ -1572,6 +2081,8 @@ def _apply_jersey(jersey_assignments, rows, tracks):
         row["jersey_roster_mass"] = assignment.get("jersey_roster_mass", 0.0)
     for frame_num, frame_tracks in enumerate(tracks.get("players", [])):
         for raw_id, track in frame_tracks.items():
+            if allowed_roles is not None and predicted_role(track) not in set(allowed_roles):
+                continue
             assignment = track_jersey_assignment(raw_id, track, frame_num, assignment_lookup)
             if not assignment:
                 continue

@@ -36,10 +36,31 @@ def validate_run_config(config):
 
     _validate_calibration(config.get("calibration", {}), errors)
     _validate_detection(config.get("detection", {}), errors)
-    _validate_tracking(config.get("tracking", {}), errors)
-    _validate_scene_cuts(config.get("scene_cuts", {}), errors)
+    _validate_tracking(config.get("tracking", {}), errors, prtreid=config.get("prtreid", {}))
+    _validate_scene_cuts(config.get("scene_cuts", {}), config.get("tracking", {}), errors)
+    _validate_activity_segmentation(config.get("activity_segmentation", {}), errors)
+    _validate_linking_pitch_gate(config, errors)
     _validate_team(config.get("team", {}), errors)
     _validate_jersey_ocr(config.get("jersey_ocr", {}), errors, warnings)
+    _validate_jersey_ocr_secondary_audit(
+        config.get("jersey_ocr_secondary_audit", {}), errors, warnings
+    )
+    if (
+        config.get("jersey_ocr_secondary_audit", {}).get("enabled", False)
+        and not config.get("jersey_ocr", {}).get("enabled", False)
+    ):
+        errors.append("jersey_ocr_secondary_audit requires jersey_ocr.enabled=true")
+    _validate_jersey_region_ctc_audit(
+        config.get("jersey_region_ctc_audit", {}), errors
+    )
+    if (
+        config.get("jersey_region_ctc_audit", {}).get("enabled", False)
+        and not config.get("jersey_ocr", {}).get("enabled", False)
+    ):
+        errors.append("jersey_region_ctc_audit requires jersey_ocr.enabled=true")
+    _validate_jersey_frame_selection(config.get("jersey_frame_selection", {}), errors)
+    _validate_jersey_subject_filter(config.get("jersey_subject_filter", {}), errors)
+    _validate_jersey_prefix_consolidation(config.get("jersey_prefix_consolidation", {}), errors)
     _validate_number_region(config.get("number_region", {}), errors, warnings)
     _validate_visual(config.get("visual", {}), config.get("prtreid", {}), errors)
     _validate_prtreid(
@@ -49,6 +70,7 @@ def validate_run_config(config):
         config.get("prtreid_identity_bridge", {}),
         errors,
         warnings,
+        tracking=config.get("tracking", {}),
     )
     _validate_prtreid_linking(config, errors)
     _validate_prtreid_identity_bridge(config, errors)
@@ -60,6 +82,45 @@ def validate_run_config(config):
 
     if errors:
         raise ValueError("Invalid FT run config:\n- " + "\n- ".join(errors))
+
+
+def _validate_linking_pitch_gate(config, errors):
+    gate = config.get("linking", {}).get("pitch_gate") or {}
+    reranking = config.get("linking", {}).get("pitch_reranking") or {}
+    pitch_enabled = gate.get("enabled", False) or reranking.get("enabled", False)
+    if pitch_enabled:
+        if not config.get("linking", {}).get("enabled", True):
+            errors.append("linking pitch features require linking.enabled=true")
+        if not config.get("calibration", {}).get("tvcalib", {}).get("enabled", False):
+            errors.append("linking pitch features require calibration.tvcalib.enabled=true")
+    if gate.get("enabled", False):
+        mode = str(gate.get("mode", "audit")).lower()
+        if mode not in {"audit", "apply"}:
+            errors.append("linking.pitch_gate.mode must be audit or apply")
+        for key in ("max_speed_mps", "fps", "pitch_length", "pitch_width"):
+            try:
+                valid = float(gate.get(key, 0.0)) > 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                errors.append(f"linking.pitch_gate.{key} must be positive")
+    if reranking.get("enabled", False):
+        mode = str(reranking.get("mode", "audit")).lower()
+        if mode not in {"audit", "apply"}:
+            errors.append("linking.pitch_reranking.mode must be audit or apply")
+        for key in ("baseline_distance_scale", "pitch_distance_scale"):
+            try:
+                valid = float(reranking.get(key, 0.0)) > 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                errors.append(f"linking.pitch_reranking.{key} must be positive")
+        try:
+            weight_valid = float(reranking.get("weight", -1.0)) >= 0
+        except (TypeError, ValueError):
+            weight_valid = False
+        if not weight_valid:
+            errors.append("linking.pitch_reranking.weight must be non-negative")
 
 
 def _validate_calibration(calibration, errors):
@@ -123,15 +184,20 @@ def _validate_detection(detection, errors):
         errors.append("detection.ball_kalman_high_speed_area_multiplier must be >= 1")
 
 
-def _validate_tracking(tracking, errors):
+def _validate_tracking(tracking, errors, prtreid=None):
     backend = str(tracking.get("backend", "bytetrack")).lower().replace("_", "")
-    if backend not in {"bytetrack", "byte", "strongsort", "strong", "prtreidstrongsort"}:
-        errors.append(f"tracking.backend must be bytetrack, strongsort or prtreid_strongsort, got {tracking.get('backend')!r}")
+    if backend not in {"bytetrack", "byte"}:
+        errors.append(f"tracking.backend must be bytetrack, got {tracking.get('backend')!r}")
+    if tracking.get("prtreid_detection_enrichment", False) and not (prtreid or {}).get("enabled", False):
+        errors.append("tracking.prtreid_detection_enrichment=true requires prtreid.enabled=true")
 
 
-def _validate_scene_cuts(scene_cuts, errors):
+def _validate_scene_cuts(scene_cuts, tracking, errors):
     if not scene_cuts.get("enabled", False):
         return
+    backend = str(tracking.get("backend", "bytetrack")).lower().replace("_", "")
+    if scene_cuts.get("tracking_reset_enabled", False) and backend not in {"bytetrack", "byte"}:
+        errors.append("scene_cuts.tracking_reset_enabled=true requires tracking.backend=bytetrack")
     for key in ("threshold", "crop_top_fraction", "crop_bottom_fraction", "crop_left_fraction", "crop_right_fraction"):
         value = float(scene_cuts.get(key) or 0.0)
         if value < 0.0:
@@ -152,6 +218,22 @@ def _validate_scene_cuts(scene_cuts, errors):
     max_cuts = scene_cuts.get("max_cuts")
     if max_cuts is not None and int(max_cuts) <= 0:
         errors.append("scene_cuts.max_cuts must be positive when provided")
+
+
+def _validate_activity_segmentation(activity, errors):
+    if not activity.get("enabled", False):
+        return
+    for key in (
+        "smoothing_window",
+        "count_change_threshold",
+        "persistence_frames",
+        "min_segment_frames",
+    ):
+        if int(activity.get(key) or 0) <= 0:
+            errors.append(f"activity_segmentation.{key} must be positive")
+    ratio = float(activity.get("persistence_ratio") or 0.0)
+    if not 0.5 <= ratio <= 1.0:
+        errors.append("activity_segmentation.persistence_ratio must be between 0.5 and 1.0")
 
 
 def _validate_team(team, errors):
@@ -178,6 +260,7 @@ def _validate_jersey_ocr(jersey_ocr, errors, warnings):
         "mmocr+easyocr",
         "mmocr-fallback",
         "mmocr_auto",
+        "mmocr_rec",
     } and "," not in backend and "+" not in backend:
         errors.append(f"jersey_ocr.backend is unsupported: {jersey_ocr.get('backend')!r}")
 
@@ -228,6 +311,159 @@ def _validate_jersey_ocr(jersey_ocr, errors, warnings):
         warnings.append(
             "jersey_ocr.mmocr_direct_recognition=true without number_roi_enabled=true may increase false positives"
         )
+    if jersey_ocr.get("mmocr_rec_weights"):
+        digest = str(jersey_ocr.get("mmocr_rec_weights_sha256") or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
+            errors.append(
+                "jersey_ocr.mmocr_rec_weights_sha256 must be a SHA-256 hex digest "
+                "with custom recognizer weights"
+            )
+
+
+def _validate_jersey_ocr_secondary_audit(audit, errors, warnings):
+    if not audit.get("enabled", False):
+        return
+    mode = str(audit.get("mode", "audit") or "audit").lower()
+    if mode not in {"audit", "propose"}:
+        errors.append("jersey_ocr_secondary_audit supports only audit/propose")
+    _validate_jersey_ocr(audit, errors, warnings)
+    if not audit.get("mmocr_rec_weights"):
+        errors.append("jersey_ocr_secondary_audit.mmocr_rec_weights is required")
+
+
+def _validate_jersey_region_ctc_audit(audit, errors):
+    if not audit.get("enabled", False):
+        return
+    if str(audit.get("mode", "audit")).lower() != "audit":
+        errors.append("jersey_region_ctc_audit supports only audit")
+    if not audit.get("audit_only", True):
+        errors.append("jersey_region_ctc_audit.audit_only must remain true")
+    if not isinstance(audit.get("fusion_preview_enabled", True), bool):
+        errors.append("jersey_region_ctc_audit.fusion_preview_enabled must be boolean")
+    for key in ("ctc_checkpoint", "detector_checkpoint"):
+        if not audit.get(key):
+            errors.append(f"jersey_region_ctc_audit.{key} is required")
+        digest = str(audit.get(f"{key}_sha256") or "")
+        if len(digest) != 64 or any(
+            char not in "0123456789abcdefABCDEF" for char in digest
+        ):
+            errors.append(
+                f"jersey_region_ctc_audit.{key}_sha256 must be a SHA-256 hex digest"
+            )
+    for key in ("detector_confidence", "min_override_confidence"):
+        value = float(audit.get(key, 0.0))
+        if not 0.0 <= value <= 1.0:
+            errors.append(f"jersey_region_ctc_audit.{key} must be between 0 and 1")
+    padding = float(audit.get("box_padding", 0.0))
+    if not 0.0 <= padding <= 0.5:
+        errors.append("jersey_region_ctc_audit.box_padding must be between 0 and 0.5")
+    for key in ("batch_size", "detector_batch_size", "max_crops_per_tracklet"):
+        if int(audit.get(key) or 0) <= 0:
+            errors.append(f"jersey_region_ctc_audit.{key} must be positive")
+    if int(audit.get("min_frame_gap") or 0) < 0:
+        errors.append("jersey_region_ctc_audit.min_frame_gap must be non-negative")
+
+
+def _validate_jersey_frame_selection(selector, errors):
+    if not selector.get("enabled", False):
+        return
+    mode = str(selector.get("mode", "audit") or "audit").lower()
+    model_type = str(selector.get("model_type", "legibility_resnet34") or "legibility_resnet34").lower()
+    if mode not in {"audit", "propose", "apply"}:
+        errors.append(f"jersey_frame_selection.mode is unsupported: {mode!r}")
+    yolo_model_types = {
+        "jersey_back_yolo11s_cls",
+        "jersey_number_readability_yolo26s_cls",
+    }
+    if model_type not in {"legibility_resnet34", *yolo_model_types}:
+        errors.append(f"jersey_frame_selection.model_type is unsupported: {model_type!r}")
+    if model_type == "jersey_back_yolo11s_cls" and mode == "apply":
+        errors.append("jersey back YOLO classifier supports only audit/propose")
+    if model_type == "jersey_number_readability_yolo26s_cls" and mode == "apply":
+        errors.append("jersey readability YOLO classifier supports only audit/propose")
+    if not selector.get("checkpoint"):
+        errors.append("jersey_frame_selection.checkpoint is required when enabled")
+    digest = str(selector.get("checkpoint_sha256") or "")
+    if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
+        errors.append("jersey_frame_selection.checkpoint_sha256 must be a SHA-256 hex digest")
+    for key in ("batch_size", "top_k", "min_winner_votes"):
+        if int(selector.get(key) or 0) <= 0:
+            errors.append(f"jersey_frame_selection.{key} must be positive")
+    if int(selector.get("min_frame_gap") or 0) < 0:
+        errors.append("jersey_frame_selection.min_frame_gap must be non-negative")
+    for key in ("min_legibility_score", "min_margin"):
+        value = float(selector.get(key, 0.0))
+        if value < 0.0 or value > 1.0:
+            errors.append(f"jersey_frame_selection.{key} must be between 0 and 1")
+    if selector.get("min_selection_score") is not None:
+        value = float(selector["min_selection_score"])
+        if value < 0.0 or value > 1.0:
+            errors.append("jersey_frame_selection.min_selection_score must be between 0 and 1")
+    weight_keys = (
+        "clean_back_weight", "sharpness_weight", "size_weight", "crop_quality_weight"
+    )
+    weight_defaults = (0.70, 0.15, 0.05, 0.10)
+    weights = [
+        float(selector.get(key, default))
+        for key, default in zip(weight_keys, weight_defaults)
+    ]
+    if any(value < 0.0 for value in weights) or sum(weights) <= 0.0:
+        errors.append("jersey_frame_selection score weights must be non-negative and sum above zero")
+    for key, default in (("sharpness_scale", 100.0), ("size_scale", 160.0)):
+        if float(selector.get(key, default)) <= 0.0:
+            errors.append(f"jersey_frame_selection.{key} must be positive")
+    x0 = float(selector.get("torso_x_min", 0.0))
+    x1 = float(selector.get("torso_x_max", 1.0))
+    y0 = float(selector.get("torso_y_min", 0.0))
+    y1 = float(selector.get("torso_y_max", 1.0))
+    if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+        errors.append("jersey_frame_selection torso bounds must be ordered values between 0 and 1")
+    roles = selector.get("allowed_roles")
+    if not isinstance(roles, list) or not roles:
+        errors.append("jersey_frame_selection.allowed_roles must be a non-empty list")
+
+
+def _validate_jersey_subject_filter(subject_filter, errors):
+    if not subject_filter.get("enabled", False):
+        return
+    mode = str(subject_filter.get("mode", "audit") or "audit").lower()
+    if mode not in {"audit", "propose"}:
+        errors.append(f"jersey_subject_filter.mode is unsupported: {mode!r}")
+    if not subject_filter.get("checkpoint"):
+        errors.append("jersey_subject_filter.checkpoint is required when enabled")
+    digest = str(subject_filter.get("checkpoint_sha256") or "")
+    if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
+        errors.append("jersey_subject_filter.checkpoint_sha256 must be a SHA-256 hex digest")
+    for key in ("batch_size", "min_samples", "min_remaining", "rounds"):
+        if int(subject_filter.get(key) or 0) <= 0:
+            errors.append(f"jersey_subject_filter.{key} must be positive")
+    if float(subject_filter.get("std_threshold", -1.0)) < 0:
+        errors.append("jersey_subject_filter.std_threshold must be non-negative")
+    quality = float(subject_filter.get("min_crop_quality", -1.0))
+    if quality < 0.0 or quality > 1.0:
+        errors.append("jersey_subject_filter.min_crop_quality must be between 0 and 1")
+    roles = subject_filter.get("allowed_roles")
+    if not isinstance(roles, list) or not roles:
+        errors.append("jersey_subject_filter.allowed_roles must be a non-empty list")
+
+
+def _validate_jersey_prefix_consolidation(prefix, errors):
+    if not prefix.get("enabled", False):
+        return
+    mode = str(prefix.get("mode", "audit") or "audit").lower()
+    if mode not in {"audit", "propose"}:
+        errors.append(f"jersey_prefix_consolidation.mode is unsupported: {mode!r}")
+    if int(prefix.get("min_long_votes") or 0) <= 0:
+        errors.append("jersey_prefix_consolidation.min_long_votes must be positive")
+    weights = prefix.get("short_vote_weights")
+    if not isinstance(weights, list) or not weights or any(float(value) < 0 or float(value) > 1 for value in weights):
+        errors.append("jersey_prefix_consolidation.short_vote_weights must contain values between 0 and 1")
+        weights = []
+    selected = prefix.get("selected_short_vote_weight")
+    if mode == "propose" and selected is None:
+        errors.append("jersey_prefix_consolidation.selected_short_vote_weight is required in propose mode")
+    elif selected is not None and float(selected) not in [float(value) for value in weights]:
+        errors.append("jersey_prefix_consolidation.selected_short_vote_weight must be in short_vote_weights")
 
 
 def _validate_number_region(number_region, errors, warnings):
@@ -242,6 +478,10 @@ def _validate_number_region(number_region, errors, warnings):
             errors.append(f"number_region.{key} must be positive")
     if int(number_region.get("max_regions_per_tracklet") or 0) < 0:
         errors.append("number_region.max_regions_per_tracklet must be non-negative")
+    if int(number_region.get("max_regions_per_tracklet") or 0) == 0:
+        warnings.append(
+            "number_region.max_regions_per_tracklet=0 is unbounded and can make OCR expensive on long videos"
+        )
     for key in ("torso_x_min", "torso_x_max", "torso_y_min", "torso_y_max"):
         value = float(number_region.get(key, 0.0))
         if value < 0.0 or value > 1.0:
@@ -277,7 +517,15 @@ def _validate_visual(visual, prtreid, errors):
         errors.append("visual.embedding_mode=prtreid requires prtreid.enabled=true")
 
 
-def _validate_prtreid(prtreid, visual, prtreid_linking, prtreid_identity_bridge, errors, warnings):
+def _validate_prtreid(
+    prtreid,
+    visual,
+    prtreid_linking,
+    prtreid_identity_bridge,
+    errors,
+    warnings,
+    tracking=None,
+):
     if not prtreid.get("enabled", False):
         return
     if int(prtreid.get("batch_size") or 0) <= 0:
@@ -296,6 +544,7 @@ def _validate_prtreid(prtreid, visual, prtreid_linking, prtreid_identity_bridge,
         str(visual.get("embedding_mode", "")).lower().replace("-", "_") != "prtreid"
         and not prtreid_linking.get("enabled", False)
         and not prtreid_identity_bridge.get("enabled", False)
+        and not (tracking or {}).get("prtreid_detection_enrichment", False)
     ):
         warnings.append("prtreid.enabled=true but visual.embedding_mode is not prtreid; PRTReID will not run")
 

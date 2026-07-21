@@ -38,7 +38,9 @@ def parse_args():
     parser.add_argument("--max-frames-per-sequence", type=int, default=None)
     parser.add_argument("--sequence", action="append", default=[])
     parser.add_argument("--split", action="append", default=[])
-    parser.add_argument("--prepare-only", action="store_true")
+    preparation = parser.add_mutually_exclusive_group()
+    preparation.add_argument("--prepare-only", action="store_true")
+    preparation.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--base-model", default="yolo26x.pt")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--imgsz", type=int, default=1280)
@@ -49,17 +51,30 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--cache", default=False)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--non-deterministic", action="store_true")
+    parser.add_argument("--close-mosaic", type=int, default=10)
+    parser.add_argument("--fraction", type=float, default=1.0)
+    parser.add_argument("--no-val", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if not 0.0 < args.fraction <= 1.0:
+        raise ValueError("--fraction must be greater than 0 and at most 1")
     output_dir = Path(args.output_dir)
-    stats = prepare_dataset(args, output_dir)
-    print_summary(args, stats, output_dir)
-    if args.prepare_only:
-        return
-    train_yolo(args, output_dir / "data.yaml")
+    data_yaml = output_dir / "data.yaml"
+    if args.skip_prepare:
+        if not data_yaml.is_file():
+            raise FileNotFoundError(data_yaml)
+        print(f"FT GSR dataset: reusing {data_yaml}")
+    else:
+        stats = prepare_dataset(args, output_dir)
+        print_summary(args, stats, output_dir)
+        if args.prepare_only:
+            return
+    train_yolo(args, data_yaml)
 
 
 def prepare_dataset(args, output_dir):
@@ -293,6 +308,7 @@ def train_yolo(args, data_yaml):
     from ultralytics import YOLO
 
     name = args.name or f"{Path(args.base_model).stem}_{args.mode}"
+    project = Path(args.project).expanduser().resolve()
     model = YOLO(args.base_model)
     model.train(
         data=str(data_yaml),
@@ -300,11 +316,16 @@ def train_yolo(args, data_yaml):
         imgsz=args.imgsz,
         batch=args.batch,
         device=args.device,
-        project=args.project,
+        project=str(project),
         name=name,
         workers=args.workers,
         patience=args.patience,
         cache=args.cache,
+        seed=args.seed,
+        deterministic=not args.non_deterministic,
+        close_mosaic=args.close_mosaic,
+        fraction=args.fraction,
+        val=not args.no_val,
     )
 
 
@@ -332,7 +353,7 @@ def infer_split(label_path):
     if "/valid/" in lowered or "/val/" in lowered:
         return "val"
     if "/test/" in lowered:
-        return "val"
+        return "test"
     if "/challenge/" in lowered:
         return "test"
     return "train"

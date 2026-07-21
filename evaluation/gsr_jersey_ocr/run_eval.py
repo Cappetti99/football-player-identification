@@ -19,6 +19,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ft.features.jersey_ocr import JerseyOCR, ocr_crop_score, parse_number
+from ft.features.jersey_frame_selector import JerseyFrameSelector
+from ft.config import load_config
 
 
 PLAYER_ROLES = {"player", "goalkeeper"}
@@ -30,14 +32,21 @@ def parse_args():
     parser.add_argument("--output-dir", default="evaluation_outputs/gsr_jersey_ocr/default")
     parser.add_argument("--split", action="append", default=[])
     parser.add_argument("--sequence", action="append", default=[])
+    parser.add_argument("--sequence-manifest")
+    parser.add_argument("--manifest-part", choices=["train", "validation"], default="validation")
+    parser.add_argument("--allow-test", action="store_true")
     parser.add_argument("--max-sequences", type=int, default=None)
     parser.add_argument("--max-tracklets", type=int, default=None)
     parser.add_argument("--crops-per-tracklet", type=int, default=20)
     parser.add_argument("--min-tracklet-frames", type=int, default=3)
     parser.add_argument("--min-box-area", type=float, default=80.0)
+    parser.add_argument("--roles", nargs="+", default=sorted(PLAYER_ROLES))
     parser.add_argument("--crop-margin", type=float, default=0.03)
     parser.add_argument("--backend", default="easyocr")
     parser.add_argument("--easyocr-gpu", action="store_true")
+    parser.add_argument("--mmocr-rec", default="SAR")
+    parser.add_argument("--mmocr-rec-weights")
+    parser.add_argument("--mmocr-rec-weights-sha256")
     parser.add_argument("--template-matching", action="store_true")
     parser.add_argument("--template-font-image", default="docs/numberFont.jpg")
     parser.add_argument("--template-min-score", type=float, default=0.62)
@@ -49,6 +58,7 @@ def parse_args():
     parser.add_argument("--temporal-passes", type=int, default=1)
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--debug-crops", action="store_true")
+    parser.add_argument("--frame-selector-config")
     parser.add_argument("--wandb", action="store_true", help="Log evaluation metrics to Weights & Biases")
     parser.add_argument("--wandb-project", default="football-tracking")
     parser.add_argument("--wandb-entity", default=None)
@@ -63,6 +73,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    requested_splits = {normalize_requested_split(value) for value in args.split}
+    if "test" in requested_splits and not args.allow_test:
+        raise ValueError("GSR test is frozen. Pass --allow-test only for final locked evaluation.")
+    manifest_sequences = load_manifest_sequences(args.sequence_manifest, args.manifest_part)
+    requested_sequences = set(args.sequence) | manifest_sequences
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     wandb_run = init_wandb(args, output_dir)
@@ -70,7 +85,7 @@ def main():
     try:
         label_files = discover_label_files(
             Path(args.gsr_dir),
-            sequences=set(args.sequence),
+            sequences=requested_sequences,
             splits={split.lower() for split in args.split},
             max_sequences=args.max_sequences,
         )
@@ -95,6 +110,8 @@ def main():
             flush=True,
         )
 
+        frame_selector = build_frame_selector(args.frame_selector_config)
+
         ocr = JerseyOCR(
             backend=args.backend,
             min_confidence=args.ocr_min_confidence,
@@ -105,6 +122,9 @@ def main():
             min_votes=args.ocr_min_votes,
             min_raw_confidence=args.ocr_min_raw_confidence,
             easyocr_gpu=args.easyocr_gpu,
+            mmocr_rec=args.mmocr_rec,
+            mmocr_rec_weights=args.mmocr_rec_weights,
+            mmocr_rec_weights_sha256=args.mmocr_rec_weights_sha256,
             debug_dir=output_dir / "debug" if args.debug_crops else None,
             template_matching=args.template_matching,
             template_font_image=args.template_font_image,
@@ -112,6 +132,7 @@ def main():
             template_weight=args.template_weight,
             template_max_candidates=args.template_max_candidates,
             progress_every=10,
+            frame_selector=frame_selector,
         )
         assignments, diagnostics = ocr.recognize(ocr_rows)
         predictions = build_predictions(gt_tracklets, tracklet_index, assignments)
@@ -128,6 +149,10 @@ def main():
         write_json(output_dir / "config.json", vars(args))
         write_json(output_dir / "metrics.json", metrics)
         write_json(output_dir / "ocr_diagnostics.json", diagnostics)
+        if frame_selector is not None:
+            write_rows(output_dir / "frame_scores.csv", frame_selector.score_rows)
+            write_rows(output_dir / "frame_selection.csv", frame_selector.selection_rows)
+            write_rows(output_dir / "frame_decisions.csv", frame_selector.decision_rows)
         write_predictions(output_dir / "predictions.csv", predictions)
         write_confusion(output_dir / "confusion.csv", predictions)
         write_threshold_sweep(output_dir / "threshold_sweep.csv", threshold_sweep)
@@ -280,8 +305,40 @@ def discover_label_files(gsr_dir, sequences, splits, max_sequences=None):
     return paths
 
 
+def load_manifest_sequences(path, part):
+    if not path:
+        return set()
+    manifest_path = Path(path)
+    payload = read_json(manifest_path)
+    if normalize_requested_split(payload.get("split")) == "test":
+        raise ValueError("training manifests must not target GSR test")
+    key = f"{part}_sequences"
+    values = payload.get(key)
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"sequence manifest is missing non-empty {key}")
+    return {str(value) for value in values}
+
+
+def build_frame_selector(config_path):
+    if not config_path:
+        return None
+    config = load_config(config_path)
+    selector = config.get("jersey_frame_selection") or {}
+    if not selector.get("enabled", False):
+        raise ValueError("--frame-selector-config must enable jersey_frame_selection")
+    return JerseyFrameSelector(**{
+        key: value for key, value in selector.items() if key != "enabled"
+    })
+
+
+def normalize_requested_split(value):
+    value = str(value or "").lower()
+    return "valid" if value == "val" else value
+
+
 def load_gt_tracklets(label_files, args, stats):
     tracklets = defaultdict(list)
+    allowed_roles = {normalize_role(value) for value in args.roles}
     for label_path in label_files:
         stats["label_files"] += 1
         payload = read_json(label_path)
@@ -305,7 +362,7 @@ def load_gt_tracklets(label_files, args, stats):
                 continue
             role = resolve_role(annotation, categories)
             stats[f"role_{role or 'missing'}"] += 1
-            if role not in PLAYER_ROLES:
+            if role not in allowed_roles:
                 stats["skip_role"] += 1
                 continue
             gt_jersey = jersey_number_from_attributes(annotation.get("attributes") or {})
@@ -790,6 +847,23 @@ def write_json(path, payload):
     with Path(path).open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False, default=json_default)
         f.write("\n")
+
+
+def write_rows(path, rows):
+    rows = list(rows or [])
+    path = Path(path)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fieldnames = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def json_default(value):

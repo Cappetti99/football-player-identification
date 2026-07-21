@@ -93,19 +93,19 @@ def temporal_quality_sample(items, max_samples):
 
 
 def attach_tracklet_prototypes(tracks, prototype_by_display):
+    """Attach linker-only prototypes without changing downstream visual evidence."""
     for frame_tracks in tracks.get("players", []):
         for raw_id, track in frame_tracks.items():
             display_id = int(track.get("display_track_id", raw_id))
             feature = prototype_by_display.get(display_id)
             if not feature or feature.get("visual_embedding") is None:
                 continue
-            track["visual_embedding"] = feature["visual_embedding"]
-            track["reid_model"] = "prtreid"
-            track["reid_sample_count"] = int(feature["sample_count"])
-            track["reid_prototype_eligible"] = bool(feature["eligible"])
-            track["reid_prototype_consistency"] = feature.get("prototype_consistency")
-            track["reid_mean_crop_quality"] = feature.get("mean_crop_quality")
-            track["reid_sampled_frames"] = feature.get("sampled_frames")
+            track["prtreid_tracklet_embedding"] = feature["visual_embedding"]
+            track["prtreid_tracklet_sample_count"] = int(feature["sample_count"])
+            track["prtreid_tracklet_eligible"] = bool(feature["eligible"])
+            track["prtreid_tracklet_consistency"] = feature.get("prototype_consistency")
+            track["prtreid_tracklet_mean_crop_quality"] = feature.get("mean_crop_quality")
+            track["prtreid_tracklet_sampled_frames"] = feature.get("sampled_frames")
 
 
 def crop_from_bbox(frame, bbox):

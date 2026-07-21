@@ -6,6 +6,7 @@ requires-python = ">=3.9"
 dependencies = [
   "numpy",
   "opencv-python",
+  "matplotlib",
   "pandas",
   "pyyaml",
   "scikit-learn",

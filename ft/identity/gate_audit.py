@@ -3,7 +3,15 @@ from collections import Counter, defaultdict
 from ft.identity.hungarian import jersey_candidate_score
 
 
-def build_identity_gate_audit(summaries, candidate_scores, assignments, roster, identity_config=None, near_miss_window=0.10):
+def build_identity_gate_audit(
+    summaries,
+    candidate_scores,
+    assignments,
+    roster,
+    identity_config=None,
+    near_miss_window=0.10,
+    final_identity_states=None,
+):
     identity_config = identity_config or {}
     min_candidate_score = float(identity_config.get("reliable_jersey_min_candidate_score", 0.20))
     roster_by_id = {str(row["player_id"]): row for row in roster or []}
@@ -14,6 +22,7 @@ def build_identity_gate_audit(summaries, candidate_scores, assignments, roster, 
     for summary in summaries or []:
         track_id = int(summary["track_id"])
         assignment = (assignments or {}).get(track_id, {})
+        final_state = (final_identity_states or {}).get(track_id, {})
         scores = sorted(scores_by_track.get(track_id, []), key=lambda row: (float(row["cost"]), str(row["player_id"])))
         selected_player = assignment.get("player_id")
         selected = next((row for row in scores if row.get("player_id") == selected_player), None)
@@ -25,13 +34,23 @@ def build_identity_gate_audit(summaries, candidate_scores, assignments, roster, 
             candidate_score = jersey_candidate_score(summary, player.get("jersey_number"), field="jersey_distribution")
         gate = best.get("assignment_gate") if isinstance(best.get("assignment_gate"), dict) else {}
         strong_failures = strong_gate_failures(gate, identity_config)
-        status = str(assignment.get("identity_status") or assignment.get("evidence", {}).get("status") or "unknown")
+        hungarian_status = str(
+            assignment.get("identity_status")
+            or assignment.get("evidence", {}).get("status")
+            or "unknown"
+        )
+        status = str(final_state.get("status") or hungarian_status)
         rows.append({
             "tracklet_id": track_id,
             "display_track_id": summary.get("display_track_id", track_id),
             "frames": int(summary.get("num_frames") or 0),
             "assignment_status": status,
+            "hungarian_assignment_status": hungarian_status,
             "assigned_player_id": selected_player or "unknown",
+            "final_player_ids": final_state.get("player_ids", []),
+            "final_assigned_rows": int(final_state.get("assigned_rows", 0)),
+            "final_unknown_rows": int(final_state.get("unknown_rows", 0)),
+            "post_assignment_reasons": final_state.get("reasons", []),
             "best_player_id": best.get("player_id"),
             "best_player_name": best.get("player_name"),
             "best_cost": float(best["cost"]) if best.get("cost") is not None else None,
@@ -85,6 +104,59 @@ def build_identity_gate_audit(summaries, candidate_scores, assignments, roster, 
     }
 
 
+def build_final_identity_states(tracks):
+    """Aggregate the actual per-frame state after constraints and bridges."""
+    grouped = defaultdict(list)
+    for frame_tracks in (tracks or {}).get("players", []):
+        for raw_id, track in frame_tracks.items():
+            tracklet_id = int(
+                track.get("identity_tracklet_id")
+                or track.get("display_track_id", raw_id)
+            )
+            grouped[tracklet_id].append(track)
+
+    states = {}
+    for tracklet_id, items in grouped.items():
+        player_ids = sorted({
+            str(item.get("player_id"))
+            for item in items
+            if item.get("player_id") not in (None, "unknown")
+        })
+        assigned_rows = sum(
+            item.get("player_id") not in (None, "unknown")
+            for item in items
+        )
+        unknown_rows = len(items) - assigned_rows
+        if assigned_rows and unknown_rows:
+            status = "partially_assigned"
+        elif assigned_rows:
+            status = "assigned"
+        else:
+            status = "unknown"
+        reasons = sorted({
+            str(reason)
+            for item in items
+            if item.get("player_id") in (None, "unknown")
+            for reason in [identity_state_reason(item)]
+            if reason
+        })
+        states[int(tracklet_id)] = {
+            "status": status,
+            "player_ids": player_ids,
+            "assigned_rows": int(assigned_rows),
+            "unknown_rows": int(unknown_rows),
+            "reasons": reasons,
+        }
+    return states
+
+
+def identity_state_reason(track):
+    evidence = track.get("identity_evidence")
+    if not isinstance(evidence, dict):
+        return None
+    return evidence.get("reason") or evidence.get("status")
+
+
 def strong_gate_failures(gate, identity_config=None):
     identity_config = identity_config or {}
     failures = []
@@ -109,7 +181,18 @@ def gate_audit_summary(rows, roster):
     return {
         "tracklets": len(rows),
         "assigned_tracklets": sum(row["assignment_status"] == "assigned" for row in rows),
-        "unknown_tracklets": sum(row["assignment_status"] != "assigned" for row in rows),
+        "partially_assigned_tracklets": sum(row["assignment_status"] == "partially_assigned" for row in rows),
+        "unknown_tracklets": sum(
+            row["assignment_status"] not in {"assigned", "partially_assigned"}
+            for row in rows
+        ),
+        "changed_after_hungarian_tracklets": sum(
+            row["hungarian_assignment_status"] == "assigned"
+            and row["assignment_status"] != "assigned"
+            for row in rows
+        ),
+        "final_assigned_rows": sum(row["final_assigned_rows"] for row in rows),
+        "final_unknown_rows": sum(row["final_unknown_rows"] for row in rows),
         "near_miss_tracklets": sum(row["near_miss_reliable_jersey"] for row in rows),
         "gate_reasons": dict(Counter(row["gate_reason"] or "unknown" for row in rows)),
         "strong_gate_failures": dict(Counter(reason for row in rows for reason in row["strong_gate_failures"])),

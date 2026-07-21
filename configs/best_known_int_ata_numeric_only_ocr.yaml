@@ -1,0 +1,7 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Matched ablation of the frozen best-known Int-Ata profile. EasyOCR and
+# Tesseract already use numeric decoder allowlists; this gate additionally
+# rejects mixed/overlong MMOCR strings before crop and tracklet voting.
+jersey_ocr:
+  strict_numeric_only: true

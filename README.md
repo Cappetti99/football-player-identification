@@ -58,7 +58,7 @@ The pipeline separates the two real teams from richer semantic groups.
 ## Current Capabilities
 
 - YOLO + ByteTrack tracking for `person` and `ball` detectors.
-- Experimental StrongSORT-style tracker for comparison, not the recommended default.
+- Modular YOLO detection stage with ByteTrack association as the validated default.
 - Tracklet linking with gates on temporal overlap, distance, team consistency and visual appearance.
 - Scene-cut detection with optional tracker and identity-assignment reset.
 - Team assignment from visual crop colours, with per-frame team evidence for detecting ID switches.
@@ -98,15 +98,13 @@ ft/
   features/                 team, referee, goalkeeper, OCR and visual features
   identity/                 roster parsing, Hungarian assignment and constraints
   linking/                  tracklet linking
-  tracking/                 YOLO + ByteTrack and experimental StrongSORT wrapper
+  tracking/                 detection records, YOLO stage and ByteTrack association
   utils/                    video IO and W&B helpers
   visualization/            overlay rendering
 
 configs/
   default.yaml              main end-to-end configuration
   bytetrack_tracking_debug.yaml
-  strongsort.yaml
-  strongsort_tracking_debug.yaml
   tvcalib_calibration.example.yaml
 
 docs/
@@ -124,6 +122,14 @@ tests/
 ```
 
 Local videos, outputs, W&B folders, model weights and generated artifacts are intentionally ignored by git.
+
+## Detection And Tracking Benchmark
+
+The reproducible SoccerNet-GSR benchmark reports detection metrics, standard
+multi-object tracking metrics on both raw and FT-linked identities, bootstrap
+aggregates, and diagnostic charts. See
+[`docs/gsr_detection_tracking_benchmark.md`](docs/gsr_detection_tracking_benchmark.md)
+for the frozen protocol and remote commands.
 
 ## Installation
 
@@ -425,6 +431,35 @@ python3 evaluation/gsr_jersey_ocr/run_eval.py \
 The main outputs are `metrics.json`, `predictions.csv`, `confusion.csv`,
 `threshold_sweep.csv` and `ocr_diagnostics.json`.
 
+### Experimental subject and prefix filters
+
+Two paper-derived OCR components are available behind disabled-by-default
+configuration gates:
+
+- `jersey_subject_filter` uses an external PRTReID checkpoint to remove crop
+  embeddings farther than `mean + std_threshold * std` from their
+  `display_track_id` centroid, iteratively and without enabling ReID linking;
+- `jersey_prefix_consolidation` audits or downweights a one-digit candidate
+  only when a compatible two-digit candidate has independent crop support.
+
+Both components support only `audit` and `propose`. `audit` preserves baseline
+OCR inputs and decisions; `propose` produces observational decisions but does
+not mutate track rows. Their CSV/JSON artifacts are written under `metadata/`
+as `*_jersey_subject_filter_scores`, `*_jersey_subject_filter_tracks`, and
+`*_jersey_prefix_counterfactuals`. Ground truth is never consumed by these
+runtime components.
+
+The method and PRTReID weights derive from the official
+[`jersey-number-pipeline`](https://github.com/mkoshkina/jersey-number-pipeline)
+repository and are subject to CC BY-NC 3.0, for research/non-commercial use.
+Weights remain external and their SHA-256 must be configured explicitly.
+
+The frozen conservative prefix candidate is available as
+`configs/gsr_prefix_consolidation_votes3_propose_v1.yaml`. It requires three
+independent crop votes for the compatible two-digit candidate and remains
+`propose`-only. The PRTReID subject filter is intentionally disabled in that
+profile because its validation gain did not justify its inference cost.
+
 Current thesis results are summarized in
 [`docs/evaluation_results.md`](docs/evaluation_results.md). The key finding is
 that MMOCR alone is high precision but low coverage, while MMOCR + EasyOCR
@@ -472,7 +507,8 @@ python3 -m ft.cli run --help
 - Broadcast cuts and camera changes can break temporal continuity.
 - ByteTrack IDs are not true player identities.
 - Long videos should be evaluated by action segment or scene cut when possible.
-- The StrongSORT wrapper is experimental and currently not the recommended tracker.
+- Appearance-aware tracking requires detection-level PRTReID embeddings and is
+  intentionally not represented by a simplified StrongSORT surrogate.
 - PRTReID and number-region OCR are opt-in experimental components and should be
   validated per video before being used for identity decisions.
 - OCR remains sensitive to crop quality, pose, motion blur and occlusion.

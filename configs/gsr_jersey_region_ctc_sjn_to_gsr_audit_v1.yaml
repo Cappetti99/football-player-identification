@@ -1,0 +1,23 @@
+base_config: gsr_legibility_selector_balanced.yaml
+
+# Locked runtime audit validated on GSR development, frozen and official test.
+# It exports proposals and crop-level provenance but cannot mutate jersey or
+# identity state. Do not change thresholds or checkpoint hashes in this file.
+jersey_region_ctc_audit:
+  enabled: true
+  mode: audit
+  audit_only: true
+  ctc_checkpoint: /home/cappetti/FT/models/jersey_number_ctc_sjn_to_gsr_v1.pth
+  ctc_checkpoint_sha256: 11c6356895c94e734b795d9ca2403580187d1d726c5aada51273738042c7c1c5
+  detector_checkpoint: /home/cappetti/FT/runs/jersey_number_region/yolo26s_smoke_v1/weights/best.pt
+  detector_checkpoint_sha256: ec3c4d06df75aff92f49779827e6cff96d99b84da496ced8a76ecfbb12c02ae4
+  detector_confidence: 0.25
+  box_padding: 0.25
+  batch_size: 64
+  detector_batch_size: 8
+  device: cuda
+  detector_device: "0"
+  min_override_confidence: 0.90
+  fusion_preview_enabled: false
+  max_crops_per_tracklet: 5
+  min_frame_gap: 5

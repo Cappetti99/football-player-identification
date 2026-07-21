@@ -4,6 +4,7 @@ from ft.utils.scene_cuts import (
     annotate_tracks_with_scene_segments,
     detect_scene_cuts,
     scene_segments,
+    select_tracking_reset_frames,
 )
 
 
@@ -61,6 +62,18 @@ def test_scene_segments_ignore_invalid_cut_frames():
         {"segment_index": 0, "start_frame": 0, "end_frame": 2, "num_frames": 3},
         {"segment_index": 1, "start_frame": 3, "end_frame": 4, "num_frames": 2},
     ]
+
+
+def test_tracking_reset_frames_can_select_hard_cuts_only():
+    diagnostics = {
+        "cuts": [
+            {"frame": 10, "type": "discontinuity"},
+            {"frame": 20, "type": "hard_cut"},
+        ]
+    }
+
+    assert select_tracking_reset_frames(diagnostics) == [10, 20]
+    assert select_tracking_reset_frames(diagnostics, hard_only=True) == [20]
 
 
 if __name__ == "__main__":

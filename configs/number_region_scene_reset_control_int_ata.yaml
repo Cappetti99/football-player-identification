@@ -1,0 +1,8 @@
+base_config: number_region_audit_int_ata.yaml
+
+# Control ablation: keep number-region audit artifacts available, but disable
+# number-region cost. This isolates the effect of scene-scoped Hungarian
+# assignment from the number-region cost component.
+identity:
+  assignment_scope: scene_segment
+  number_region_cost_enabled: false

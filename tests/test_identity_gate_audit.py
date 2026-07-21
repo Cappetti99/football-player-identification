@@ -1,4 +1,4 @@
-from ft.identity.gate_audit import build_identity_gate_audit
+from ft.identity.gate_audit import build_final_identity_states, build_identity_gate_audit
 
 
 def test_gate_audit_distinguishes_tracklet_and_roster_visual_availability():
@@ -37,3 +37,41 @@ def test_gate_audit_is_one_row_per_tracklet():
     report = build_identity_gate_audit([], [], {}, [], {})
     assert report["summary"]["tracklets"] == 0
     assert report["tracklets"] == []
+
+
+def test_gate_audit_reports_post_constraint_partial_state():
+    summaries = [{"track_id": 7, "display_track_id": 7, "num_frames": 2}]
+    assignments = {
+        7: {
+            "player_id": "p7",
+            "identity_status": "assigned",
+            "evidence": {"status": "assigned"},
+        }
+    }
+    tracks = {
+        "players": [
+            {1: {"display_track_id": 7, "identity_tracklet_id": 7, "player_id": "p7"}},
+            {1: {
+                "display_track_id": 7,
+                "identity_tracklet_id": 7,
+                "player_id": "unknown",
+                "identity_evidence": {"status": "cleared", "reason": "frame_team_conflict"},
+            }},
+        ]
+    }
+
+    report = build_identity_gate_audit(
+        summaries,
+        [],
+        assignments,
+        [],
+        final_identity_states=build_final_identity_states(tracks),
+    )
+
+    row = report["tracklets"][0]
+    assert row["hungarian_assignment_status"] == "assigned"
+    assert row["assignment_status"] == "partially_assigned"
+    assert row["final_assigned_rows"] == 1
+    assert row["final_unknown_rows"] == 1
+    assert row["post_assignment_reasons"] == ["frame_team_conflict"]
+    assert report["summary"]["changed_after_hungarian_tracklets"] == 1

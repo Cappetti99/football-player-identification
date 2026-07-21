@@ -33,8 +33,7 @@ from ft.identity.hungarian import (
 )
 from ft.identity.roster import normalize_jersey_number
 from ft.linking.jersey_identity_linker import JerseyIdentityLinker
-from ft.linking.tracklet_linker import TrackletLinker
-from ft.tracking.yolo_strongsort import Detection, StrongSortTrackerCore
+from ft.linking.tracklet_linker import TrackletLinker, tracklet_linker_config
 from ft.features.visual import extract_from_crop as extract_visual_from_crop, normalize_embedding_mode
 from ft.visualization.overlay import player_label, referee_label
 
@@ -193,11 +192,11 @@ def test_scene_segment_assignment_scope_resets_roster_competition():
 
     apply_assignments(tracks, assignments, assignment_scope="scene_segment")
 
-    assert sorted(assignments) == [400000, 500001]
-    assert assignments[400000]["player_id"] == "p7"
-    assert assignments[500001]["player_id"] == "p7"
-    assert tracks["players"][0][1]["identity_tracklet_id"] == 400000
-    assert tracks["players"][1][2]["identity_tracklet_id"] == 500001
+    assert sorted(assignments) == [-500002, -400001]
+    assert assignments[-400001]["player_id"] == "p7"
+    assert assignments[-500002]["player_id"] == "p7"
+    assert tracks["players"][0][1]["identity_tracklet_id"] == -400001
+    assert tracks["players"][1][2]["identity_tracklet_id"] == -500002
     assert tracks["players"][0][1]["player_id"] == "p7"
     assert tracks["players"][1][2]["player_id"] == "p7"
 
@@ -247,6 +246,11 @@ def test_jersey_numbers_start_at_one():
     assert parse_number("0") is None
     assert parse_number("A17") == 17
     assert parse_number("171") == 17
+    assert parse_number("17", strict_numeric_only=True) == 17
+    assert parse_number("A17", strict_numeric_only=True) is None
+    assert parse_number("23I", strict_numeric_only=True) is None
+    assert parse_number("2B", strict_numeric_only=True) is None
+    assert parse_number("171", strict_numeric_only=True) is None
     try:
         normalize_jersey_number(0)
     except ValueError as exc:
@@ -875,6 +879,13 @@ def test_hungarian_identity_tracklet_id_keeps_segment_assignments_local():
     assert tracks["players"][1][1]["player_id"] == "unknown"
 
 
+def test_scene_identity_tracklet_ids_do_not_collide_with_jersey_segments():
+    from ft.identity.hungarian import scene_identity_tracklet_id
+
+    assert scene_identity_tracklet_id(4, 1) < 0
+    assert scene_identity_tracklet_id(4, 1) != 400001
+
+
 def test_hungarian_prefers_raw_distribution_for_jersey_cost():
     identifier = HungarianPlayerIdentifier(roster_path=None, unknown_threshold=0.0)
     identifier.roster = [
@@ -936,6 +947,33 @@ def test_linker_team_gate_blocks_confident_team_mismatch():
     assert linker.diagnostics["rejection_counts"]["team_gate"] == 1
 
 
+def test_tracklet_linker_config_handles_legacy_hsv_options():
+    options = tracklet_linker_config(
+        {
+            "enabled": True,
+            "embedding_mode": "hsv",
+            "appearance_min_similarity": 0.72,
+            "appearance_min_similarity_hsv": 0.65,
+            "max_temporal_candidates": 50,
+            "max_gap": 90,
+        }
+    )
+
+    assert options == {"appearance_min_similarity": 0.72, "max_gap": 90}
+    assert TrackletLinker(**options).appearance_min_similarity == 0.72
+
+
+def test_tracklet_linker_config_uses_legacy_hsv_threshold_as_alias():
+    options = tracklet_linker_config(
+        {
+            "embedding_mode": "hsv",
+            "appearance_min_similarity_hsv": 0.68,
+        }
+    )
+
+    assert options["appearance_min_similarity"] == 0.68
+
+
 def test_linker_appearance_gate_blocks_low_similarity():
     tracks = two_tracklets(
         previous={"team": 1, "team_confidence": 0.9, "visual_embedding": [1.0, 0.0]},
@@ -960,6 +998,128 @@ def test_linker_accepts_distance_gap_when_embeddings_missing():
 
     assert mapping[1] == mapping[2]
     assert linker.diagnostics["accepted_links"][0]["from_track_id"] == 1
+
+
+def test_pitch_speed_gate_audit_does_not_change_linking():
+    tracks = two_tracklets(
+        previous={"position_pitch": [10.0, 10.0]},
+        current={"position_pitch": [12.0, 10.0]},
+    )
+    linker = TrackletLinker(
+        max_gap=10,
+        max_distance=20,
+        min_frames=1,
+        calibration_source="tvcalib:test.json",
+        pitch_gate={"enabled": True, "mode": "audit", "max_speed_mps": 14.0},
+    )
+
+    mapping = linker.apply(tracks)
+
+    assert mapping[1] == mapping[2]
+    accepted = linker.diagnostics["accepted_links"][0]
+    assert accepted["required_speed_mps"] == 25.0
+    assert accepted["pitch_gate_would_block"] is True
+    assert accepted["pitch_gate_blocked"] is False
+
+
+def test_pitch_speed_gate_apply_blocks_impossible_link():
+    tracks = two_tracklets(
+        previous={"position_pitch": [10.0, 10.0]},
+        current={"position_pitch": [12.0, 10.0]},
+    )
+    linker = TrackletLinker(
+        max_gap=10,
+        max_distance=20,
+        min_frames=1,
+        calibration_source="tvcalib:test.json",
+        pitch_gate={"enabled": True, "mode": "apply", "max_speed_mps": 14.0},
+    )
+
+    mapping = linker.apply(tracks)
+
+    assert mapping[1] != mapping[2]
+    assert linker.diagnostics["rejection_counts"]["pitch_speed_gate"] == 1
+    assert linker.diagnostics["pitch_gate"]["blocked_pairs"] == 1
+
+
+def test_pitch_speed_gate_ignores_non_tvcalib_source():
+    tracks = two_tracklets(
+        previous={"position_pitch": [10.0, 10.0]},
+        current={"position_pitch": [12.0, 10.0]},
+    )
+    linker = TrackletLinker(
+        max_gap=10,
+        max_distance=20,
+        min_frames=1,
+        calibration_source="auto:field_quad",
+        pitch_gate={"enabled": True, "mode": "apply", "max_speed_mps": 14.0},
+    )
+
+    mapping = linker.apply(tracks)
+
+    assert mapping[1] == mapping[2]
+    assert linker.diagnostics["accepted_links"][0]["pitch_gate_source_ok"] is False
+
+
+def test_pitch_reranking_apply_prefers_close_field_candidate():
+    tracks = pitch_reranking_tracks()
+    linker = TrackletLinker(
+        max_gap=10,
+        max_distance=20,
+        min_frames=1,
+        team_gate_enabled=False,
+        appearance_gate_enabled=False,
+        calibration_source="tvcalib:test.json",
+        pitch_reranking={"enabled": True, "mode": "apply", "weight": 0.10},
+    )
+
+    mapping = linker.apply(tracks)
+
+    assert mapping[3] == mapping[2]
+    assert mapping[3] != mapping[1]
+    accepted = next(row for row in linker.diagnostics["accepted_links"] if row["to_track_id"] == 3)
+    assert accepted["pitch_reranking_changed"] is True
+    assert accepted["pitch_reranking_baseline_from_track_id"] == 1
+    assert accepted["pitch_reranking_proposed_from_track_id"] == 2
+
+
+def test_pitch_reranking_audit_preserves_baseline_winner():
+    linker = TrackletLinker(
+        max_gap=10,
+        max_distance=20,
+        min_frames=1,
+        team_gate_enabled=False,
+        appearance_gate_enabled=False,
+        calibration_source="tvcalib:test.json",
+        pitch_reranking={"enabled": True, "mode": "audit", "weight": 0.10},
+    )
+
+    mapping = linker.apply(pitch_reranking_tracks())
+
+    assert mapping[3] == mapping[1]
+    accepted = next(row for row in linker.diagnostics["accepted_links"] if row["to_track_id"] == 3)
+    assert accepted["pitch_reranking_changed"] is True
+
+
+def test_pitch_reranking_requires_all_candidates_usable():
+    tracks = pitch_reranking_tracks()
+    tracks["players"][0][2].pop("position_pitch")
+    tracks["players"][1][2].pop("position_pitch")
+    linker = TrackletLinker(
+        max_gap=10,
+        max_distance=20,
+        min_frames=1,
+        team_gate_enabled=False,
+        appearance_gate_enabled=False,
+        calibration_source="tvcalib:test.json",
+        pitch_reranking={"enabled": True, "mode": "apply", "weight": 0.10},
+    )
+
+    mapping = linker.apply(tracks)
+
+    assert mapping[3] == mapping[1]
+    accepted = next(row for row in linker.diagnostics["accepted_links"] if row["to_track_id"] == 3)
+    assert accepted["pitch_reranking_group_usable"] is False
 
 
 def test_jersey_identity_linker_links_reliable_same_number_continuation():
@@ -1088,36 +1248,6 @@ def test_jersey_identity_linker_rejects_temporal_overlap():
 
     assert diagnostics["accepted_links"] == []
     assert diagnostics["rejection_counts"]["gap"] >= 1
-
-
-def test_strongsort_core_uses_appearance_to_keep_identity():
-    tracker = StrongSortTrackerCore(
-        min_confidence=0.1,
-        max_age=5,
-        min_hits=1,
-        max_center_distance=80.0,
-        max_cost=0.90,
-        iou_weight=0.20,
-        appearance_weight=0.70,
-        center_weight=0.10,
-        appearance_min_similarity=0.0,
-    )
-    first = tracker.update(
-        [
-            Detection(np_box(0, 0, 20, 40), 0.9, "person", [1.0, 0.0]),
-            Detection(np_box(80, 0, 100, 40), 0.9, "person", [0.0, 1.0]),
-        ]
-    )
-    ids_by_embedding = {tuple(track.embedding): track.track_id for track in first}
-
-    second = tracker.update(
-        [
-            Detection(np_box(76, 0, 96, 40), 0.9, "person", [1.0, 0.0]),
-            Detection(np_box(4, 0, 24, 40), 0.9, "person", [0.0, 1.0]),
-        ]
-    )
-
-    assert {tuple(track.embedding): track.track_id for track in second} == ids_by_embedding
 
 
 def test_position_prior_is_capped():
@@ -2182,6 +2312,21 @@ def test_overlay_labels_referee_candidate_without_question_mark():
     assert label == "ref roster_yellow 0.31"
 
 
+def pitch_reranking_tracks():
+    wrong = {"bbox": [0, 0, 10, 20], "position": [10.0, 10.0], "position_pitch": [20.0, 20.0]}
+    correct = {"bbox": [0, 0, 10, 20], "position": [14.0, 10.0], "position_pitch": [31.0, 20.0]}
+    current = {"bbox": [0, 0, 10, 20], "position": [11.0, 10.0], "position_pitch": [32.0, 20.0]}
+    return {
+        "players": [
+            {1: dict(wrong), 2: dict(correct)},
+            {1: dict(wrong), 2: dict(correct)},
+            {},
+            {3: dict(current)},
+            {3: dict(current)},
+        ]
+    }
+
+
 def two_tracklets(previous, current):
     base_previous = {"bbox": [0, 0, 10, 20], "position": (10.0, 10.0)}
     base_previous.update(previous)
@@ -2196,12 +2341,6 @@ def two_tracklets(previous, current):
             {2: dict(base_current)},
         ]
     }
-
-
-def np_box(x1, y1, x2, y2):
-    import numpy as np
-
-    return np.asarray([x1, y1, x2, y2], dtype=np.float32)
 
 
 if __name__ == "__main__":
@@ -2247,7 +2386,6 @@ if __name__ == "__main__":
     test_linker_accepts_distance_gap_when_embeddings_missing()
     test_jersey_identity_linker_links_reliable_same_number_continuation()
     test_jersey_identity_linker_rejects_far_same_number_tracklet()
-    test_strongsort_core_uses_appearance_to_keep_identity()
     test_position_prior_is_capped()
     test_reliable_jersey_beats_position_prior()
     test_assignment_gate_blocks_weak_non_jersey_assignment()

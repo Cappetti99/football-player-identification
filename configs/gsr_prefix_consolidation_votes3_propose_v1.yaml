@@ -1,0 +1,15 @@
+base_config: gsr_legibility_selector_balanced.yaml
+
+# Frozen after the first held-out prefix ablation. The candidate requires
+# three independent crop votes for a compatible two-digit number and only
+# downweights the conflicting one-digit evidence. This remains observational:
+# it must not mutate track rows or identity assignments.
+jersey_subject_filter:
+  enabled: false
+
+jersey_prefix_consolidation:
+  enabled: true
+  mode: propose
+  min_long_votes: 3
+  short_vote_weights: [1.0, 0.75, 0.50, 0.25]
+  selected_short_vote_weight: 0.25

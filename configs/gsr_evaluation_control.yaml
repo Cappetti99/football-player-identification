@@ -1,0 +1,28 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Ground-truth evaluation control. Do not expose GSR labels or a synthetic
+# roster to the prediction pipeline: matching and attribute scoring happen
+# offline after inference.
+roster_path: null
+
+jersey_ocr:
+  roster_aware: false
+  promote_roster_candidate: false
+  strict_numeric_only: false
+
+# Identity-by-name is not defined by GSR. Preserve raw team/role/jersey and
+# tracking predictions for the external evaluator instead.
+identity:
+  enforce_unique_team_jersey: false
+
+identity_propagation:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: false
+
+prtreid_linking:
+  enabled: false
+
+prtreid_identity_bridge:
+  enabled: false

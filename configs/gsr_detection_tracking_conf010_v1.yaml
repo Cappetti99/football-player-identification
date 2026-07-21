@@ -1,0 +1,6 @@
+base_config: gsr_detection_tracking_benchmark_v1.yaml
+
+# One-variable compromise ablation after confidence=0.12 exposed localized
+# association regressions on SNGS-041 and SNGS-079.
+detection:
+  confidence: 0.10

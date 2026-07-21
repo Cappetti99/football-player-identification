@@ -1,3 +1,11 @@
+"""Command-line entry point for single-video and directory FT runs.
+
+This module only translates CLI arguments into configuration values. The
+actual computer-vision and identity workflow starts in ``ft.pipeline``.
+Keeping that boundary explicit makes CLI, batch, tests, and Python callers use
+the same pipeline implementation.
+"""
+
 import argparse
 from copy import deepcopy
 from pathlib import Path
@@ -31,6 +39,7 @@ def build_parser():
 
 
 def main(argv=None):
+    """Resolve configuration and dispatch either one run or a batch."""
     args = build_parser().parse_args(argv)
     if args.command == "run":
         from ft.pipeline import run_pipeline
@@ -44,6 +53,7 @@ def main(argv=None):
 
 
 def run_batch(config, args):
+    """Run independent copies of one base configuration over a directory."""
     videos = discover_videos(args.input_dir, limit=args.limit)
     if not videos:
         raise RuntimeError(f"No video files found in input directory: {args.input_dir}")
@@ -58,6 +68,8 @@ def run_batch(config, args):
     for index, video_path in enumerate(videos, start=1):
         video_id = video_path.stem
         print(f"FT batch {index}/{len(videos)}: {video_path}")
+        # Never mutate the shared base config: paths are specific to one video
+        # and must not leak into the following iteration.
         run_config = deepcopy(config)
         run_config["video_path"] = str(video_path)
         run_config["output_path"] = str(output_dir / f"{video_id}_ft.mp4")

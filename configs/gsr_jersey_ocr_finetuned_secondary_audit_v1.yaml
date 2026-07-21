@@ -1,0 +1,15 @@
+base_config: gsr_legibility_selector_balanced.yaml
+
+# The operational pretrained recognizer remains unchanged. The fine-tuned SAR
+# is observational only and cannot mutate jersey or identity assignments.
+jersey_ocr_secondary_audit:
+  enabled: true
+  mode: audit
+  backend: mmocr_rec
+  mmocr_rec: models/jersey_ocr_sar_gsr_readable_v1.py
+  mmocr_rec_weights: models/jersey_ocr_sar_gsr_readable_v1.pth
+  mmocr_rec_weights_sha256: e93894fa213be4044bb27617452de28f09925a898726c8fcba8220c27d6d5843
+  min_votes: 4
+  min_winner_margin: 0.08
+  cache_dir: .ft_cache/ocr_secondary_audit
+  debug_crops: false

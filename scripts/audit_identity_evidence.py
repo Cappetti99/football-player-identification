@@ -24,6 +24,13 @@ def main():
     root = Path(args.artifacts_root)
     baseline = load_run(root, args.baseline_run, args.video_id)
     candidate = load_run(root, args.candidate_run, args.video_id)
+    checks = promotion_checks(
+        baseline,
+        candidate,
+        args.video_id,
+        assigned_floor=args.assigned_floor,
+        unknown_ceiling=args.unknown_ceiling,
+    )
     report = {
         "video_id": args.video_id,
         "baseline_run": args.baseline_run,
@@ -34,15 +41,9 @@ def main():
             key: candidate["overview"].get(key, 0) - baseline["overview"].get(key, 0)
             for key in ("player_rows", "assigned_rows", "unknown_rows", "jersey_rows", "propagated_rows")
         },
-        "recommendations": recommendations(candidate),
+        "promotion_checks": checks,
+        "recommendations": recommendations(candidate, checks),
     }
-    report["promotion_checks"] = promotion_checks(
-        baseline,
-        candidate,
-        args.video_id,
-        assigned_floor=args.assigned_floor,
-        unknown_ceiling=args.unknown_ceiling,
-    )
     print_report(report)
     if args.output_json:
         path = Path(args.output_json)
@@ -188,8 +189,19 @@ def low_confidence_decisions(rows):
     return sorted(output, key=lambda row: row["identity_confidence"])[:20]
 
 
-def recommendations(candidate):
+def recommendations(candidate, promotion_checks=None):
     recs = []
+    failed_checks = sorted(
+        key
+        for key, passed in (promotion_checks or {}).items()
+        if not passed
+    )
+    if failed_checks:
+        recs.append(
+            "Promotion metadata gate failed: "
+            + ", ".join(failed_checks)
+            + ". Explain the delta with a matched ablation before promotion."
+        )
     duplicates = candidate["duplicates"]
     if any(value for value in duplicates.values()):
         recs.append("Inspect duplicate identity/team-jersey constraints before promotion.")
@@ -209,7 +221,7 @@ def promotion_checks(baseline, candidate, video_id, assigned_floor=5986, unknown
         "assigned_not_lower": candidate_overview["assigned_rows"] >= baseline_overview["assigned_rows"],
         "unknown_not_higher": candidate_overview["unknown_rows"] <= baseline_overview["unknown_rows"],
         "duplicates_zero": not any(candidate["duplicates"].values()),
-        "propagation_disabled": candidate_overview["propagated_rows"] == 0,
+        "propagation_zero": candidate_overview["propagated_rows"] == 0,
     }
     bridge = candidate.get("prtreid_identity_bridge", {})
     if bridge.get("apply", False):

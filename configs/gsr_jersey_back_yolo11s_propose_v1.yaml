@@ -1,0 +1,49 @@
+base_config: gsr_evaluation_control.yaml
+
+# Manually supervised clean-back classifier trained only on 46 GSR train
+# sequences with a sequence-disjoint 37/9 internal split.
+jersey_frame_selection:
+  enabled: true
+  model_type: jersey_back_yolo11s_cls
+  checkpoint: /home/cappetti/FT/models/jersey_back_yolo11s_cls_v1.pt
+  checkpoint_sha256: 844803a2f06358065bddb2e05b66e2ea316f4632562143988a20b95f1f4ebbf8
+  mode: propose
+  device: cuda:0
+  batch_size: 32
+  top_k: 5
+  min_legibility_score: 0.50
+  min_selection_score: 0.0
+  min_frame_gap: 5
+  min_winner_votes: 2
+  min_margin: 0.0
+  allowed_roles: [player]
+  gate_each_frame_role: true
+  clean_back_weight: 0.70
+  sharpness_weight: 0.15
+  size_weight: 0.05
+  crop_quality_weight: 0.10
+  sharpness_scale: 100.0
+  size_scale: 160.0
+  use_torso_crop: true
+  torso_x_min: 0.15
+  torso_x_max: 0.85
+  torso_y_min: 0.08
+  torso_y_max: 0.68
+
+jersey_subject_filter:
+  enabled: false
+
+jersey_prefix_consolidation:
+  enabled: false
+
+identity_propagation:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: false
+
+prtreid_linking:
+  enabled: false
+
+prtreid_identity_bridge:
+  enabled: false

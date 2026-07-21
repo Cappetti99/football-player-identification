@@ -40,19 +40,9 @@ tracking:
   progress_every: 250
   inference_mode: true
   half_precision: false
-  strongsort:
-    max_age: 150
-    min_hits: 2
-    max_center_distance: 180.0
-    max_cost: 0.78
-    iou_weight: 0.45
-    appearance_weight: 0.35
-    center_weight: 0.20
-    appearance_min_similarity: 0.15
-    appearance_ema: 0.85
-    class_gate: true
-    progress_every: 250
-
+  # Annotates detections with PRTReID evidence but does not affect ByteTrack.
+  # Requires prtreid.enabled=true when explicitly enabled.
+  prtreid_detection_enrichment: false
 linking:
   enabled: true
   max_gap: 90
@@ -62,6 +52,23 @@ linking:
   team_gate_min_confidence: 0.65
   appearance_gate_enabled: true
   appearance_min_similarity: 0.72
+  pitch_gate:
+    enabled: false
+    mode: audit
+    max_speed_mps: 14.0
+    fps: 25.0
+    pitch_length: 105.0
+    pitch_width: 68.0
+    bounds_tolerance: 2.0
+    require_in_bounds: true
+    require_source_prefix: "tvcalib:"
+  pitch_reranking:
+    enabled: false
+    mode: audit
+    weight: 0.10
+    baseline_distance_scale: 160.0
+    pitch_distance_scale: 10.0
+    require_all_candidates_usable: true
   max_rejection_records: 5000
 
 jersey_identity_linking:
@@ -170,6 +177,8 @@ jersey_ocr:
   mmocr_device: cuda:0
   mmocr_det: dbnet_resnet18_fpnc_1200e_icdar2015
   mmocr_rec: SAR
+  mmocr_rec_weights: null
+  mmocr_rec_weights_sha256: null
   mmocr_batch_size: 8
   mmocr_direct_recognition: null
   progress_every: 5
@@ -183,7 +192,95 @@ jersey_ocr:
   super_resolution_max_side: 100
   demote_direct_only_single_digits: true
   prefer_two_digit_candidates: true
+  strict_numeric_only: false
   apply_to_goalkeepers: false
+
+# Optional second recognizer. It can emit diagnostics/proposals but is never
+# allowed to modify jersey assignments or identity evidence.
+jersey_ocr_secondary_audit:
+  enabled: false
+  mode: audit
+  backend: mmocr_rec
+  mmocr_rec: SAR
+  mmocr_rec_weights: null
+  mmocr_rec_weights_sha256: null
+  min_votes: 4
+  min_winner_margin: 0.08
+  cache_dir: .ft_cache/ocr_secondary_audit
+  debug_crops: false
+
+# Frozen YOLO number-region + numeric CTC experiment. This stage consumes the
+# primary OCR selected crops and exports diagnostics only.
+jersey_region_ctc_audit:
+  enabled: false
+  mode: audit
+  audit_only: true
+  ctc_checkpoint: null
+  ctc_checkpoint_sha256: null
+  detector_checkpoint: null
+  detector_checkpoint_sha256: null
+  detector_confidence: 0.25
+  box_padding: 0.10
+  batch_size: 64
+  detector_batch_size: 8
+  device: cuda
+  detector_device: "0"
+  min_override_confidence: 0.90
+  max_crops_per_tracklet: 5
+  min_frame_gap: 5
+
+# Optional SoccerNet legibility selector. Its upstream checkpoint is CC BY-NC
+# 3.0 and remains external to this repository.
+jersey_frame_selection:
+  enabled: false
+  model_type: legibility_resnet34
+  mode: audit
+  checkpoint: null
+  checkpoint_sha256: b9c61dabaea4a6ec99528c5ae394f5875aecb8207de38484eccb0f977a373e41
+  device: cuda
+  batch_size: 32
+  top_k: 5
+  min_legibility_score: 0.50
+  min_selection_score: null
+  min_frame_gap: 5
+  min_winner_votes: 2
+  min_margin: 0.0
+  allowed_roles: [player]
+  gate_each_frame_role: true
+  clean_back_weight: 0.70
+  sharpness_weight: 0.15
+  size_weight: 0.05
+  crop_quality_weight: 0.10
+  sharpness_scale: 100.0
+  size_scale: 160.0
+  use_torso_crop: true
+  torso_x_min: 0.15
+  torso_x_max: 0.85
+  torso_y_min: 0.08
+  torso_y_max: 0.68
+
+# Optional PRTReID crop-consistency filter. Method and external checkpoint are
+# CC BY-NC 3.0; research/non-commercial use only. No weights are vendored.
+jersey_subject_filter:
+  enabled: false
+  mode: audit
+  checkpoint: null
+  checkpoint_sha256: null
+  device: cuda
+  batch_size: 32
+  allowed_roles: [player]
+  min_crop_quality: 0.08
+  min_samples: 3
+  min_remaining: 2
+  rounds: 3
+  std_threshold: 3.5
+
+jersey_prefix_consolidation:
+  enabled: false
+  mode: audit
+  min_long_votes: 2
+  short_vote_weights: [1.0, 0.75, 0.50, 0.25]
+  selected_short_vote_weight: null
 
 identity:
   unknown_threshold: 0.55

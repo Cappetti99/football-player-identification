@@ -38,6 +38,11 @@ class ArtifactExporter:
             "write_failed": 0,
             "bytes_written": 0,
         }
+        self.detection_stats = {
+            "rows": 0,
+            "save_json": False,
+            "save_csv": False,
+        }
 
     def export_tracklets(self, frames, tracks, stage="tracklets", save_json=True, save_csv=True):
         rows = []
@@ -69,7 +74,24 @@ class ArtifactExporter:
                     "scene_cut_boundary": bool(track.get("scene_cut_boundary", False)),
                     "scene_cut_score": track.get("scene_cut_score"),
                     "scene_cut_type": track.get("scene_cut_type"),
+                    "activity_segment_id": track.get("activity_segment_id"),
+                    "activity_boundary": bool(track.get("activity_boundary", False)),
+                    "activity_boundary_type": track.get("activity_boundary_type"),
+                    "activity_boundary_reason": track.get("activity_boundary_reason"),
+                    "frame_athlete_count": track.get("frame_athlete_count"),
+                    "smoothed_athlete_count": track.get("smoothed_athlete_count"),
+                    "ball_interpolated": (
+                        bool(track.get("interpolated", False))
+                        if track_group == "ball"
+                        else None
+                    ),
+                    "ball_kalman_predicted": (
+                        bool(track.get("kalman_predicted", False))
+                        if track_group == "ball"
+                        else None
+                    ),
                     "bbox": bbox,
+                    "detection_confidence": track.get("detection_confidence"),
                     "role_detection": track.get("role_detection"),
                     "team_id": track.get("team"),
                     "team_confidence": float(track.get("team_confidence", 0.0)),
@@ -102,6 +124,12 @@ class ArtifactExporter:
                     "jersey_constraint": track.get("jersey_constraint"),
                     "visual_embedding": track.get("visual_embedding"),
                     "reid_model": track.get("reid_model"),
+                    "prtreid_tracklet_embedding": track.get("prtreid_tracklet_embedding"),
+                    "prtreid_tracklet_sample_count": track.get("prtreid_tracklet_sample_count"),
+                    "prtreid_tracklet_eligible": track.get("prtreid_tracklet_eligible"),
+                    "prtreid_tracklet_consistency": track.get("prtreid_tracklet_consistency"),
+                    "prtreid_tracklet_mean_crop_quality": track.get("prtreid_tracklet_mean_crop_quality"),
+                    "prtreid_tracklet_sampled_frames": track.get("prtreid_tracklet_sampled_frames"),
                     "reid_visibility_scores": track.get("reid_visibility_scores"),
                     "reid_body_masks": track.get("reid_body_masks"),
                     "reid_role_detection": track.get("reid_role_detection"),
@@ -118,7 +146,7 @@ class ArtifactExporter:
                     "player_id": track.get("player_id", "unknown"),
                     "player_name": track.get("player_name", "unknown"),
                     "identity_confidence": float(track.get("identity_confidence", 0.0)),
-                    "identity_status": track.get("identity_status"),
+                    "identity_status": track.get("identity_status") or "unknown",
                     "identity_sources": track.get("identity_sources", {}),
                     "identity_risk_flags": track.get("identity_risk_flags", []),
                     "identity_evidence": track.get("identity_evidence", {}),
@@ -166,6 +194,46 @@ class ArtifactExporter:
         )
         return rows
 
+    def export_detections(self, frames, tracks, save_json=False, save_csv=True):
+        """Persist YOLO athlete detections before tracker association/filtering."""
+        rows = []
+        for frame_num, detections in enumerate(tracks.get("detections", [])):
+            frame = frames[frame_num]
+            values = detections.values() if isinstance(detections, dict) else detections
+            for detection_index, detection in enumerate(values):
+                bbox = clip_bbox_float(detection["bbox"], frame)
+                rows.append({
+                    "video_id": self.video_id,
+                    "frame": int(frame_num),
+                    "detection_id": int(detection_index),
+                    "bbox": bbox,
+                    "detection_confidence": detection.get("detection_confidence"),
+                    "class_name": detection.get("class_name"),
+                    "role_detection": detection.get("role_detection"),
+                })
+        if save_json:
+            self.write_json(rows, self.metadata_dir / f"{self.video_id}_detections.json")
+        if save_csv:
+            self.write_csv(
+                rows,
+                self.metadata_dir / f"{self.video_id}_detections.csv",
+                fieldnames=[
+                    "video_id", "frame", "detection_id", "bbox",
+                    "detection_confidence", "class_name", "role_detection",
+                ],
+            )
+        self.detection_stats = {
+            "rows": len(rows),
+            "save_json": bool(save_json),
+            "save_csv": bool(save_csv),
+        }
+        print(
+            f"FT export detections: rows={len(rows)}"
+            f" csv={bool(save_csv)} json={bool(save_json)}",
+            flush=True,
+        )
+        return rows
+
     @staticmethod
     def _frame_export_items(tracks, frame_num):
         for track_group in ("players", "referees"):
@@ -204,7 +272,10 @@ class ArtifactExporter:
         return path
 
     def diagnostics(self):
-        return {"crops": dict(self.crop_stats)}
+        return {
+            "crops": dict(self.crop_stats),
+            "detections": dict(self.detection_stats),
+        }
 
     @staticmethod
     def write_json(payload, path):
@@ -235,6 +306,16 @@ class ArtifactExporter:
                     else:
                         out[key] = value
                 writer.writerow(out)
+
+
+def clip_bbox_float(bbox, frame):
+    height, width = frame.shape[:2]
+    return [
+        max(0.0, min(float(width - 1), float(bbox[0]))),
+        max(0.0, min(float(height - 1), float(bbox[1]))),
+        max(0.0, min(float(width), float(bbox[2]))),
+        max(0.0, min(float(height), float(bbox[3]))),
+    ]
 
 
 def crop_quality(bbox, frame):

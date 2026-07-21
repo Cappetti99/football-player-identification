@@ -129,6 +129,8 @@ def source_provenance(config):
         "ft/linking/jersey_identity_linker.py",
         "ft/identity/gate_audit.py",
         "ft/identity/prtreid_bridge.py",
+        "ft/features/jersey_frame_selector.py",
+        "ft/features/jersey_ocr.py",
     )
     return {
         "config_sha256": sha256_bytes(canonical_json(config).encode("utf-8")),

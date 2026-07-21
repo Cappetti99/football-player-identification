@@ -1,0 +1,6 @@
+base_config: gsr_detection_tracking_conf012_tvcalib_pitch_audit_v1.yaml
+
+# Experimental end-to-end ablation only. Not a promoted default.
+linking:
+  pitch_gate:
+    mode: apply

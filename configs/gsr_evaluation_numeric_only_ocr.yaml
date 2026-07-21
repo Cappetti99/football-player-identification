@@ -1,0 +1,6 @@
+base_config: gsr_evaluation_control.yaml
+
+# Matched OCR ablation: the only changed inference variable is whether mixed
+# or overlong recognizer strings may contribute digits to jersey voting.
+jersey_ocr:
+  strict_numeric_only: true

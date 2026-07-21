@@ -465,10 +465,14 @@ class HungarianPlayerIdentifier:
             and position_distance <= self.strong_evidence_max_position_distance
         )
 
-        if reliable_jersey:
-            reason = "reliable_jersey"
-        elif goalkeeper_singleton:
+        # Prefer the most specific provenance when more than one gate passes.
+        # A singleton goalkeeper supported by palette/role evidence may also
+        # happen to have a reliable number, but the roster constraint is the
+        # evidence that makes this special-case assignment safe.
+        if goalkeeper_singleton:
             reason = "goalkeeper_roster_singleton"
+        elif reliable_jersey:
+            reason = "reliable_jersey"
         elif strong_combined:
             reason = "strong_team_visual_trajectory"
         else:
@@ -638,7 +642,13 @@ def apply_assignments(tracks, assignments, assignment_scope="global"):
 
 
 def scene_identity_tracklet_id(display_id, scene_segment_id):
-    return int(display_id) * 100000 + int(scene_segment_id)
+    display_id = int(display_id)
+    scene_segment_id = int(scene_segment_id)
+    if display_id < 0 or scene_segment_id < 0:
+        raise ValueError("scene-scoped identity IDs require non-negative display and segment IDs")
+    # Scene IDs are negative so they cannot collide with global display IDs or
+    # the positive IDs produced by jersey-window segmentation.
+    return -(display_id * 100000 + scene_segment_id + 1)
 
 
 def mode(values):

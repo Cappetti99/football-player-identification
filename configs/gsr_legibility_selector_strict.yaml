@@ -1,0 +1,5 @@
+base_config: gsr_legibility_selector_balanced.yaml
+
+# Frozen zero-emission candidate; do not tune this margin on GSR test.
+jersey_frame_selection:
+  min_margin: 0.10

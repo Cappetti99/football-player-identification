@@ -1,0 +1,27 @@
+base_config: gsr_detection_tracking_conf012_v1.yaml
+
+# TVCalib path is injected per sequence by the benchmark runner.
+calibration:
+  auto: false
+  tvcalib:
+    enabled: true
+    path: null
+    per_frame: true
+    coordinate_system: tvcalib_centered
+    invert: false
+    temporal_index: 0
+    frame_offset: 1
+    nearest_frame: true
+    max_frame_gap: 13
+
+linking:
+  pitch_gate:
+    enabled: true
+    mode: audit
+    max_speed_mps: 14.0
+    fps: 25.0
+    pitch_length: 105.0
+    pitch_width: 68.0
+    bounds_tolerance: 2.0
+    require_in_bounds: true
+    require_source_prefix: "tvcalib:"

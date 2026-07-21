@@ -1,0 +1,39 @@
+base_config: gsr_evaluation_control.yaml
+
+# Manual number-readability classifier. Training and internal validation use
+# only the 46 GSR train sequences; this profile remains observational.
+jersey_frame_selection:
+  enabled: true
+  model_type: jersey_number_readability_yolo26s_cls
+  checkpoint: /home/cappetti/FT/models/jersey_number_readability_yolo26s_v1.pt
+  checkpoint_sha256: 5bd6c96abce1a1ef0c78772bf73c2e547324851a59208972467a9bce16affffc
+  mode: propose
+  device: cuda:0
+  batch_size: 32
+  top_k: 5
+  min_legibility_score: 0.0
+  min_selection_score: 0.0
+  min_frame_gap: 5
+  min_winner_votes: 2
+  min_margin: 0.0
+  allowed_roles: [player]
+  gate_each_frame_role: true
+  use_torso_crop: false
+
+jersey_subject_filter:
+  enabled: false
+
+jersey_prefix_consolidation:
+  enabled: false
+
+identity_propagation:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: false
+
+prtreid_linking:
+  enabled: false
+
+prtreid_identity_bridge:
+  enabled: false

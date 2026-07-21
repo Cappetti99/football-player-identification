@@ -180,9 +180,17 @@ def summarize_display_tracklets(tracks):
         items.sort(key=lambda item: (item[0], item[1]))
         team_values = [item[2].get("team") for item in items if item[2].get("team") is not None]
         team_id = mode(team_values)
-        embeddings = [item[2].get("visual_embedding") for item in items if item[2].get("visual_embedding") is not None]
-        sample_counts = [int(item[2].get("reid_sample_count") or 0) for item in items]
-        consistencies = [item[2].get("reid_prototype_consistency") for item in items if item[2].get("reid_prototype_consistency") is not None]
+        embeddings = [
+            item[2].get("prtreid_tracklet_embedding")
+            for item in items
+            if item[2].get("prtreid_tracklet_embedding") is not None
+        ]
+        sample_counts = [int(item[2].get("prtreid_tracklet_sample_count") or 0) for item in items]
+        consistencies = [
+            item[2].get("prtreid_tracklet_consistency")
+            for item in items
+            if item[2].get("prtreid_tracklet_consistency") is not None
+        ]
         segments = [item[2].get("scene_segment_id") for item in items if item[2].get("scene_segment_id") is not None]
         summaries[display_id] = {
             "display_track_id": int(display_id),

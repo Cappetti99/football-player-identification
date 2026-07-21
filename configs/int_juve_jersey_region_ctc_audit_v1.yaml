@@ -1,0 +1,46 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Qualitative custom-video experiment. The primary SAR behaviour remains the
+# only operational jersey source; Region CTC and its frozen fusion are audit.
+number_region:
+  enabled: false
+
+jersey_region_ctc_audit:
+  enabled: true
+  mode: audit
+  audit_only: true
+  ctc_checkpoint: /home/cappetti/FT/models/jersey_number_region_ctc_resnet18_smoke_v1.pth
+  ctc_checkpoint_sha256: f0936480d19c4b2557ac69590ce0964e3b573aef34fbef7b5f573d86bcc11754
+  detector_checkpoint: /home/cappetti/FT/runs/jersey_number_region/yolo26s_smoke_v1/weights/best.pt
+  detector_checkpoint_sha256: ec3c4d06df75aff92f49779827e6cff96d99b84da496ced8a76ecfbb12c02ae4
+  detector_confidence: 0.25
+  box_padding: 0.10
+  batch_size: 64
+  detector_batch_size: 8
+  device: cuda
+  detector_device: "0"
+  min_override_confidence: 0.90
+  max_crops_per_tracklet: 5
+  min_frame_gap: 5
+
+identity:
+  number_region_cost_enabled: false
+
+identity_propagation:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: false
+
+prtreid_linking:
+  enabled: false
+
+prtreid_identity_bridge:
+  enabled: false
+
+wandb:
+  enabled: false
+  log_artifacts: false
+  log_video: false
+  alert_on_finish: false
+  alert_on_failure: false

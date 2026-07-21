@@ -1,0 +1,47 @@
+base_config: gsr_evaluation_control.yaml
+
+# Detection/tracking benchmark profile.  It keeps the detector, ByteTrack,
+# scene resets and FT display-track linking unchanged, while disabling OCR and
+# identity evidence that cannot affect the benchmark outputs.
+roster_path: null
+
+number_region:
+  enabled: false
+
+jersey_ocr:
+  enabled: false
+
+jersey_frame_selection:
+  enabled: false
+
+prtreid:
+  enabled: false
+  role_enabled: false
+
+prtreid_linking:
+  enabled: false
+
+prtreid_identity_bridge:
+  enabled: false
+
+jersey_identity_linking:
+  enabled: false
+
+identity_propagation:
+  enabled: false
+
+export:
+  save_crops: false
+  save_detections_json: false
+  save_detections_csv: true
+  save_pre_identity_json: false
+  save_pre_identity_csv: false
+  save_final_json: false
+  save_final_csv: true
+
+wandb:
+  enabled: false
+  log_artifacts: false
+  log_video: false
+  alert_on_finish: false
+  alert_on_failure: false

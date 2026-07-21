@@ -1,0 +1,13 @@
+base_config: number_region_cost_scene_reset_int_ata.yaml
+
+# Conservative follow-up to the scene-reset number-region run. Keep the
+# per-scene Hungarian reset, but make number-region evidence a tie-breaker
+# instead of a dominant cost component.
+identity:
+  assignment_scope: scene_segment
+  number_region_cost_enabled: true
+  number_region_bonus_weight: 0.05
+  number_region_mismatch_penalty: 0.0
+  number_region_min_votes: 3
+  number_region_min_mean_confidence: 0.50
+  number_region_min_consecutive_support: 2

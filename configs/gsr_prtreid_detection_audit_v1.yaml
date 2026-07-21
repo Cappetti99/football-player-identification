@@ -1,0 +1,14 @@
+base_config: gsr_detection_tracking_benchmark_v1.yaml
+
+# Paper-aligned audit: PRTReID is evaluated for every athlete detection, but
+# ByteTrack remains the only association backend and ignores the embeddings.
+tracking:
+  backend: bytetrack
+  prtreid_detection_enrichment: true
+
+prtreid:
+  enabled: true
+  role_enabled: true
+  device: cuda
+  batch_size: 32
+  download_weights: false

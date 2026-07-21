@@ -21,8 +21,8 @@ evaluation_outputs/
 logs/
 wandb/
 runs/
+README_WORKFLOW.md
 handoff.md
-basketball_ai_how_to_detect_track_and_identify_basketball_players.ipynb
 
 # Custom local inputs. Keep only the placeholder/readme.
 costume-video/**

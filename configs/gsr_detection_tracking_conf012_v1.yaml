@@ -1,0 +1,7 @@
+base_config: gsr_detection_tracking_benchmark_v1.yaml
+
+# Frozen one-variable ablation from the 12-sequence offline confidence sweep.
+# Every other detection, tracking, linking, and evaluation setting is inherited
+# unchanged from the baseline benchmark profile.
+detection:
+  confidence: 0.12

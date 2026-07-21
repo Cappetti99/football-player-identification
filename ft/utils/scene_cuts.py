@@ -292,3 +292,15 @@ def scene_cut_rows(diagnostics):
         }
         for row in diagnostics.get("cuts", [])
     ]
+
+
+def select_tracking_reset_frames(diagnostics, hard_only=False):
+    """Return cut frames that are safe to use as tracker reset boundaries."""
+    cuts = (diagnostics or {}).get("cuts", [])
+    return sorted({
+        int(row["frame"])
+        for row in cuts
+        if row.get("frame") is not None
+        and int(row["frame"]) > 0
+        and (not hard_only or row.get("type") == "hard_cut")
+    })

@@ -344,7 +344,17 @@ def role_from_scores(scores, index):
 def role_confidence(scores, index):
     if scores is None or index >= len(scores):
         return None
-    return float(np.max(scores[index]))
+    # PRTReID exposes role-classification logits. Convert them to a calibrated
+    # [0, 1] diagnostic value instead of reporting the raw maximum logit as a
+    # confidence (which can legitimately be greater than one).
+    logits = np.asarray(scores[index], dtype=np.float64).reshape(-1)
+    if not len(logits) or not np.all(np.isfinite(logits)):
+        return None
+    probabilities = np.exp(logits - np.max(logits))
+    denominator = float(np.sum(probabilities))
+    if denominator <= 0.0:
+        return None
+    return float(np.max(probabilities) / denominator)
 
 
 def apply_feature(row, feature):

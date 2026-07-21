@@ -1,0 +1,16 @@
+base_config: default_realvideo_identity_evidence_v1.yaml
+
+# Hard broadcast cuts reset ByteTrack. Persistent count changes only create
+# soft analysis segments and never reset tracker state.
+scene_cuts:
+  tracking_reset_enabled: true
+  tracking_reset_hard_only: true
+
+activity_segmentation:
+  enabled: true
+  smoothing_window: 15
+  count_change_threshold: 3
+  persistence_frames: 12
+  persistence_ratio: 0.75
+  min_segment_frames: 30
+  include_referees: true
