@@ -1,0 +1,29 @@
+# Lightweight local test environment: no GPU, no torch, no ultralytics.
+#
+# Install in an isolated venv, then run pytest against tests/:
+#
+#   python3 -m venv .venv-local-test
+#   .venv-local-test/bin/pip install -r requirements-local-test.txt
+#   .venv-local-test/bin/python3 -m pytest tests/ -q
+#   .venv-local-test/bin/python3 -m pyflakes ft/ scripts/
+#
+# This covers pure-logic tests (identity, constraints, hungarian, config,
+# validation, jersey_ocr selection logic, tracklet_linker, scene_cuts,
+# propagation, gate_audit, pipeline phase contracts, ...): 300+ tests as of
+# 2026-07-21, ~15 seconds, zero GPU. Tests that genuinely need torch/ultralytics
+# (e.g. jersey_multiframe_digits, real YOLO/CTC inference) are skipped or fail
+# here by design; those still require the remote GPU environment.
+#
+# pyflakes catches undefined-name bugs (a variable computed inside one phase
+# function but referenced in another, e.g. the compact_activity_diagnostics
+# bug caught during the 2026-07-21 _run_pipeline_impl extraction) in
+# milliseconds, statically, before any test even runs. Run it on every edit
+# to ft/pipeline.py.
+pytest
+pyflakes
+pyyaml
+numpy
+scipy
+pandas
+Pillow
+opencv-python-headless

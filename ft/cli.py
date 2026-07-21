@@ -54,6 +54,8 @@ def main(argv=None):
 
 def run_batch(config, args):
     """Run independent copies of one base configuration over a directory."""
+    from ft.pipeline import run_pipeline
+
     videos = discover_videos(args.input_dir, limit=args.limit)
     if not videos:
         raise RuntimeError(f"No video files found in input directory: {args.input_dir}")

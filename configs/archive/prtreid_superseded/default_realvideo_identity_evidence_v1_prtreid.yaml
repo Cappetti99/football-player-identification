@@ -1,4 +1,4 @@
-base_config: default_realvideo_identity_evidence_v1.yaml
+base_config: ../../default_realvideo_identity_evidence_v1.yaml
 
 visual:
   embedding_mode: prtreid

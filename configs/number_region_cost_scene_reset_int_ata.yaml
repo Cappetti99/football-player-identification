@@ -1,4 +1,4 @@
-base_config: number_region_cost_int_ata.yaml
+base_config: archive/rejected/number_region_cost_int_ata.yaml
 
 # Solve Hungarian identity assignment independently inside each detected
 # broadcast scene segment. This resets one-to-one roster competition at scene

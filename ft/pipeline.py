@@ -896,6 +896,154 @@ def _run_pipeline_impl(config):
             save_json=config.get("export", {}).get("save_final_json", True),
             save_csv=config.get("export", {}).get("save_final_csv", True),
         )
+    # Needed both inside export_final_artifacts (written to the activity
+    # artifact) and below in run_diagnostics.write_summary; computed once
+    # here so both call sites stay in sync.
+    compact_activity_diagnostics = {
+        key: value
+        for key, value in activity_diagnostics.items()
+        if key != "frame_stats"
+    }
+    export_final_artifacts(
+        config=config,
+        artifacts_dir=artifacts_dir,
+        video_id=video_id,
+        tracks=tracks,
+        final_rows=final_rows,
+        compact_activity_diagnostics=compact_activity_diagnostics,
+        calibrator=calibrator,
+        scene_cut_diagnostics=scene_cut_diagnostics,
+        activity_diagnostics=activity_diagnostics,
+        linking_diagnostics=linking_diagnostics,
+        prtreid_tracklet_features=prtreid_tracklet_features,
+        prtreid_linking_diagnostics=prtreid_linking_diagnostics,
+        prtreid_bridge_diagnostics=prtreid_bridge_diagnostics,
+        team_assignments=team_assignments,
+        referee_diagnostics=referee_diagnostics,
+        goalkeeper_diagnostics=goalkeeper_diagnostics,
+        semantic_groups=semantic_groups,
+        jersey_diagnostics=jersey_diagnostics,
+        secondary_ocr_diagnostics=secondary_ocr_diagnostics,
+        region_ctc_diagnostics=region_ctc_diagnostics,
+        jersey_linking_diagnostics=jersey_linking_diagnostics,
+        constraints_diagnostics=constraints_diagnostics,
+        identity_propagation_diagnostics=identity_propagation_diagnostics,
+        summaries=summaries,
+        assignments=assignments,
+        candidate_scores=candidate_scores,
+        identity_candidates=identity_candidates,
+        segment_jersey_candidates=segment_jersey_candidates,
+        segment_jersey_diagnostics=segment_jersey_diagnostics,
+        segment_candidate_diagnostics=segment_candidate_diagnostics,
+        identity_evidence=identity_evidence,
+        constraint_actions=constraint_actions,
+        identity_gate_audit=identity_gate_audit,
+        number_region_diagnostics=number_region_diagnostics,
+        number_region_detections=number_region_detections,
+        number_region_evidence=number_region_evidence,
+        exporter=exporter,
+        visual_extractor=visual_extractor,
+        ocr=locals().get("ocr", None),
+    )
+
+    render_output_phase(config, frames, tracks, output_path, run_diagnostics)
+
+    print(f"FT output video: {output_path}", flush=True)
+    print(f"FT artifacts: {artifacts_dir}", flush=True)
+    print(f"FT tracklet rows: {len(final_rows)}", flush=True)
+    final_player_rows = [row for row in final_rows if row.get("track_group", "players") == "players"]
+    assigned = [row for row in final_player_rows if row.get("player_id") not in (None, "unknown")]
+    print(f"FT assigned row count: {len(assigned)}", flush=True)
+    run_diagnostics.write_summary(
+        {
+            "rows": len(final_rows),
+            "assigned_rows": len(assigned),
+            "export": exporter.diagnostics(),
+            "scene_cuts": scene_cut_diagnostics,
+            "activity_segmentation": compact_activity_diagnostics,
+            "visual_features": visual_extractor.diagnostics(),
+            "prtreid_linking": prtreid_linking_diagnostics,
+            "prtreid_identity_bridge": prtreid_bridge_diagnostics,
+            "identity_propagation": identity_propagation_diagnostics,
+            "identity_candidates": len(identity_candidates),
+            "segment_jersey_candidates": len(segment_jersey_candidates),
+            "segment_candidate_fallback": segment_candidate_diagnostics,
+            "number_region": number_region_diagnostics,
+            "identity_evidence": len(identity_evidence),
+            "constraint_actions": len(constraint_actions),
+        }
+    )
+    return {
+        "output_path": output_path,
+        "artifacts_dir": str(artifacts_dir),
+        "video_id": video_id,
+        "rows": final_rows,
+        "summaries": summaries,
+        "assignments": assignments,
+        "candidate_scores": candidate_scores,
+        "scene_cuts": scene_cut_diagnostics,
+        "activity_segmentation": activity_diagnostics,
+        "prtreid_linking": prtreid_linking_diagnostics,
+        "prtreid_identity_bridge": prtreid_bridge_diagnostics,
+        "identity_propagation": identity_propagation_diagnostics,
+        "identity_candidates": identity_candidates,
+        "segment_jersey_candidates": segment_jersey_candidates,
+        "segment_candidate_fallback": segment_candidate_diagnostics,
+        "number_region": number_region_diagnostics,
+        "identity_evidence": identity_evidence,
+        "constraint_actions": constraint_actions,
+    }
+
+
+def export_final_artifacts(
+    config,
+    artifacts_dir,
+    video_id,
+    tracks,
+    final_rows,
+    calibrator,
+    scene_cut_diagnostics,
+    activity_diagnostics,
+    compact_activity_diagnostics,
+    linking_diagnostics,
+    prtreid_tracklet_features,
+    prtreid_linking_diagnostics,
+    prtreid_bridge_diagnostics,
+    team_assignments,
+    referee_diagnostics,
+    goalkeeper_diagnostics,
+    semantic_groups,
+    jersey_diagnostics,
+    secondary_ocr_diagnostics,
+    region_ctc_diagnostics,
+    jersey_linking_diagnostics,
+    constraints_diagnostics,
+    identity_propagation_diagnostics,
+    summaries,
+    assignments,
+    candidate_scores,
+    identity_candidates,
+    segment_jersey_candidates,
+    segment_jersey_diagnostics,
+    segment_candidate_diagnostics,
+    identity_evidence,
+    constraint_actions,
+    identity_gate_audit,
+    number_region_diagnostics,
+    number_region_detections,
+    number_region_evidence,
+    exporter,
+    visual_extractor,
+    ocr,
+):
+    """Write every post-identity diagnostics/metadata artifact for one run.
+
+    Pure side-effecting I/O: every value here was already computed by earlier
+    pipeline phases. Kept as a single function (rather than split further)
+    because splitting further would only move lines around without adding
+    real functional boundaries — these are all independent `write_*` calls
+    that read the same phase outputs.
+    """
     write_json(
         {
             "calibration": calibrator.diagnostics(),
@@ -959,11 +1107,6 @@ def _run_pipeline_impl(config):
     )
     write_json(scene_cut_diagnostics, artifacts_dir / "metadata" / f"{video_id}_scene_cuts.json")
     write_table(scene_cut_rows(scene_cut_diagnostics), artifacts_dir / "metadata" / f"{video_id}_scene_cuts.csv")
-    compact_activity_diagnostics = {
-        key: value
-        for key, value in activity_diagnostics.items()
-        if key != "frame_stats"
-    }
     write_json(
         compact_activity_diagnostics,
         artifacts_dir / "metadata" / f"{video_id}_activity_segments.json",
@@ -1044,7 +1187,7 @@ def _run_pipeline_impl(config):
             artifacts_dir / "metadata" / f"{video_id}_jersey_region_ctc_crops.csv",
         )
     frame_selection = jersey_diagnostics.get("frame_selection", {})
-    frame_selector = getattr(locals().get("ocr", None), "frame_selector", None)
+    frame_selector = getattr(ocr, "frame_selector", None)
     frame_scores = list(getattr(frame_selector, "score_rows", []))
     frame_selections = list(getattr(frame_selector, "selection_rows", []))
     frame_decisions = list(getattr(frame_selector, "decision_rows", []))
@@ -1058,7 +1201,7 @@ def _run_pipeline_impl(config):
             {"diagnostics": frame_selection, "rows": rows},
             artifacts_dir / "metadata" / f"{video_id}_jersey_frame_{name}.json",
         )
-    subject_filter = getattr(locals().get("ocr", None), "subject_filter", None)
+    subject_filter = getattr(ocr, "subject_filter", None)
     subject_diagnostics = jersey_diagnostics.get("subject_filter", {})
     subject_artifacts = (
         ("scores", list(getattr(subject_filter, "score_rows", []))),
@@ -1073,7 +1216,7 @@ def _run_pipeline_impl(config):
             {"diagnostics": subject_diagnostics, "rows": rows},
             artifacts_dir / "metadata" / f"{video_id}_jersey_subject_filter_{name}.json",
         )
-    prefix_consolidator = getattr(locals().get("ocr", None), "prefix_consolidator", None)
+    prefix_consolidator = getattr(ocr, "prefix_consolidator", None)
     prefix_rows = list(getattr(prefix_consolidator, "counterfactual_rows", []))
     prefix_diagnostics = jersey_diagnostics.get("prefix_consolidation", {})
     write_table(
@@ -1104,54 +1247,6 @@ def _run_pipeline_impl(config):
     )
     write_json(exporter.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_export.json")
     write_json(visual_extractor.diagnostics(), artifacts_dir / "metadata" / f"{video_id}_visual_features.json")
-
-    render_output_phase(config, frames, tracks, output_path, run_diagnostics)
-
-    print(f"FT output video: {output_path}", flush=True)
-    print(f"FT artifacts: {artifacts_dir}", flush=True)
-    print(f"FT tracklet rows: {len(final_rows)}", flush=True)
-    final_player_rows = [row for row in final_rows if row.get("track_group", "players") == "players"]
-    assigned = [row for row in final_player_rows if row.get("player_id") not in (None, "unknown")]
-    print(f"FT assigned row count: {len(assigned)}", flush=True)
-    run_diagnostics.write_summary(
-        {
-            "rows": len(final_rows),
-            "assigned_rows": len(assigned),
-            "export": exporter.diagnostics(),
-            "scene_cuts": scene_cut_diagnostics,
-            "activity_segmentation": compact_activity_diagnostics,
-            "visual_features": visual_extractor.diagnostics(),
-            "prtreid_linking": prtreid_linking_diagnostics,
-            "prtreid_identity_bridge": prtreid_bridge_diagnostics,
-            "identity_propagation": identity_propagation_diagnostics,
-            "identity_candidates": len(identity_candidates),
-            "segment_jersey_candidates": len(segment_jersey_candidates),
-            "segment_candidate_fallback": segment_candidate_diagnostics,
-            "number_region": number_region_diagnostics,
-            "identity_evidence": len(identity_evidence),
-            "constraint_actions": len(constraint_actions),
-        }
-    )
-    return {
-        "output_path": output_path,
-        "artifacts_dir": str(artifacts_dir),
-        "video_id": video_id,
-        "rows": final_rows,
-        "summaries": summaries,
-        "assignments": assignments,
-        "candidate_scores": candidate_scores,
-        "scene_cuts": scene_cut_diagnostics,
-        "activity_segmentation": activity_diagnostics,
-        "prtreid_linking": prtreid_linking_diagnostics,
-        "prtreid_identity_bridge": prtreid_bridge_diagnostics,
-        "identity_propagation": identity_propagation_diagnostics,
-        "identity_candidates": identity_candidates,
-        "segment_jersey_candidates": segment_jersey_candidates,
-        "segment_candidate_fallback": segment_candidate_diagnostics,
-        "number_region": number_region_diagnostics,
-        "identity_evidence": identity_evidence,
-        "constraint_actions": constraint_actions,
-    }
 
 
 def run_from_config(path):

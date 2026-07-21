@@ -1,4 +1,4 @@
-base_config: number_region_audit_int_ata.yaml
+base_config: ../../number_region_audit_int_ata.yaml
 
 # Experimental cost-only integration. Number-region evidence changes the
 # Hungarian cost matrix but does not act as an assignment gate by itself.

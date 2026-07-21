@@ -1,4 +1,4 @@
-base_config: prtreid_linking_additive_control_disabled.yaml
+base_config: ../../prtreid_linking_additive_control_disabled.yaml
 
 # Int-Ata-only ablation. Keep propagation and PRTReID linking disabled so the
 # effect of conservative jersey-based display linking remains isolated.

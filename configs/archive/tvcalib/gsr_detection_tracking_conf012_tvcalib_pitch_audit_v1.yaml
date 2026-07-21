@@ -1,4 +1,4 @@
-base_config: gsr_detection_tracking_conf012_v1.yaml
+base_config: ../../gsr_detection_tracking_conf012_v1.yaml
 
 # TVCalib path is injected per sequence by the benchmark runner.
 calibration:
