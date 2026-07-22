@@ -571,30 +571,9 @@ def _run_pipeline_impl(config):
                         " identity_mutations=0",
                         flush=True,
                     )
-            for assignment in (jersey_assignments or {}).values():
-                if assignment.get("raw_jersey_distribution") is None:
-                    assignment["raw_jersey_distribution"] = assignment.get("candidates")
-            if config["jersey_ocr"].get("roster_aware", True):
-                # OCR is intentionally treated as a noisy proposal generator. The
-                # roster filter removes impossible numbers before identity sees them.
-                roster_filter = RosterAwareOCRFilter(
-                    roster,
-                    mode=config["jersey_ocr"].get("roster_filter_mode", "degrade"),
-                    unknown_team_policy=config["jersey_ocr"].get("roster_unknown_team_policy", "keep"),
-                    confidence_scale=config["jersey_ocr"].get("roster_degrade_confidence_scale", 0.60),
-                    promote_roster_candidate=config["jersey_ocr"].get("promote_roster_candidate", True),
-                    min_promoted_candidate_confidence=config["jersey_ocr"].get("min_promoted_candidate_confidence", 0.12),
-                    min_promoted_candidate_votes=config["jersey_ocr"].get("min_promoted_candidate_votes", 1),
-                    preserve_dropped_evidence=config["jersey_ocr"].get("roster_preserve_dropped_evidence", False),
-                )
-                jersey_assignments, roster_filter_diagnostics = roster_filter.apply(jersey_assignments, player_rows)
-                jersey_diagnostics["roster_filter"] = roster_filter_diagnostics
-            jersey_assignments, goalkeeper_ocr_diagnostics = filter_goalkeeper_jersey_assignments(
-                jersey_assignments,
-                player_rows,
-                apply_to_goalkeepers=config["jersey_ocr"].get("apply_to_goalkeepers", False),
+            jersey_assignments, jersey_diagnostics = normalize_and_filter_jersey_assignments(
+                jersey_assignments, jersey_diagnostics, player_rows, roster, config
             )
-            jersey_diagnostics["goalkeeper_ocr_filter"] = goalkeeper_ocr_diagnostics
             selector_cfg = config.get("jersey_frame_selection", {})
             selector_mode = str(selector_cfg.get("mode", "audit")).lower()
             subject_cfg = config.get("jersey_subject_filter", {})
@@ -669,28 +648,9 @@ def _run_pipeline_impl(config):
                     segment_frames=segment_candidate_frames,
                 )
                 segment_assignments, segment_jersey_diagnostics = segment_ocr.recognize(player_rows)
-                for assignment in (segment_assignments or {}).values():
-                    if assignment.get("raw_jersey_distribution") is None:
-                        assignment["raw_jersey_distribution"] = assignment.get("candidates")
-                if config["jersey_ocr"].get("roster_aware", True):
-                    roster_filter = RosterAwareOCRFilter(
-                        roster,
-                        mode=config["jersey_ocr"].get("roster_filter_mode", "degrade"),
-                        unknown_team_policy=config["jersey_ocr"].get("roster_unknown_team_policy", "keep"),
-                        confidence_scale=config["jersey_ocr"].get("roster_degrade_confidence_scale", 0.60),
-                        promote_roster_candidate=config["jersey_ocr"].get("promote_roster_candidate", True),
-                        min_promoted_candidate_confidence=config["jersey_ocr"].get("min_promoted_candidate_confidence", 0.12),
-                        min_promoted_candidate_votes=config["jersey_ocr"].get("min_promoted_candidate_votes", 1),
-                        preserve_dropped_evidence=config["jersey_ocr"].get("roster_preserve_dropped_evidence", False),
-                    )
-                    segment_assignments, roster_filter_diagnostics = roster_filter.apply(segment_assignments, player_rows)
-                    segment_jersey_diagnostics["roster_filter"] = roster_filter_diagnostics
-                segment_assignments, goalkeeper_ocr_diagnostics = filter_goalkeeper_jersey_assignments(
-                    segment_assignments,
-                    player_rows,
-                    apply_to_goalkeepers=config["jersey_ocr"].get("apply_to_goalkeepers", False),
+                segment_assignments, segment_jersey_diagnostics = normalize_and_filter_jersey_assignments(
+                    segment_assignments, segment_jersey_diagnostics, player_rows, roster, config
                 )
-                segment_jersey_diagnostics["goalkeeper_ocr_filter"] = goalkeeper_ocr_diagnostics
                 segment_jersey_candidates = segment_jersey_candidate_rows(
                     segment_assignments,
                     player_rows,
@@ -1343,6 +1303,41 @@ def compare_ocr_assignments(primary, secondary):
             "transition": transition,
         })
     return {**counts, "rows": rows}
+
+
+def normalize_and_filter_jersey_assignments(assignments, diagnostics, player_rows, roster, config):
+    """Backfill raw_jersey_distribution, then apply the roster and goalkeeper filters.
+
+    Shared by the primary jersey OCR pass and the segment-candidate pass,
+    which previously duplicated this exact sequence with different variable
+    names (jersey_assignments/jersey_diagnostics vs segment_assignments/
+    segment_jersey_diagnostics).
+    """
+    for assignment in (assignments or {}).values():
+        if assignment.get("raw_jersey_distribution") is None:
+            assignment["raw_jersey_distribution"] = assignment.get("candidates")
+    if config["jersey_ocr"].get("roster_aware", True):
+        # OCR is intentionally treated as a noisy proposal generator. The
+        # roster filter removes impossible numbers before identity sees them.
+        roster_filter = RosterAwareOCRFilter(
+            roster,
+            mode=config["jersey_ocr"].get("roster_filter_mode", "degrade"),
+            unknown_team_policy=config["jersey_ocr"].get("roster_unknown_team_policy", "keep"),
+            confidence_scale=config["jersey_ocr"].get("roster_degrade_confidence_scale", 0.60),
+            promote_roster_candidate=config["jersey_ocr"].get("promote_roster_candidate", True),
+            min_promoted_candidate_confidence=config["jersey_ocr"].get("min_promoted_candidate_confidence", 0.12),
+            min_promoted_candidate_votes=config["jersey_ocr"].get("min_promoted_candidate_votes", 1),
+            preserve_dropped_evidence=config["jersey_ocr"].get("roster_preserve_dropped_evidence", False),
+        )
+        assignments, roster_filter_diagnostics = roster_filter.apply(assignments, player_rows)
+        diagnostics["roster_filter"] = roster_filter_diagnostics
+    assignments, goalkeeper_ocr_diagnostics = filter_goalkeeper_jersey_assignments(
+        assignments,
+        player_rows,
+        apply_to_goalkeepers=config["jersey_ocr"].get("apply_to_goalkeepers", False),
+    )
+    diagnostics["goalkeeper_ocr_filter"] = goalkeeper_ocr_diagnostics
+    return assignments, diagnostics
 
 
 def build_jersey_ocr(
