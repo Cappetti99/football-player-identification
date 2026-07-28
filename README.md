@@ -79,6 +79,11 @@ The pipeline separates the two real teams from richer semantic groups.
   - stores raw detections and per-tracklet evidence separately from legacy OCR;
   - can contribute an optional cost term to identity assignment.
 - PRTReID-based tracklet descriptors for conservative linking experiments.
+- Evidence-based jersey-number decision layer:
+  - each recognizer (primary OCR, region CTC) appends immutable evidence instead of mutating shared state;
+  - `ft.decision.jersey_policy` arbitrates between sources via a configurable, ordered `decision_policy.jersey_number.sources` list, with `fallback` or `abstain` semantics;
+  - promoting a recognizer to decide is a configuration change, not a code change;
+  - `scripts/verify_evidence_additive.py` checks that a config change to this layer is bit-identical to the legacy path when no source list is overridden.
 - Hungarian assignment from tracklets to roster players, with optional per-scene assignment scope.
 - Identity constraints:
   - no duplicate `player_id` in the same frame;
@@ -94,6 +99,8 @@ The pipeline separates the two real teams from richer semantic groups.
 ```text
 ft/
   calibration/              pitch transform and automatic fallback calibration
+  core/                     immutable Evidence records and the EvidenceStore
+  decision/                 jersey_policy: arbitrates between evidence sources
   export/                   CSV, JSON, crop and metadata artifact export
   features/                 team, referee, goalkeeper, OCR and visual features
   identity/                 roster parsing, Hungarian assignment and constraints

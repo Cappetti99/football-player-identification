@@ -23,6 +23,11 @@ wandb/
 runs/
 README_WORKFLOW.md
 handoff.md
+tmp/
+
+# Thesis writeup material, kept locally only
+docs/thesis/
+docs/project_brief_for_llm.md
 
 # Custom local inputs. Keep only the placeholder/readme.
 costume-video/**
