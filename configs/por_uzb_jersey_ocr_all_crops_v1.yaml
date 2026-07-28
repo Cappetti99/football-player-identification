@@ -1,0 +1,15 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Overnight, maximal-evidence test: read every usable crop of every tracklet
+# (max_crops_per_tracklet set above any tracklet's usable_crops count, so
+# select_spread_crops's min(max_count, len(items)) always resolves to
+# len(items) -- literally all of them). temporal_passes stays 1: with the
+# target already equal to the full pool, extra passes would just reselect
+# the same crops. Acceptance thresholds (min_votes/min_winner_margin) are
+# left at their strict defaults on purpose, to isolate the effect of more
+# evidence alone from the effect of a looser acceptance bar (already tested
+# separately). escalate_on_unassigned is irrelevant here (nothing left in
+# the pool to escalate into) and left at its default (false).
+jersey_ocr:
+  max_crops_per_tracklet: 100000
+  temporal_passes: 1

@@ -1,0 +1,12 @@
+base_config: gsr_detection_tracking_conf012_v1.yaml
+
+# One-variable ablation on top of the frozen confidence=0.12 pilot12 baseline:
+# widen the TrackletLinker candidate-generation window (max_gap, max_distance)
+# to test whether the 44% of GSR link targets whose correct candidate never
+# even enters the pool (scripts/audit_gsr_link_candidate_ranking.py finding)
+# can be recovered. Team/appearance gates stay enabled and unchanged, so a
+# wider window adds candidates without disabling the checks that reject bad
+# merges.
+linking:
+  max_gap: 180
+  max_distance: 250.0

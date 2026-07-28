@@ -1,0 +1,28 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Same "read every usable crop" profile already validated on Por-Uzb
+# (configs/por_uzb_jersey_ocr_all_crops_v1.yaml), duplicated with a
+# video-specific name for audit clarity. max_crops_per_tracklet set above
+# any tracklet's usable_crops count, so select_spread_crops's
+# min(max_count, len(items)) always resolves to len(items). temporal_passes
+# stays 1: with the target already equal to the full pool, extra passes
+# would just reselect the same crops. Acceptance thresholds
+# (min_votes/min_winner_margin) left at strict defaults on purpose.
+#
+# Rerun target: same run as the previous Usa-Bel max-crop pass, now with
+# the full_body_sufficient confidence signal active in jersey_ocr.py and
+# consumed by the Hungarian assignment gate (narrow_region_jersey_score_penalty).
+jersey_ocr:
+  max_crops_per_tracklet: 100000
+  temporal_passes: 1
+
+# The base config's number_region audit loads a full second MMOCR+EasyOCR
+# backend instance back-to-back with the main jersey OCR one, in the same
+# process. On this rerun that sequence triggered a "CUDA error: an illegal
+# memory access" on the second (main OCR) load -- the known transitory GPU
+# instability already seen elsewhere this session, but this specific config
+# combination makes it worse by doubling the backend load pressure. Disabled
+# here since this run is testing full_body_sufficient / the identity gate,
+# not re-validating the number_region audit (already tested separately).
+number_region:
+  enabled: false

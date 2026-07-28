@@ -1,0 +1,33 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Reuse the already-validated legibility-based frame selector (see
+# gsr_legibility_selector_balanced.yaml, validated on 5 GSR sequences:
+# improves OCR accuracy, not just speed) for our custom broadcast videos.
+# top_k=5 replaces the blind temporal-spread sampling (86+ crops/tracklet)
+# with at most 5 crops per tracklet chosen by a legibility score (clean
+# back orientation, sharpness, size, crop quality) -- this is the main
+# lever for cutting jersey_ocr runtime drastically, not just a smaller
+# max_crops_per_tracklet on the old sampler.
+#
+# mode is deliberately "apply", not the "propose" used by the GSR-frozen
+# reference config: ft/pipeline.py treats any enabled selector/subject/
+# prefix module in "propose" mode as observational-only and SKIPS
+# _apply_jersey() entirely for every tracklet in the run (not just the
+# ones the selector touches), so jersey_number never reaches tracks or
+# the final export. "propose" is correct for auditing this selector
+# against an already-populated operational profile; "apply" is required
+# here because this selector is the ONLY jersey source in this profile.
+jersey_frame_selection:
+  enabled: true
+  mode: apply
+  checkpoint: /home/cappetti/tools/jersey-number-pipeline/models/legibility_resnet34_soccer_20240215.pth
+  checkpoint_sha256: b9c61dabaea4a6ec99528c5ae394f5875aecb8207de38484eccb0f977a373e41
+  device: cuda
+  batch_size: 32
+  top_k: 5
+  min_legibility_score: 0.50
+  min_frame_gap: 5
+  min_winner_votes: 2
+  min_margin: 0.0
+  allowed_roles: [player]
+  gate_each_frame_role: true

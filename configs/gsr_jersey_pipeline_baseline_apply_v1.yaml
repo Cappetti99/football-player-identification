@@ -1,0 +1,20 @@
+base_config: gsr_jersey_region_ctc_sjn_to_gsr_audit_v1.yaml
+
+# Experiment profile: measure jersey accuracy on the PIPELINE surface
+# (display_track_id from real detection and tracking), not on the offline
+# ground-truth surface.
+#
+# The frozen parent keeps the legibility selector in `propose`, which sets
+# observational_propose in ft/pipeline.py and therefore skips _apply_jersey
+# entirely: the jersey is computed but never written to the rows, so
+# tracklets.csv carries no number and any evaluation of it reads zero.
+#
+# `audit` is the minimal change that lets the decision reach the rows.
+# self.mode in JerseyFrameSelector is only validated and used for a YOLO guard;
+# it does not affect which frames are selected, so the selection stays the one
+# of the frozen profile.
+#
+# NOT a promotion: the operational default remains the frozen profile.
+
+jersey_frame_selection:
+  mode: audit

@@ -38,6 +38,10 @@ export:
   save_pre_identity_csv: false
   save_final_json: false
   save_final_csv: true
+  # Diagnostic-only profile: the evaluator reads detections/tracklets CSVs,
+  # never the annotated video. Skipping encoding saves real wall-clock time
+  # per sequence with no effect on any measured metric.
+  save_video: false
 
 wandb:
   enabled: false

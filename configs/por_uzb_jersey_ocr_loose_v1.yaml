@@ -1,0 +1,12 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# One-variable relaxation of the mmocr_easyocr jersey OCR thresholds, to test
+# whether Por-Uzb's small player crops (median 55px min-side, broadcast wide
+# shot) recover coverage the same way lower detector confidence did on the
+# YOLO number-region pipeline yesterday. Everything else (detection,
+# tracking, linking) stays identical to the baseline run.
+jersey_ocr:
+  min_confidence: 0.10
+  min_raw_confidence: 0.05
+  min_winner_margin: 0.08
+  min_votes: 1

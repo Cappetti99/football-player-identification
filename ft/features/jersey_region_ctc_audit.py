@@ -2,7 +2,7 @@
 
 import gc
 import hashlib
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from ft.features.jersey_number_ctc import (
@@ -10,6 +10,7 @@ from ft.features.jersey_number_ctc import (
     build_numeric_crnn,
     candidate_log_probabilities,
 )
+from ft.identity.roster import roster_numbers_by_team
 
 
 class JerseyRegionCTCAuditor:
@@ -29,6 +30,9 @@ class JerseyRegionCTCAuditor:
         fusion_preview_enabled=True,
         max_crops_per_tracklet=5,
         min_frame_gap=5,
+        roster=None,
+        roster_reranking_enabled=False,
+        roster_reranking_top_k=5,
     ):
         self.ctc_checkpoint = verified_file(ctc_checkpoint, ctc_checkpoint_sha256)
         self.detector_checkpoint = verified_file(
@@ -46,18 +50,23 @@ class JerseyRegionCTCAuditor:
         self.fusion_preview_enabled = bool(fusion_preview_enabled)
         self.max_crops_per_tracklet = int(max_crops_per_tracklet)
         self.min_frame_gap = int(min_frame_gap)
+        self.roster_reranking_enabled = bool(roster_reranking_enabled)
+        self.roster_reranking_top_k = int(roster_reranking_top_k)
+        self.roster_by_team = roster_numbers_by_team(roster or []) if roster_reranking_enabled else {}
 
-    def run(self, jersey_diagnostics, primary_assignments, frame_selection_rows=None):
+    def run(self, jersey_diagnostics, primary_assignments, frame_selection_rows=None, player_rows=None):
         import torch
         from PIL import Image
         from torchvision import transforms
         from ultralytics import YOLO
 
+        scene_segment_by_frame = frame_scene_segment_lookup(player_rows)
         selected = collect_selected_crops(
             jersey_diagnostics,
             frame_selection_rows=frame_selection_rows,
             max_crops_per_tracklet=self.max_crops_per_tracklet,
             min_frame_gap=self.min_frame_gap,
+            scene_segment_by_frame=scene_segment_by_frame,
         )
         if not selected:
             return self._empty("no_selected_crops")
@@ -122,7 +131,7 @@ class JerseyRegionCTCAuditor:
                 logits = recognizer(images).cpu()
             for index, row in enumerate(batch):
                 scores = candidate_log_probabilities(logits[:, index, :])
-                key = str(row["display_track_id"])
+                key = tracklet_key(row["display_track_id"], row.get("scene_segment_id"))
                 tracks[key]["scores"].append(scores)
                 tracks[key]["weights"].append(row["detector_confidence"])
                 tracks[key]["frames"].append(row["frame"])
@@ -153,15 +162,21 @@ class JerseyRegionCTCAuditor:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        team_by_display = (
+            team_by_display_track_id(player_rows) if self.roster_reranking_enabled else {}
+        )
+
         primary = primary_by_display(primary_assignments)
         standalone = {}
         fusion_preview = {}
+        roster_preview = {}
         tracklets = {}
         for key in sorted(tracks, key=numeric_sort_key):
             evidence = tracks[key]
             result = aggregate_frames(evidence["scores"], evidence["weights"])
+            display_track_id = display_track_id_from_key(key)
             proposal = {
-                "display_track_id": int(key),
+                "display_track_id": display_track_id,
                 "jersey_number": result["prediction"],
                 "confidence": result["confidence"],
                 "winner_margin": result["margin"],
@@ -171,7 +186,11 @@ class JerseyRegionCTCAuditor:
                 "applied": False,
             }
             standalone[key] = proposal
-            before = (primary.get(key) or {}).get("jersey_number")
+            # primary_assignments is not scene-segment-aware upstream, so this
+            # comparison intentionally looks up by the plain display_track_id
+            # regardless of which scene segment produced this CTC evidence --
+            # unrelated to the roster-reranking scene-disambiguation below.
+            before = (primary.get(str(display_track_id)) or {}).get("jersey_number")
             if self.fusion_preview_enabled:
                 chosen, reason = conservative_preview(
                     before,
@@ -182,14 +201,27 @@ class JerseyRegionCTCAuditor:
             else:
                 chosen, reason = before, "audit_no_fusion_preview"
             fusion_preview[key] = {
-                "display_track_id": int(key),
+                "display_track_id": display_track_id,
                 "primary_number": before,
                 "candidate_number": proposal["jersey_number"],
                 "preview_number": chosen,
                 "reason": reason,
                 "applied": False,
             }
-            tracklets[key] = {**proposal, "fusion_preview": fusion_preview[key]}
+            roster_preview[key] = roster_rerank_preview(
+                key,
+                proposal["jersey_number"],
+                result["scores"],
+                team_by_display,
+                self.roster_by_team,
+                self.roster_reranking_top_k,
+                enabled=self.roster_reranking_enabled,
+            )
+            tracklets[key] = {
+                **proposal,
+                "fusion_preview": fusion_preview[key],
+                "roster_rerank_preview": roster_preview[key],
+            }
 
         return {
             "enabled": True,
@@ -203,7 +235,9 @@ class JerseyRegionCTCAuditor:
             "tracklets_with_prediction": len(standalone),
             "standalone_assignments": standalone,
             "fusion_preview": fusion_preview,
-            "comparison_to_primary": compare_numbers(primary, standalone),
+            "roster_rerank_preview": roster_preview,
+            "roster_reranking_summary": roster_rerank_summary(roster_preview),
+            "comparison_to_primary": compare_numbers(primary, standalone_by_plain_display_id(standalone)),
             "tracklets": tracklets,
             "crops": crop_rows,
             "configuration": self.configuration(),
@@ -225,6 +259,9 @@ class JerseyRegionCTCAuditor:
             "fusion_preview_enabled": self.fusion_preview_enabled,
             "max_crops_per_tracklet": self.max_crops_per_tracklet,
             "min_frame_gap": self.min_frame_gap,
+            "roster_reranking_enabled": self.roster_reranking_enabled,
+            "roster_reranking_top_k": self.roster_reranking_top_k,
+            "roster_teams_loaded": sorted(self.roster_by_team),
         }
 
     def _empty(self, status):
@@ -239,6 +276,8 @@ class JerseyRegionCTCAuditor:
             "tracklets_with_prediction": 0,
             "standalone_assignments": {},
             "fusion_preview": {},
+            "roster_rerank_preview": {},
+            "roster_reranking_summary": roster_rerank_summary({}),
             "comparison_to_primary": compare_numbers({}, {}),
             "tracklets": {},
             "crops": [],
@@ -251,7 +290,20 @@ def collect_selected_crops(
     frame_selection_rows=None,
     max_crops_per_tracklet=5,
     min_frame_gap=5,
+    scene_segment_by_frame=None,
 ):
+    """Groups selected crops by tracklet for top-k/temporal-gap filtering.
+
+    A raw display_track_id can be reused for different physical players
+    across scene resets (e.g. resetbytetrack). Grouping by display_track_id
+    alone would merge unrelated players' crops into one CTC-recognized
+    "tracklet". scene_segment_by_frame (built from live player_rows, see
+    frame_scene_segment_lookup) lets us group by the finer
+    (display_track_id, scene_segment_id) key instead whenever that
+    information is available; falls back to the plain display_track_id key
+    when it is not (e.g. in tests that call this without player_rows).
+    """
+    scene_segment_by_frame = scene_segment_by_frame or {}
     selection_by_path = {
         str(row.get("crop_path")): {
             "score": float(
@@ -274,9 +326,13 @@ def collect_selected_crops(
             if not path or identity in seen or not Path(path).is_file():
                 continue
             seen.add(identity)
-            grouped[str(display)].append({
+            frame = int(crop.get("frame") or 0)
+            scene_segment_id = scene_segment_by_frame.get((str(display), frame))
+            group_key = tracklet_key(display, scene_segment_id)
+            grouped[group_key].append({
                 "display_track_id": int(display),
-                "frame": int(crop.get("frame") or 0),
+                "scene_segment_id": scene_segment_id,
+                "frame": frame,
                 "crop_path": path,
                 "crop_quality": float(crop.get("crop_quality") or 0.0),
                 "selection_score": (
@@ -311,6 +367,118 @@ def collect_selected_crops(
                 break
         output.extend(selected)
     return output
+
+
+def team_by_display_track_id(player_rows):
+    """Majority-vote team_id per tracklet from already-team-tagged rows.
+
+    Keyed by tracklet_key(display_track_id, scene_segment_id) when rows carry
+    scene_segment_id (a raw display_track_id can be reused for a different
+    physical player after a scene reset), falling back to the plain
+    display_track_id when they don't.
+    """
+    votes = defaultdict(Counter)
+    for row in player_rows or []:
+        display_id = row.get("display_track_id")
+        team_id = row.get("team_id")
+        if display_id is None or team_id is None:
+            continue
+        key = tracklet_key(display_id, row.get("scene_segment_id"))
+        votes[key][int(team_id)] += 1
+    return {key: counter.most_common(1)[0][0] for key, counter in votes.items() if counter}
+
+
+def tracklet_key(display_track_id, scene_segment_id):
+    """Groups CTC/roster evidence by the finer (display_track_id,
+    scene_segment_id) pair when scene_segment_id is known, since a raw
+    display_track_id can be reused for a different physical player after a
+    scene reset. Falls back to the plain display_track_id when
+    scene_segment_id is unavailable (e.g. in unit tests without player_rows),
+    preserving prior behavior."""
+    if scene_segment_id in (None, ""):
+        return str(display_track_id)
+    return f"{display_track_id}#{scene_segment_id}"
+
+
+def display_track_id_from_key(key):
+    return int(str(key).split("#", 1)[0])
+
+
+def frame_scene_segment_lookup(player_rows):
+    lookup = {}
+    for row in player_rows or []:
+        display_id = row.get("display_track_id")
+        frame = row.get("frame")
+        if display_id is None or frame is None:
+            continue
+        lookup[(str(display_id), int(frame))] = row.get("scene_segment_id")
+    return lookup
+
+
+def standalone_by_plain_display_id(standalone):
+    """Collapses scene-segment-keyed standalone proposals back to one entry
+    per plain display_track_id for the comparison_to_primary diagnostic,
+    which pre-dates scene-segment disambiguation and is not scene-aware.
+    Picks the proposal with the most recognized frames as the representative
+    one when a raw ID was reused across scene segments."""
+    best = {}
+    for proposal in standalone.values():
+        display_id = str(proposal["display_track_id"])
+        current = best.get(display_id)
+        if current is None or proposal["recognized_frames"] > current["recognized_frames"]:
+            best[display_id] = proposal
+    return best
+
+
+def roster_rerank_preview(key, original_number, ranked_scores, team_by_display, roster_by_team, top_k, enabled):
+    """Audit-only: what the roster-constrained top-1 WOULD be, restricted to
+    the top_k CTC candidates. Never written back into jersey_number/tracklets
+    used downstream -- identity_mutations stays 0 regardless of this preview.
+    """
+    display_track_id = display_track_id_from_key(key)
+    if not enabled or original_number is None:
+        return {
+            "display_track_id": display_track_id,
+            "team_id": None,
+            "roster_size": 0,
+            "original_number": original_number,
+            "preview_number": original_number,
+            "changed": False,
+            "reason": "roster_reranking_disabled" if not enabled else "candidate_abstained",
+        }
+    team_id = team_by_display.get(str(key))
+    roster = roster_by_team.get(team_id) if team_id is not None else None
+    if not roster:
+        return {
+            "display_track_id": display_track_id,
+            "team_id": team_id,
+            "roster_size": 0,
+            "original_number": original_number,
+            "preview_number": original_number,
+            "changed": False,
+            "reason": "no_roster_for_team",
+        }
+    ranked = list(ranked_scores.items())[:top_k]
+    in_roster = [int(candidate) for candidate, _score in ranked if int(candidate) in roster]
+    preview_number = in_roster[0] if in_roster else original_number
+    return {
+        "display_track_id": display_track_id,
+        "team_id": team_id,
+        "roster_size": len(roster),
+        "original_number": original_number,
+        "preview_number": preview_number,
+        "changed": preview_number != original_number,
+        "reason": "roster_constrained_topk" if in_roster else "no_topk_candidate_in_roster",
+    }
+
+
+def roster_rerank_summary(roster_preview):
+    changed = [row for row in roster_preview.values() if row.get("changed")]
+    return {
+        "tracklets": len(roster_preview),
+        "changed": len(changed),
+        "changed_display_ids": sorted(row["display_track_id"] for row in changed),
+    }
 
 
 def primary_by_display(assignments):
@@ -399,9 +567,14 @@ def sha256_file(path):
 
 def numeric_sort_key(value):
     try:
-        return 0, int(value)
+        return 0, int(value), ""
     except (TypeError, ValueError):
-        return 1, str(value)
+        pass
+    try:
+        display_part, _, rest = str(value).partition("#")
+        return 0, int(display_part), rest
+    except (TypeError, ValueError):
+        return 1, 0, str(value)
 
 
 def ratio(a, b):

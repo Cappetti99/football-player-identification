@@ -49,7 +49,18 @@ from ft.linking.tracklet_linker import TrackletLinker, tracklet_linker_config
 from ft.linking.prtreid_tracklet_linker import PRTReIDTrackletLinker
 from ft.tracking.yolo_bytetrack import YoloByteTracker
 from ft.tracking.prtreid_enricher import PRTReIDDetectionEnricher
-from ft.utils.run_diagnostics import RunDiagnostics
+from ft.utils.run_diagnostics import RunDiagnostics, canonical_json, sha256_bytes
+from ft.core.evidence import EvidenceKind
+from ft.core.evidence_store import EvidenceStore
+from ft.decision.jersey_policy import resolve_jersey_assignments
+from ft.core.emitters import (
+    PRODUCER_JERSEY_SECONDARY,
+    jersey_assignment_evidence,
+    jersey_region_ctc_evidence,
+    linking_evidence,
+    referee_role_evidence,
+    team_evidence,
+)
 from ft.utils.geometry import bbox_center
 from ft.utils.activity_segments import (
     activity_segment_rows,
@@ -79,6 +90,10 @@ class RunSetup:
     video_id: str
     roster: list
     diagnostics: RunDiagnostics
+    # Append-only evidence collected by the feature stages. Additive: stages
+    # keep mutating rows/tracks as before and emit evidence alongside, so the
+    # legacy artifacts stay byte-identical.
+    evidence: EvidenceStore
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,9 @@ def initialize_run(config):
         video_id=video_id,
         roster=roster,
         diagnostics=diagnostics,
+        evidence=EvidenceStore(
+            config_hash=sha256_bytes(canonical_json(config).encode("utf-8"))
+        ),
     )
 
 
@@ -247,7 +265,9 @@ def calibration_phase(config, frames, tracks, run_diagnostics):
 
 
 def render_output_phase(config, frames, tracks, output_path, run_diagnostics):
-    """Draw the final overlay and encode the annotated video."""
+    """Draw the final overlay and encode the annotated video, unless disabled."""
+    if not config.get("export", {}).get("save_video", True):
+        return
     with run_diagnostics.stage("overlay"):
         output_frames = draw_overlay(frames, tracks, config=config.get("overlay", {}))
     with run_diagnostics.stage("save_video"):
@@ -282,6 +302,7 @@ def _run_pipeline_impl(config):
     video_id = setup.video_id
     roster = setup.roster
     run_diagnostics = setup.diagnostics
+    evidence_store = setup.evidence
     scene_cut_diagnostics = temporal.diagnostics
     scene_cut_frames = temporal.scene_cut_frames
 
@@ -370,6 +391,12 @@ def _run_pipeline_impl(config):
         with run_diagnostics.stage("referee_second_pass"):
             referee_cfg = referee_config(config, roster)
             referee_diagnostics = RefereeAppearanceAssigner(**referee_cfg).apply(frames, tracks)
+
+    # Evidence is emitted after the second colour pass because that is the one
+    # keyed on the final display_track_id grouping.
+    evidence_store.extend(team_evidence(team_assignments, evidence_store.config_hash))
+    evidence_store.extend(referee_role_evidence(referee_diagnostics, evidence_store.config_hash))
+    evidence_store.extend(linking_evidence(linking_diagnostics, evidence_store.config_hash))
 
     goalkeeper_diagnostics = {"enabled": False, "status": "disabled"}
     if config.get("goalkeeper", {}).get("enabled", True):
@@ -541,6 +568,14 @@ def _run_pipeline_impl(config):
                     secondary_ocr_diagnostics["comparison_to_primary"] = compare_ocr_assignments(
                         jersey_assignments, secondary_proposals
                     )
+                    evidence_store.extend(
+                        jersey_assignment_evidence(
+                            secondary_proposals,
+                            evidence_store.config_hash,
+                            produced_by=PRODUCER_JERSEY_SECONDARY,
+                            model_sha256=secondary_cfg.get("mmocr_rec_weights_sha256"),
+                        )
+                    )
                     print(
                         "FT secondary jersey OCR:"
                         f" mode={secondary_ocr_diagnostics['mode']}"
@@ -551,29 +586,61 @@ def _run_pipeline_impl(config):
             region_ctc_cfg = config.get("jersey_region_ctc_audit", {})
             if region_ctc_cfg.get("enabled", False):
                 with run_diagnostics.stage("jersey_region_ctc_audit"):
-                    region_ctc_auditor = JerseyRegionCTCAuditor(**{
-                        key: value
-                        for key, value in region_ctc_cfg.items()
-                        if key not in {"enabled", "mode", "audit_only"}
-                    })
+                    region_ctc_auditor = JerseyRegionCTCAuditor(
+                        roster=roster,
+                        **{
+                            key: value
+                            for key, value in region_ctc_cfg.items()
+                            if key not in {"enabled", "mode", "audit_only"}
+                        },
+                    )
                     region_ctc_diagnostics = region_ctc_auditor.run(
                         jersey_diagnostics,
                         jersey_assignments,
                         frame_selection_rows=list(
                             getattr(getattr(ocr, "frame_selector", None), "selection_rows", [])
                         ),
+                        player_rows=player_rows,
                     )
                     print(
                         "FT jersey region CTC audit:"
                         f" selected={region_ctc_diagnostics.get('selected_crops', 0)}"
                         f" regions={region_ctc_diagnostics.get('detected_regions', 0)}"
                         f" tracklets={region_ctc_diagnostics.get('tracklets_with_prediction', 0)}"
+                        f" roster_reranking_changed={region_ctc_diagnostics.get('roster_reranking_summary', {}).get('changed', 0)}"
                         " identity_mutations=0",
                         flush=True,
                     )
+                    evidence_store.extend(
+                        jersey_region_ctc_evidence(
+                            region_ctc_diagnostics, evidence_store.config_hash
+                        )
+                    )
+            # Producers state their raw claim; the policy arbitrates between
+            # them; only then do the roster and goalkeeper filters constrain the
+            # winner. A filter is a constraint on the decision, not part of the
+            # producer, so a promoted recognizer goes through exactly the same
+            # gates as the primary one.
+            backfill_raw_jersey_distribution(jersey_assignments)
+            evidence_store.extend(
+                jersey_assignment_evidence(jersey_assignments, evidence_store.config_hash)
+            )
+            jersey_assignments, jersey_policy_diagnostics = resolve_jersey_assignments(
+                evidence_store.query(kind=EvidenceKind.JERSEY_NUMBER),
+                config.get("decision_policy", {}).get("jersey_number"),
+            )
+            print(
+                "FT jersey decision policy:"
+                f" sources={jersey_policy_diagnostics['policy']['sources']}"
+                f" subjects={jersey_policy_diagnostics['subjects']}"
+                f" assigned={jersey_policy_diagnostics['assigned']}"
+                f" per_source={jersey_policy_diagnostics['per_source']}",
+                flush=True,
+            )
             jersey_assignments, jersey_diagnostics = normalize_and_filter_jersey_assignments(
                 jersey_assignments, jersey_diagnostics, player_rows, roster, config
             )
+            jersey_diagnostics["decision_policy"] = jersey_policy_diagnostics
             selector_cfg = config.get("jersey_frame_selection", {})
             selector_mode = str(selector_cfg.get("mode", "audit")).lower()
             subject_cfg = config.get("jersey_subject_filter", {})
@@ -695,6 +762,7 @@ def _run_pipeline_impl(config):
             position_prior_tiebreak_only=config["identity"].get("position_prior_tiebreak_only", True),
             require_assignment_evidence=config["identity"].get("require_assignment_evidence", True),
             reliable_jersey_min_candidate_score=config["identity"].get("reliable_jersey_min_candidate_score", 0.45),
+            narrow_region_jersey_score_penalty=config["identity"].get("narrow_region_jersey_score_penalty", 0.15),
             strong_evidence_min_team_confidence=config["identity"].get("strong_evidence_min_team_confidence", 0.75),
             strong_evidence_min_visual_similarity=config["identity"].get("strong_evidence_min_visual_similarity", 0.82),
             strong_evidence_min_tracklet_frames=config["identity"].get("strong_evidence_min_tracklet_frames", 45),
@@ -906,9 +974,14 @@ def _run_pipeline_impl(config):
         ocr=locals().get("ocr", None),
     )
 
+    export_evidence_artifacts(evidence_store, artifacts_dir, video_id)
+
     render_output_phase(config, frames, tracks, output_path, run_diagnostics)
 
-    print(f"FT output video: {output_path}", flush=True)
+    if config.get("export", {}).get("save_video", True):
+        print(f"FT output video: {output_path}", flush=True)
+    else:
+        print("FT output video: skipped (export.save_video=false)", flush=True)
     print(f"FT artifacts: {artifacts_dir}", flush=True)
     print(f"FT tracklet rows: {len(final_rows)}", flush=True)
     final_player_rows = [row for row in final_rows if row.get("track_group", "players") == "players"]
@@ -953,6 +1026,29 @@ def _run_pipeline_impl(config):
         "identity_evidence": identity_evidence,
         "constraint_actions": constraint_actions,
     }
+
+
+def export_evidence_artifacts(evidence_store, artifacts_dir, video_id):
+    """Write the two new additive artifacts: evidence rows and their manifest.
+
+    Kept out of ``export_final_artifacts`` on purpose -- these are the only
+    files step 1 is allowed to add, so they must be trivial to diff against a
+    control run that has the feature removed.
+    """
+    metadata_dir = Path(artifacts_dir) / "metadata"
+    path = evidence_store.write(metadata_dir / f"{video_id}_evidence.parquet")
+    manifest = evidence_store.manifest(path)
+    write_json(manifest, metadata_dir / f"{video_id}_evidence_manifest.json")
+    print(
+        "FT evidence:"
+        f" rows={manifest['total']}"
+        f" kinds={len(manifest['per_kind'])}"
+        f" producers={len(manifest['per_kind_producer'])}"
+        f" abstentions={manifest['abstentions']}"
+        f" artifact={path.name}",
+        flush=True,
+    )
+    return path
 
 
 def export_final_artifacts(
@@ -1305,6 +1401,21 @@ def compare_ocr_assignments(primary, secondary):
     return {**counts, "rows": rows}
 
 
+def backfill_raw_jersey_distribution(assignments):
+    """Normalize the producer's own output, in place.
+
+    JerseyOCR stores the same dict object in `assignments` and in its
+    diagnostics, so this in-place edit is also what makes the field appear in
+    the exported jersey_ocr.json. It must therefore run before the evidence is
+    emitted: the decision policy rebuilds fresh dicts, which would leave the
+    aliased diagnostics without the field.
+    """
+    for assignment in (assignments or {}).values():
+        if assignment.get("raw_jersey_distribution") is None:
+            assignment["raw_jersey_distribution"] = assignment.get("candidates")
+    return assignments
+
+
 def normalize_and_filter_jersey_assignments(assignments, diagnostics, player_rows, roster, config):
     """Backfill raw_jersey_distribution, then apply the roster and goalkeeper filters.
 
@@ -1313,9 +1424,7 @@ def normalize_and_filter_jersey_assignments(assignments, diagnostics, player_row
     names (jersey_assignments/jersey_diagnostics vs segment_assignments/
     segment_jersey_diagnostics).
     """
-    for assignment in (assignments or {}).values():
-        if assignment.get("raw_jersey_distribution") is None:
-            assignment["raw_jersey_distribution"] = assignment.get("candidates")
+    backfill_raw_jersey_distribution(assignments)
     if config["jersey_ocr"].get("roster_aware", True):
         # OCR is intentionally treated as a noisy proposal generator. The
         # roster filter removes impossible numbers before identity sees them.
@@ -1390,6 +1499,8 @@ def build_jersey_ocr(
         aggregate_by_crop=jersey_cfg.get("aggregate_by_crop", True),
         max_candidates_per_crop=jersey_cfg.get("max_candidates_per_crop", 3),
         min_crop_candidate_ratio=jersey_cfg.get("min_crop_candidate_ratio", 0.35),
+        escalate_on_unassigned=jersey_cfg.get("escalate_on_unassigned", False),
+        escalation_max_extra_crops=jersey_cfg.get("escalation_max_extra_crops", 20),
         crop_quality_vote_weighting=jersey_cfg.get("crop_quality_vote_weighting", False),
         crop_quality_min_vote_weight=jersey_cfg.get("crop_quality_min_vote_weight", 0.35),
         crop_quality_vote_power=jersey_cfg.get("crop_quality_vote_power", 1.0),
@@ -2164,6 +2275,7 @@ def _apply_jersey(jersey_assignments, rows, tracks, allowed_roles=None):
         row["jersey_winner_margin"] = assignment.get("winner_margin")
         row["jersey_winner_score_ratio"] = assignment.get("winner_score_ratio")
         row["jersey_votes"] = assignment["votes"]
+        row["jersey_full_body_sufficient"] = assignment.get("full_body_sufficient")
         row["jersey_roster_filter"] = assignment.get("roster_filter")
         row["jersey_candidates"] = assignment.get("candidates")
         row["raw_jersey_distribution"] = assignment.get("raw_jersey_distribution")
@@ -2184,6 +2296,7 @@ def _apply_jersey(jersey_assignments, rows, tracks, allowed_roles=None):
             track["jersey_winner_margin"] = assignment.get("winner_margin")
             track["jersey_winner_score_ratio"] = assignment.get("winner_score_ratio")
             track["jersey_votes"] = assignment["votes"]
+            track["jersey_full_body_sufficient"] = assignment.get("full_body_sufficient")
             track["jersey_evidence"] = assignment
             track["jersey_roster_filter"] = assignment.get("roster_filter")
             track["jersey_candidates"] = assignment.get("candidates")

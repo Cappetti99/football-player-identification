@@ -340,6 +340,8 @@ def _validate_jersey_region_ctc_audit(audit, errors):
         errors.append("jersey_region_ctc_audit.audit_only must remain true")
     if not isinstance(audit.get("fusion_preview_enabled", True), bool):
         errors.append("jersey_region_ctc_audit.fusion_preview_enabled must be boolean")
+    if not isinstance(audit.get("roster_reranking_enabled", False), bool):
+        errors.append("jersey_region_ctc_audit.roster_reranking_enabled must be boolean")
     for key in ("ctc_checkpoint", "detector_checkpoint"):
         if not audit.get(key):
             errors.append(f"jersey_region_ctc_audit.{key} is required")

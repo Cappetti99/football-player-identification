@@ -1,0 +1,20 @@
+base_config: gsr_jersey_region_ctc_sjn_to_gsr_audit_v1.yaml
+
+# NOT VALIDATED. Experimental decision policy, for development/frozen ablation
+# only. Do not run it on the GSR test split and do not quote numbers from it
+# until it has cleared an independent held-out.
+#
+# Conservative promotion: the primary SAR recognizer keeps every tracklet it
+# decided, and the region CTC is consulted only where the primary abstained.
+# With `on_abstain: fallback` the sole transition this can produce against the
+# baseline is unknown -> number: a source earlier in the list is never
+# overridden, so correct -> wrong is impossible by construction.
+#
+# The aggressive variant (CTC first, overriding the primary) is a one-line
+# change to `sources`, and is deliberately not shipped as a profile: it can
+# regress decided tracklets and needs its own paired benchmark first.
+
+decision_policy:
+  jersey_number:
+    sources: [jersey_ocr_primary, jersey_region_ctc]
+    on_abstain: fallback

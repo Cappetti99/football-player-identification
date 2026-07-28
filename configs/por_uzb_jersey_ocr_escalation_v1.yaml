@@ -1,0 +1,10 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Isolate the effect of the new escalation mechanism alone: keep the original
+# strict jersey_ocr thresholds (min_votes/min_winner_margin unchanged from
+# default), only add escalate_on_unassigned. Baseline for comparison is
+# Por-Uzb_baseline_v2 (17/27 tracklets assigned, same strict thresholds, no
+# escalation).
+jersey_ocr:
+  escalate_on_unassigned: true
+  escalation_max_extra_crops: 40

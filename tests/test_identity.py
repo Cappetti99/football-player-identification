@@ -19,7 +19,7 @@ from ft.features.jersey_ocr import (
     requested_backends,
     vote_numbers,
 )
-from ft.features.referee import referee_color_ranges_from_roster
+from ft.features.referee import referee_color_ranges_from_roster, summarize_samples
 from ft.features.goalkeeper import GoalkeeperAppearanceAssigner, goalkeeper_color_ranges_by_team_from_roster
 from ft.features.jersey_template import prefer_two_digit_candidates
 from ft.features.roster_aware_ocr import RosterAwareOCRFilter
@@ -315,6 +315,63 @@ def test_number_one_is_soft_goalkeeper_prior():
     assert gk_cost["raw_cost"] < outfield_cost["raw_cost"]
     assert gk_cost["components"]["goalkeeper_number_one_prior"] < 0.0
     assert outfield_cost["components"]["goalkeeper_number_one_prior"] > 0.0
+
+
+def test_number_one_is_soft_goalkeeper_prior_even_with_raw_jersey_distribution():
+    # Regression test: the prior must still apply when raw_jersey_distribution
+    # is populated (the common production case), not just in the bare
+    # jersey_number fallback path covered by the test above. Previously the
+    # jersey_score branch (taken whenever the tracklet's own dominant number
+    # appears in its own distribution, which is almost always true) silently
+    # skipped this prior entirely.
+    identifier = HungarianPlayerIdentifier(roster_path=None, unknown_threshold=0.0)
+    tracklet = {
+        "track_id": 1,
+        "team_id": 1,
+        "mean_team_confidence": 0.8,
+        "jersey_number": 1,
+        "jersey_confidence": 0.9,
+        "jersey_votes": 3,
+        "raw_jersey_distribution": [{"jersey_number": 1, "confidence": 0.9, "votes": 3}],
+        "num_frames": 40,
+        "mean_crop_quality": 0.4,
+        "mean_pitch_position": None,
+        "visual_embedding": None,
+    }
+    goalkeeper = {"player_id": "gk", "team_id": 1, "jersey_number": 1, "role": "goalkeeper"}
+    outfield = {"player_id": "p1", "team_id": 1, "jersey_number": 1, "role": "player"}
+
+    gk_cost = identifier.cost_details(tracklet, goalkeeper)
+    outfield_cost = identifier.cost_details(tracklet, outfield)
+
+    assert gk_cost["jersey_score_source"] == "raw_jersey_distribution"
+    assert gk_cost["components"]["goalkeeper_number_one_prior"] < 0.0
+    assert outfield_cost["components"]["goalkeeper_number_one_prior"] > 0.0
+
+
+def test_summarize_samples_counts_only_the_winning_color():
+    # One real yellow observation plus one unrelated black observation (e.g.
+    # shorts/shadow) must not satisfy a min_tracklet_frames=2 gate on their
+    # own -- num_samples has to reflect how many frames actually support the
+    # winning color, mirroring summarize_goalkeeper_samples in goalkeeper.py.
+    samples = [
+        {"color": "yellow", "score": 0.9, "shorts_black_score": 0.1},
+        {"color": "black", "score": 0.3, "shorts_black_score": 0.8},
+    ]
+    summary = summarize_samples(samples)
+    assert summary["color"] == "yellow"
+    assert summary["num_samples"] == 1
+
+
+def test_summarize_samples_counts_all_frames_supporting_the_winner():
+    samples = [
+        {"color": "yellow", "score": 0.9, "shorts_black_score": 0.1},
+        {"color": "yellow", "score": 0.8, "shorts_black_score": 0.1},
+        {"color": "black", "score": 0.3, "shorts_black_score": 0.8},
+    ]
+    summary = summarize_samples(samples)
+    assert summary["color"] == "yellow"
+    assert summary["num_samples"] == 2
 
 
 def test_ocr_vote_requires_raw_confidence_filter():

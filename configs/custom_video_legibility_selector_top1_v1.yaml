@@ -1,0 +1,12 @@
+base_config: custom_video_legibility_selector_v1.yaml
+
+# One-variable test: read only the single best (most legible) crop per
+# tracklet instead of top_k=5. min_winner_votes stays at 2 -- this only
+# works if the OCR's own multi-variant augmentation of that one crop
+# (torso/torso_clahe/number_band/sharpened/etc, ~12 variants) agrees with
+# itself often enough to clear the vote bar without a second frame. If
+# most tracklets end up "insufficient_votes", that tells us variant-level
+# agreement is not a substitute for real multi-frame confirmation, and we
+# should go back to a small top_k>1 instead of top_k=1.
+jersey_frame_selection:
+  top_k: 1

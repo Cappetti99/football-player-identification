@@ -40,3 +40,4 @@ costume-video/**
 # Local secrets
 .env
 *.env
+.venv-local-test/

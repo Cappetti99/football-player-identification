@@ -1,5 +1,17 @@
 # Handoff FT - aggiornato 2026-07-21
 
+## Briefing iniziale
+
+Prima di usare la cronologia di questo handoff, leggere:
+
+```text
+docs/project_brief_for_llm.md
+```
+
+Il briefing spiega finalita', domanda scientifica, pipeline, protocollo
+anti-leakage, risultati, esperimenti respinti, stato validato e prossime
+priorita'. Questo file conserva invece il dettaglio cronologico e operativo.
+
 ## Setup operativo per l'LLM
 
 Quando leggi questo handoff, lavora come un esperto senior di:
@@ -59,6 +71,681 @@ Formato delle risposte:
   invece di `Ti suggerisco di considerare l'implementazione di ByteTrack...`.
 
 ## Baseline e stato progetto
+
+## Aggiornamento 2026-07-27 (2) - il vantaggio dell'ordinamento sopravvive al tracking
+
+Seguito diretto della sezione successiva, che misurava la policy sulla
+superficie offline. Qui la stessa domanda sulla superficie **pipeline**:
+detection e tracking reali, `display_track_id` invece di `gt_track_id`. Il
+default operativo resta invariato.
+
+### Prerequisiti risolti
+
+```text
+GPU        driver NVIDIA 580.173.02 riallineato dopo reboot; torch.cuda True
+video      7 clip generate da img1 con scripts/make_soccernet_videos.py
+           (portato in FT dal repo legacy, sha256
+            12f00b6c8960dfc141e9338d560060b3aa60eedb18dd07626d450ff97bb5ae28)
+           750 frame, 25 fps, 1920x1080 ciascuna
+frame      max_frames: 300 da configs/default.yaml: la pipeline elabora i
+           primi 300 frame, non i 750. Applicato a entrambi i bracci;
+           l'evaluator riceve --max-frames 300 per allineare la GT.
+```
+
+### Le prime due run erano cieche: mode propose
+
+Le run iniziali con i profili congelati hanno prodotto `emitted_on_visible: 0`
+su entrambi i bracci e su tutte le sequenze, con metriche **identiche fino
+all'ultima cifra**. Causa: il profilo congelato tiene
+`jersey_frame_selection.mode: propose`, che attiva `observational_propose` in
+`ft/pipeline.py` e salta `_apply_jersey`. Il numero viene calcolato, la policy
+lo sceglie, ma non raggiunge mai le righe: `tracklets.csv` non contiene jersey.
+
+Il segnale che ha smascherato il problema e' l'identita' perfetta fra i due
+bracci: con policy diverse e' impossibile, a meno che la policy non arrivi da
+nessuna parte.
+
+Correzione: `mode: audit`. Verificato in `ft/features/jersey_frame_selector.py`
+che `self.mode` compare solo nella validazione e in una guardia per i modelli
+YOLO, quindi **non** cambia quali frame vengono selezionati: la selezione resta
+quella del profilo congelato.
+
+```text
+configs/gsr_jersey_pipeline_baseline_apply_v1.yaml
+  sha256 dbae8964a96867c4ef93f695873ca597e1f196cc134421f1fd05d82314ccc33d
+configs/gsr_jersey_pipeline_ctc_primary_apply_v1.yaml
+  sha256 76c823fd07bde7e0be27bf760e98ea1ca9d118de4a1fadb7b46563d424f9690e
+```
+
+Le run cieche restano utili come prova che il disegno e' appaiato: `tracklet
+rows` identiche fra i bracci su tutte e 7 le sequenze.
+
+### Risultati, 7 sequenze, 300 frame, 114 tracklet GT visibili
+
+Valutazione con `scripts/evaluate_ft_gsr.py`, matching per IoU 0.50, livello
+tracklet. I 114 tracklet GT sono gli stessi nei due bracci.
+
+```text
+                gt visibili  emessi  corretti  coverage  acc.emessi  acc.all
+baseline            114        63       19      0.5526     0.3016     0.1667
+CTC primario        114        94       53      0.8246     0.5638     0.4649
+
+emissioni su GT senza maglia visibile:  11 -> 14
+```
+
+Transizioni:
+
+```text
+abstain -> correct    20
+wrong   -> correct    17
+wrong   -> abstain     2
+correct -> correct    16
+correct -> wrong       3
+abstain -> abstain    18
+abstain -> wrong      13
+wrong   -> wrong      25
+
+corretti 19 -> 53, guadagno netto +34
+40 discordanti, 37 a favore del CTC
+McNemar / binomiale esatto: p = 1.947e-08
+```
+
+Per sequenza, corretti baseline -> CTC:
+
+```text
+SNGS-089   6 -> 11      SNGS-094   4 -> 9
+SNGS-091   0 ->  1      SNGS-095   2 -> 9
+SNGS-092   2 ->  9      SNGS-096   1 -> 5
+SNGS-093   4 ->  9
+```
+
+Il CTC vince in 7 sequenze su 7. Bootstrap per sequenza, 10000 repliche,
+seed 20260726:
+
+```text
+delta accuracy all   +0.2978   IC95 [+0.2082, +0.3740]   P(delta>0) = 1.0
+```
+
+SNGS-091 resta degenere: 0 corretti su 15 per il baseline, 1 per il CTC. In
+quella sequenza l'audit CTC trova 9 regioni su 33 crop; il numero non si vede.
+
+### Confronto fra le due superfici
+
+```text
+                        offline (GT)    pipeline (tracker)
+corretti baseline          18/116           19/114
+corretti CTC               72/116           53/114
+delta accuracy all         +0.466           +0.298
+correct -> wrong             2                3
+wrong -> correct            46               17
+```
+
+Circa due terzi del guadagno sopravvive. Il recupero di errori cala molto
+(46 -> 17) mentre le regressioni restano stabili (2 -> 3): il rumore del
+tracking non rende il CTC piu' sbagliato, lo rende piu' silenzioso — crop
+peggiori, meno regioni rilevate, meno occasioni di correggere. Degradazione
+benigna.
+
+Le due superfici non sono confrontabili numero a numero: unita' diverse
+(`gt_track_id` contro `display_track_id`), finestra diversa (sequenze intere
+contro 300 frame) e denominatore diverso. Vanno riportate separatamente.
+
+Un dettaglio che conferma il meccanismo: le emissioni crescono di 31
+(63 -> 94) ma i corretti di 34. Se il CTC coprisse soltanto dove il SAR tace i
+due incrementi coinciderebbero; che i corretti crescano di piu' significa che
+sta anche correggendo emissioni sbagliate del SAR.
+
+Nota: il baseline sembra piu' accurato in pipeline che offline sulle emissioni
+(0.302 contro 0.231). Non e' un miglioramento: emette su molte meno tracklet,
+quindi parla solo dove e' facile.
+
+### Criterio di promozione: invariato e ancora aperto
+
+```text
+correct -> wrong           3      richiesto 0
+nuove emissioni errate    16      (13 su visibili + 3 su non visibili)
+                                  richiesto 0
+```
+
+Il braccio B fallisce il gate su entrambe le superfici, come dichiarato in
+anticipo nella pre-registrazione. Nessuna decisione presa: il default resta
+`sources: [jersey_ocr_primary]`.
+
+Il quadro completo per decidere: la regola cosi' com'e' scritta boccia un
+cambiamento che triplica i tracklet corretti su due superfici indipendenti,
+con p dell'ordine di 1e-08, al prezzo di tre tracklet peggiorati. Qualunque
+riformulazione va dichiarata come avvenuta **dopo** aver visto questi numeri.
+
+### Limiti
+
+- 300 frame su 750 per sequenza.
+- 7 sequenze, una sola esecuzione, nessun blocco pulito residuo in GSR.
+- `roster_path: null`: filtro roster e identita' reale non girano.
+- `_apply_jersey` con `mode: audit` riceve `allowed_roles=None`, quindi scrive
+  su tutti i gruppi; offline i ruoli erano player e goalkeeper.
+
+### Prossimo passo
+
+Ispezionare le 3 regressioni `correct -> wrong` una per una. Sulla superficie
+offline le 2 regressioni erano lo stesso errore (`27` letto `21`, il `7`
+scambiato per `1`): se anche qui emerge un pattern di forma, diventa un
+bersaglio per una calibrazione o un'astensione mirata invece che un costo
+irriducibile.
+
+## Aggiornamento 2026-07-27 - held-out policy jersey: l'ordine delle sorgenti vale +44 tracklet
+
+Questa sezione riporta il primo esperimento sulla decision policy. Non modifica
+il default operativo, che resta `sources: [jersey_ocr_primary]`. Il criterio di
+promozione **non** e' stato cambiato: resta aperto e discusso in fondo.
+
+### Held-out nuovo, dichiarato prima
+
+GSR train e' esaurito: 57 sequenze, tutte consumate (37 OCR train, 9
+development, 11 frozen). Il test e' congelato. Nello split valid restavano 7
+sequenze che nessun esperimento aveva toccato.
+
+```text
+manifest: evaluation/jersey_heldout_manifests/jersey_policy_heldout_v1.json
+manifest_sha256: b8e18d31c6f4f18cf11bf2e3e178ac9ba2314175732e3f01a08b3846def95e1c
+sequenze: SNGS-089 091 092 093 094 095 096
+tracklet con numero GT: 116
+pre-registrazione: evaluation/jersey_heldout_manifests/jersey_policy_heldout_v1_preregistration.md
+```
+
+Le esclusioni sono **derivate**, non elencate a memoria: 9900 file scansionati,
+ogni sequenza scartata registrata con il file che la squalifica. Dopo questo
+blocco GSR non ha piu' superficie pulita: una domanda successiva richiedera' il
+test congelato o un'altra fonte.
+
+### Superficie e strumenti
+
+Superficie offline, la stessa di frozen e test: box e track_id dalla ground
+truth, chiave `(sequence, gt_track_id)`. Il tracking non entra.
+
+```text
+1. evaluation/gsr_jersey_ocr/run_eval.py            -> shared_surface (crop + SAR)
+2. scripts/evaluate_jersey_number_region_ctc_ocr_run.py -> region_ctc
+3. scripts/apply_jersey_policy_to_predictions.py    -> bracci A e B
+4. scripts/aggregate_jersey_thesis_benchmark.py     -> transizioni e bootstrap
+```
+
+Il passo 3 non reimplementa la regola: costruisce evidenze dai due
+`predictions.csv` e chiama `ft.decision.jersey_policy.resolve_jersey_assignments`,
+la stessa funzione che gira in pipeline. Se la regola cambia, cambia in un solo
+posto.
+
+Divergenza deliberata dalla `shared_surface` del GSR test, che usava il SAR
+**fine-tuned**: qui il baseline e' il SAR **pretrained**, cioe' il recognizer
+operativo dichiarato. Misurare il fallback contro un baseline non spedito non
+avrebbe risposto alla domanda.
+
+Device CPU: driver NVIDIA disallineato con il modulo kernel su `lie`
+(NVML "Driver/library version mismatch", serve reboot). Baseline e candidati
+girano sullo stesso device e i numeri sono nuovi, non confrontati con i valori
+GPU gia' pubblicati.
+
+### Il baseline e' coerente con il record
+
+```text
+                        coverage   accuracy assigned
+development (9 seq)      0.7548         0.1709
+frozen (11 seq)          0.7168         0.2419
+held-out (7 seq)         0.6724         0.2308
+```
+
+Il SAR pretrained si comporta come documentato. La superficie e' comparabile.
+Anche il CTC lo e': region detection coverage 0.6075 contro 0.6104 sul test.
+
+### Bracci dichiarati e risultati
+
+```text
+A  fallback     sources=[jersey_ocr_primary, jersey_region_ctc]
+B  ctc_primary  sources=[jersey_region_ctc, jersey_ocr_primary]
+```
+
+```text
+                   assigned  correct  coverage  acc.assigned  acc.all
+baseline SAR          78       18      0.6724     0.2308      0.1552
+A  fallback           95       28      0.8190     0.2947      0.2414
+B  CTC primario       95       72      0.8190     0.7579      0.6207
+```
+
+Transizioni contro la baseline:
+
+```text
+                    A        B
+abstain->correct    10       10
+abstain->wrong       7        7
+correct->correct    18       16
+correct->wrong       0        2
+wrong->correct       0       46
+wrong->wrong        60       14
+```
+
+Il braccio A ha **zero** `correct->wrong`, come garantito per costruzione
+quando la baseline e' anche la prima sorgente: nessuna sorgente successiva puo'
+scavalcare cio' che la prima ha deciso.
+
+Bootstrap per sequenza, 10000 repliche, seed 20260726:
+
+```text
+                    delta accuracy all     IC95                P(delta>0)
+A  fallback              +0.0874      [0.0323, 0.1574]          0.9997
+B  CTC primario          +0.4657      [0.4016, 0.5478]          1.0000
+```
+
+### Confronto diretto A contro B
+
+E' la misura piu' pulita: stessa superficie, stessi crop, **stessa coverage**
+(delta esattamente 0.0, entrambi assegnano gli stessi 95 tracklet). L'unica
+variabile e' l'ordine di priorita'.
+
+```text
+delta accuracy all   +0.3784   IC95 [0.2750, 0.4959]   P(delta>0) = 1.0
+transizioni: recovered_correct 46, correct_to_wrong 2,
+             unchanged_correct 26, unchanged_wrong 15,
+             wrong_to_wrong 6, both_abstain 21
+48 discordanti, 46 a favore di B
+test binomiale paired esatto: p = 8.363e-12
+guadagno netto: +44 tracklet
+```
+
+Interpretazione: l'ordinamento conservativo cattura meno di un quinto del
+guadagno disponibile. Il motivo e' che protegge una sorgente che, quando
+decide, sbaglia il 77% delle volte: il braccio A lascia intatti 60 tracklet
+errati del SAR, dei quali B ne corregge 46.
+
+### Le due regressioni sono lo stesso errore
+
+```text
+SNGS-089 track 10: GT 27, SAR 27, CTC 21
+SNGS-092 track  4: GT 27, SAR 27, CTC 21
+```
+
+Entrambe `27 -> 21`: una singola confusione sistematica di forma, il `7` letto
+come `1`, della stessa famiglia del `9/5` gia' documentato. Bersaglio concreto
+per una calibrazione o un'astensione mirata, non rumore irriducibile.
+
+### Metrica da non riportare
+
+`gt_top5_rate` vale 0 per entrambi i bracci policy: l'aggregatore la calcola da
+`ocr_diagnostics.json`, che le directory fuse non hanno, e su sorgenti miste
+sarebbe comunque mal definita perche' i top-5 del CTC vivono in un altro
+artifact. Il `-0.59` contro la baseline **non e' una regressione**. Conferma:
+nel confronto A contro B, dove entrambi valgono zero, il delta e' esattamente
+0.0. Dichiararla non disponibile finche' l'adattatore non propaga i candidati
+della sorgente vincente.
+
+### Tensione aperta nel criterio di promozione
+
+La regola dichiarata chiede zero `correct->wrong` **e** zero nuove emissioni
+errate. Applicata a questi risultati:
+
+```text
+A  zero regressioni, ma 7 nuove emissioni errate   -> bocciato
+B  44 tracklet netti in piu', 2 regressioni        -> bocciato
+```
+
+Il criterio boccia entrambi, incluso quello che quadruplica i tracklet
+corretti. Un vincolo di zero nuove emissioni errate rende impossibile
+qualunque aumento di coverage, salvo sorgenti perfette.
+
+Non e' stata presa alcuna decisione: il default resta invariato. Una eventuale
+riformulazione — per esempio bilancio netto con intervallo di confidenza invece
+di conteggi assoluti — e' una scelta metodologica, e va dichiarata come
+avvenuta **dopo** aver visto questi numeri.
+
+### Cosa questi numeri non dimostrano
+
+- Non dicono che il CTC sia buono in assoluto: il confronto e' contro un
+  incumbent debole.
+- La superficie e' offline, con box e track dalla ground truth: il rumore del
+  tracking non c'e'.
+- 7 sequenze, device CPU, una sola esecuzione.
+- Nessuna run di pipeline con il profilo B e' mai stata eseguita.
+
+### Profili
+
+```text
+configs/gsr_jersey_ctc_fallback_coverage_v1.yaml   braccio A
+configs/gsr_jersey_ctc_primary_v1.yaml             braccio B
+```
+
+Entrambi non validati per `apply`. Nessuno dei due va eseguito sul GSR test.
+
+### Prossimo passo previsto
+
+Eseguire la pipeline reale con il profilo B sulle stesse 7 sequenze e
+verificare se il guadagno sopravvive al rumore di detection e tracking.
+
+La superficie e' diversa — `display_track_id` invece di `gt_track_id` — ma
+l'evaluator esiste gia': `scripts/evaluate_ft_gsr.py` fa matching per IoU fra
+`tracklets.csv` e le label GSR e produce coverage, accuratezza sulle emissioni
+visibili, falsi su GT non visibile e calibrazione della confidenza. Le
+definizioni non coincidono con quelle della superficie offline, quindi i due
+esperimenti vanno riportati separatamente e non confrontati numero a numero.
+
+Due run necessarie, identiche salvo la riga `sources`: il tracking e'
+deterministico a parita' di input, quindi il confronto risulta appaiato sulle
+stesse track.
+
+## Aggiornamento 2026-07-26 - decision policy jersey, passo 2 equivalente
+
+Questa sezione prevale sulla precedente per il percorso della decisione jersey.
+Non modifica detection, tracking, OCR, soglie, checkpoint ne' i risultati
+congelati. Il comportamento operativo e' identico a prima.
+
+### Perche' il piano iniziale e' stato cambiato
+
+Il passo 2 previsto era "portare `summarize` a leggere dalle evidenze". Il
+rilievo del contratto reale di `HungarianPlayerIdentifier.summarize` lo ha
+invalidato: legge sette famiglie di campi dalle righe, e le evidenze ne
+coprono due e mezzo.
+
+```text
+jersey            coperta
+team              coperta
+ruolo             solo arbitro; portiere e PRTReID no
+portiere          non coperta
+gruppi semantici  non coperta
+geometria/visuale non coperta (position_pitch, visual_embedding)
+crop              non coperta (crop_quality, crop_path)
+```
+
+Le tre ultime sono per-frame: emetterle trasformerebbe l'artifact da tabella a
+livello tracklet a tabella a livello frame, su 4901 righe. E non serve
+all'obiettivo, che e' promuovere un recognizer con una riga di config.
+
+Il passo 2 e' stato quindi ristretto al **solo canale jersey**, intercettando
+nel punto in cui si sceglie quale numero diventa un assignment. Il resto della
+pipeline continua a leggere dalle righe.
+
+### Stratificazione
+
+```text
+produttori emettono claim grezzo
+  -> decision policy sceglie fra le sorgenti
+  -> filtro roster e filtro portiere vincolano il vincitore
+  -> _apply_jersey
+```
+
+Il filtro e' un vincolo sulla decisione, non parte del produttore: un
+recognizer promosso attraversa esattamente gli stessi gate del primario.
+
+### Codice
+
+```text
+ft/decision/jersey_policy.py    resolve_jersey_assignments(evidence, policy)
+ft/decision/__init__.py
+ft/pipeline.py                  innesto policy + backfill estratto
+ft/config.py                    blocco decision_policy nei DEFAULTS
+ft/core/emitters.py             payload jersey lossless
+tests/test_jersey_decision_policy.py     17 test
+configs/gsr_jersey_ctc_fallback_coverage_v1.yaml
+```
+
+```text
+ft/pipeline.py sha256
+  cd8aaeeee6c15a6c2e37cc7c5b107daba7b8e9cfd15e7eda52d594563ed7f3f3
+scripts/verify_evidence_additive.py sha256
+  e323f966a686a5714d28d6d7c446f3035a49b4d3fd8efbef358a8d321ae2a22e
+```
+
+### Policy
+
+```yaml
+decision_policy:
+  jersey_number:
+    sources: [jersey_ocr_primary]
+    on_abstain: fallback
+```
+
+`sources` e' ordinata: vince la prima sorgente che ha **deciso**. Con
+`on_abstain: fallback` una sorgente successiva parla solo dove la precedente si
+e' astenuta, quindi l'unica transizione possibile rispetto alla baseline e'
+`unknown -> numero`; `correct -> wrong` e' impossibile per costruzione, non per
+soglia. Il default a sorgente singola riproduce il comportamento storico.
+
+Il payload CTC e' mappato esplicitamente (`recognized_frames -> votes`,
+`top5 -> candidates`) e i campi senza equivalente a monte restano assenti
+invece di essere inventati. Le evidenze a livello crop non sono mai promosse.
+
+Limite dichiarato: il primario emette su `players:<id>` oppure
+`players:<id>:<segmento>` quando `jersey_ocr.segment_frames > 0`; il CTC emette
+sempre su `players:<id>`. Con i segmenti attivi i due soggetti non si
+incontrano e una sorgente CTC non puo' vincere su un tracklet segmentato. E'
+asserito da un test invece di essere risolto con una regola inventata.
+
+### Bug trovato dal gate: aliasing diagnostics/assignments
+
+`JerseyOCR` mette lo **stesso oggetto** dict in `assignments` e nei propri
+diagnostics (`"voted": voted`). Il backfill in place di
+`raw_jersey_distribution`, che apriva `normalize_and_filter_jersey_assignments`,
+mutava quindi anche l'artifact esportato.
+
+La policy costruisce dict nuovi: il backfill finiva su quelli e
+`jersey_ocr.json` perdeva il campo su tutti e 13 i tracklet. Correzione: il
+backfill e' stato estratto in `backfill_raw_jersey_distribution` ed eseguito
+**prima** dell'emissione dell'evidenza, cosi' muta l'oggetto originale come
+prima ed entra nel payload.
+
+Verificato per lettura che `RosterAwareOCRFilter.apply` (`dict(assignment)`) e
+`filter_goalkeeper_jersey_assignments` (ricostruisce `kept`) **non** mutano in
+place: il backfill era l'unica mutazione della catena, quindi l'equivalenza non
+dipende dal fatto che il filtro roster fosse disattivo nel profilo di gate.
+
+### Gate esteso
+
+Il confronto per SHA-256 puro non e' un criterio utilizzabile: la config
+risolta e il suo hash cambiano per costruzione a ogni chiave aggiunta, e una
+chiave nuova nei diagnostics e' additiva quanto un file nuovo. Tre bucket,
+tutti riportati, nessuno silenzioso:
+
+```text
+changed_volatile_fields_only   timestamp, durate, artifacts_bytes, cache OCR
+changed_config_surface_only    config e config_sha256    --allow-config-change
+changed_added_keys_only        sole chiavi inserite      --allow-added-keys
+changed                        tutto il resto: fallimento
+```
+
+Il criterio delle chiavi aggiunte e' esatto, non una whitelist di nomi: ogni
+chiave del controllo deve essere presente nel candidato con lo stesso valore,
+liste comprese; una chiave persa, un valore diverso o una lista di lunghezza
+diversa restano `changed`. Entrambi i flag sono espliciti a riga di comando: il
+pass dichiara cosa e' stato accettato.
+
+### Risultato equivalenza, SNGS-025 250 frame, CPU
+
+```text
+FT jersey decision policy: sources=['jersey_ocr_primary'] subjects=13
+                           assigned=13 per_source={'jersey_ocr_primary': 13}
+
+changed                        []
+changed_volatile_fields_only   run_diagnostics
+changed_config_surface_only    run_manifest, source_provenance
+changed_added_keys_only        jersey_ocr:/decision_policy
+                               identity_assignments:/jersey_ocr/decision_policy
+removed                        []
+unexpected_new_files           []
+passed                         true
+```
+
+Suite locale: 405 passed, 3 skipped, 1 failed (`jersey_multiframe_digits`,
+richiede torch, by-design).
+
+### Profilo di ablation, non validato
+
+```text
+configs/gsr_jersey_ctc_fallback_coverage_v1.yaml
+sources: [jersey_ocr_primary, jersey_region_ctc]
+on_abstain: fallback
+```
+
+Il primario tiene ogni tracklet che ha deciso; il CTC parla solo dove il
+primario si e' astenuto. Non eseguito. La variante aggressiva (CTC che scavalca
+il primario) e' una riga in `sources` e **non** e' spedita come profilo: puo'
+regredire tracklet gia' decisi e richiede un benchmark paired suo.
+
+### Vincoli
+
+- Non usare il profilo di fallback sul GSR test.
+- Il blocco di valutazione va scelto e dichiarato **prima** di guardare i
+  numeri; development a 9 sequenze e frozen a 11 sono gia' stati aperti.
+- Per l'ablation il gate additivita' non e' il criterio: serve confronto paired
+  sui tracklet con la ground truth, con transizioni `correct->wrong` e
+  `wrong->correct` riportate.
+- Le altre famiglie di campi restano sulle righe; migrarle non e' richiesto da
+  nessuna decisione in sospeso.
+
+## Aggiornamento 2026-07-25 - layer evidenze, passo 1 additivo validato
+
+Questa sezione prevale sulle note storiche per la struttura interna della
+pipeline. Non modifica detection, tracking, OCR, soglie, checkpoint, config
+congelate ne' il percorso operativo/apply.
+
+### Motivazione
+
+Oggi ogni stage muta strutture condivise (`tracks`, `rows`), e il decision
+layer ri-aggrega dalle righe cio' che il modulo a monte sapeva gia':
+`HungarianPlayerIdentifier.summarize(rows)` e `build_tracklet_evidence(rows)`
+ricostruiscono entrambi il jersey che `_apply_jersey` aveva appena scritto. Da
+quel giro derivano tre limiti: un solo recognizer per volta puo' scrivere,
+confrontarne due richiede due run intere, e la modalita' `audit` va imposta a
+mano da moduli che si trattengono dallo scrivere.
+
+Il passo 1 introduce una tabella di evidenze immutabili come output
+**aggiuntivo**. Nessuno la legge ancora.
+
+### Codice aggiunto
+
+```text
+ft/core/evidence.py                     record Evidence, SubjectType, EvidenceKind
+ft/core/evidence_store.py               store append-only, query, manifest, Parquet/JSONL
+ft/core/emitters.py                     6 adattatori puri + ricostruzione inversa
+scripts/verify_evidence_additive.py     gate control vs candidate
+tests/test_evidence_core.py             schema, store, artifact
+tests/test_evidence_emitters.py         adattatori, gate di sufficienza
+tests/test_verify_evidence_additive.py  normalizzazione volatili
+configs/gsr_jersey_region_ctc_sjn_to_gsr_audit_v1_cpu_gate.yaml
+```
+
+`ft/pipeline.py`: +68 righe, una sola riga rimossa (import sostituito). Nessuno
+stage e' stato modificato.
+
+### Semantica del record
+
+```text
+subject_id      sempre stringa, namespaced dal track group: players:12,
+                players:12:0 (segmento jersey), referees:13
+value=None      il produttore ha girato e si e' astenuto
+riga assente    il produttore non ha girato
+payload         chiavi legacy copiate verbatim, nessuna rinomina
+produced_by     identificatore stabile: la policy del passo 2 seleziona da qui
+```
+
+Produttori: `jersey_ocr_primary`, `jersey_ocr_secondary_audit`,
+`jersey_region_ctc` (livello track e livello crop), `team_color`,
+`referee_palette`, `tracklet_linker`.
+
+### Artifact runtime
+
+```text
+metadata/<video>_evidence.parquet   (fallback .jsonl se manca pyarrow)
+metadata/<video>_evidence_manifest.json
+```
+
+### Protocollo del gate
+
+Controllo e candidata devono usare la **stessa** artifacts dir, rinominata dopo
+ogni run: dir diverse cambiano `crop_path` nei CSV e falsano il confronto. Il
+controllo va eseguito con `ft/pipeline.py` pre-evidence
+(sha256 `5b6dc14867c18034aaf81f0ced8c1bf0f5b46a56a88aead9dc7b899f85e7825f`); la
+candidata con la versione evidence
+(sha256 `9b17a2dc36c84ecad8b35270cd4541242588f9a7ca5c9cc5acc4a9e393827870`).
+Verifica che nel log del controllo **non** compaia la riga `FT evidence:`.
+
+Una run A/A con codice identico ha mostrato che quattro artifact differiscono
+per conto proprio: timestamp, durate di stage, `artifacts_bytes` e contatori
+della cache OCR. Il gate normalizza quei campi nei JSON prima di hashare, li
+riporta in `changed_volatile_fields_only` e confronta byte per byte tutto il
+resto.
+
+### Risultato su SNGS-025, 250 frame
+
+CUDA era indisponibile su `lie` (errore 804, forward compatibility su GeForce);
+entrambe le run sono state eseguite su CPU con
+`CUDA_VISIBLE_DEVICES=""` e il profilo `*_cpu_gate.yaml`. Il gate verifica
+additivita', non qualita': il device non riapre la configurazione congelata.
+
+```text
+passed                          true
+changed                         []
+removed                         []
+unexpected_new_files            []
+changed_volatile_fields_only    run_manifest, run_diagnostics
+added                           evidence.jsonl, evidence_manifest.json
+control_files / candidate_files 52 / 54
+tracklet rows                   4901 in entrambe
+identity_mutations              0
+config_hash                     a4f442d5ad61af87a98c7af52d6c7edcef1ea78093a81ed3e0fe0233ee6558ac
+```
+
+```text
+evidenze: 140 righe, 4 kind, 5 produttori, 21 astensioni
+
+jersey_number/jersey_ocr_primary   13
+jersey_number/jersey_region_ctc    84   (18 track + 66 crop)
+role/referee_palette               22
+team/team_color                    20
+link/tracklet_linker                1
+```
+
+`jersey_ocr_secondary_audit` non compare perche' disabilitato nel profilo: 5
+produttori e' il numero corretto, non uno mancante.
+
+### Due difetti corretti, entrambi trovati dai dati reali
+
+1. `display_track_id` non e' unico fra track group: SNGS-025 ha un arbitro 13 e
+   un giocatore 13. I subject id sono ora namespaced dal gruppo.
+2. L'emettitore referee derivava `value="referee"` da `is_referee_palette`, che
+   e' un ingrediente di `_is_player_referee_candidate`, non il suo risultato: su
+   SNGS-025 etichettava 13 giocatori su 20 come arbitri. Ora il gruppo
+   `players` si astiene sempre e il segnale grezzo resta nel payload. Regola
+   generale: un adattatore riporta cio' che lo stage ha deciso, mai una
+   decisione che lo stage non ha preso.
+
+### Test di sufficienza
+
+`test_evidence_reconstructs_jersey_rows_exactly` ricostruisce gli assignment
+dalle evidenze, li passa a `_apply_jersey` e verifica righe e track identiche
+alla via legacy. Passa: nessuna informazione jersey vive soltanto nelle righe
+mutate. E' la precondizione del passo 2.
+
+Suite locale: 379 passed, 3 skipped, 1 failed (`test_jersey_multiframe_digits`,
+richiede torch, gia' dichiarato by-design in `requirements-local-test.txt`).
+
+### Vincoli congelati
+
+- Nessun componente legge le evidenze: il decision layer resta invariato.
+- Gli stage continuano a mutare `tracks` e `rows` esattamente come prima.
+- `*_cpu_gate.yaml` e' solo plumbing: non usarlo per produrre numeri di
+  valutazione.
+- Non aggiungere altri file agli artifact senza aggiornare `allowed_new` nel
+  gate.
+
+### Passo 2 ammesso
+
+Portare `summarize` e `build_tracklet_evidence` a leggere dalle evidenze invece
+che dalle righe, con test di equivalenza contro le versioni attuali e switch
+`decision.input_source: rows | evidence` con default `rows`. Promozione solo
+con output operativo invariato sullo stesso protocollo di gate.
+
+### Nota operativa
+
+Il disallineamento fra worktree locale e `/home/cappetti/FT` e' costato tre
+cicli e ha invalidato una run per un backup mancante. Prima del passo 2 va
+deciso se le modifiche nate sulla remota rientrano in locale o se la remota
+riceve git.
 
 ## Aggiornamento 2026-07-20 - CTC SJN-210k nuovo candidato migliore
 
@@ -3363,3 +4050,1843 @@ solo dopo fine-tuning attention su bag GSR. Evitare nuove teste casuali su sole
 
 Worktree locale pronto per pubblicazione su `main`. Artifact, dataset, video,
 log e checkpoint restano esclusi dal repository.
+
+## Aggiornamento 2026-07-22 - Coverage gap del detector regione: diagnosi e limite strutturale
+
+### Diagnosi del gap sul frozen
+
+Auditato il gap di coverage del detector regione (`yolo26s_smoke_v1`) sul
+frozen (11 sequenze, 173 tracklet, 865 crop selezionati):
+
+```text
+region_detection_coverage @conf=0.25: 60.7%
+confidence_threshold_curve:
+  0.25 -> 60.7%
+  0.20 -> 64.4%
+  0.15 -> 68.9%
+  0.10 -> 71.9%
+  0.05 -> 75.0%
+hard_miss_rate (zero box anche a conf=0.05): 25.0%
+fully_blind_tracklets: 12/173
+```
+
+Scomposizione dell'hard-miss con il classificatore `clean_back`
+(`jersey_back_yolo11s_cls_v1.pt`, uso diagnostico):
+
+```text
+pose_explained_not_clean_back: 78.2% (169/216)
+unexplained_clean_back_still_missed: 21.8% (47/216)
+```
+
+Nuovo segnale più forte, orientamento di schiena via pose estimator generico
+(`yolov8x-pose.pt`, regola geometrica su keypoint spalle sinistra/destra COCO,
+zero training):
+
+```text
+pose_detected: 763/865 (88%) — keypoint affidabili anche su crop 25-70px
+coverage crop orientation=back:  81.0% (410/506)
+coverage crop orientation=front: 29.0% (71/245)
+```
+
+Script: `scripts/audit_jersey_number_region_detector_coverage.py`,
+`scripts/analyze_number_region_coverage_csv.py`,
+`scripts/inspect_jersey_ocr_tracklet_diagnostics.py`,
+`scripts/audit_hard_miss_crop_pose.py`,
+`scripts/audit_crop_pose_orientation.py`,
+`scripts/aggregate_number_region_coverage_by_sequence.py`.
+
+### Re-selezione frame: due tentativi, entrambi falliti
+
+Ipotesi: se il frame selezionato non mostra la schiena, ri-selezionare fra i
+20 candidati grezzi già su disco (non serve nuova estrazione) un frame
+migliore recupererebbe i tracklet ciechi.
+
+```text
+Re-selezione per clean_back_probability: 0/12 tracklet recuperati
+Re-selezione per pose_back_score (piu' discriminante in aggregato): 0/12 recuperati
+```
+
+Dettaglio per i 12 tracklet ciechi (pose):
+
+```text
+7 tracklet: zero candidati "back" in tutti i 20 frame campionati
+  (068::10, 068::13, 068::16, 068::5, 097::14, 098::7, 170::16)
+  -> assenza strutturale nel campione, non risolvibile da nessun ranking
+5 tracklet: almeno 1 candidato "back" confermato (fino a 6/20 per due
+  tracklet, confidence spalle 0.93-0.99), detector fallisce comunque su tutti
+  (099::3, 165::17, 068::14, 170::6, 098::11)
+  -> vero limite del detector, non un problema di selezione frame
+```
+
+Script: `scripts/simulate_clean_back_reselection.py`,
+`scripts/simulate_pose_reselection.py`.
+
+Conclusione: la selezione dei frame NON è il collo di bottiglia dominante.
+
+### Retraining del detector: tre varianti, nessuna promossa
+
+Scoperto che il checkpoint operativo (`yolo26s_smoke_v1`) era stato
+addestrato per sole 10 epoche (mAP50-95 ancora in salita all'ultima epoca).
+Tre esperimenti, stesso dataset `gsr_train_manual_v1` (435 immagini, 337
+positive, 37 sequenze; frozen mai incluso, verificato), stesso seed
+`20260719`:
+
+```text
+                          coverage@0.25  hard_miss  fully_blind  coverage@0.05
+smoke (10 epoche)              60.7%       25.0%       12/173        75.0%
+full GSR-only (43 epoche)      62.8%       27.2%       13/173        72.8%
+SJN->GSR (25 epoche, pretrain  63.7%       28.1%       13/173        71.9%
+  esterno SJN-210k gia' pronto,
+  runs/jersey_number_region/yolo26s_sjn210k_full_v1)
+```
+
+Checkpoint valutati:
+
+```text
+runs/jersey_number_region/yolo26s_full_v1/weights/best.pt
+sha256 a268eb047dc2be307ec35dae99409315ddc8f631d76f663d5c62448241f9ccee
+
+runs/jersey_number_region/yolo26s_sjn_to_gsr_full_v1/weights/best.pt
+sha256 1b050f3fac085d77eb669f9d93907df2c0698fa163a8e2224bcb723c1c152f16
+```
+
+Pattern coerente su tutti e tre: piu' training (piu' epoche, poi pretraining
+esterno su 8938 regioni SJN-210k) sposta la coverage al threshold operativo
+di pochi punti (+3 totali), ma peggiora sistematicamente hard-miss e coverage
+alle soglie basse. Il detector diventa piu' "sicuro" quando rileva, non piu'
+capace sui casi difficili.
+
+**Decisione**: nessuno dei tre checkpoint promosso. Il collo di bottiglia non
+e' la procedura di training (epoche, pretraining esterno) ne' la selezione
+frame (pose o classificatore): e' strutturale — le 435 immagini manuali GSR
+non coprono la varieta' visiva delle sequenze frozen, e nessun retraining
+sulle stesse 435 immagini la recupera. Prossimi passi possibili, non
+eseguiti: piu' dati annotati nel dominio target (richiede annotazione
+manuale), o cambio architetturale (risoluzione input maggiore,
+super-risoluzione dei crop prima del recognizer, detector per oggetti molto
+piccoli). Restare su `yolo26s_smoke_v1` come operativo.
+
+Nota operativa: training su questa GPU (RTX 2080, 7.8GB) e' andato in crash
+CUDA "illegal memory access" transitorio due volte durante la validazione a
+batch=16 (non deterministico, non riproducibile a batch=8). Se ricapita,
+riprovare con `--batch 8` prima di altre ipotesi.
+
+## Aggiornamento 2026-07-22 (2) - Roster-reranking implementato; posa come detector bocciata
+
+### Roster-constrained re-ranking del CTC: successo, implementato
+
+Osservazione di partenza: il CTC a volte legge con alta confidenza una cifra
+sbagliata quando la vera cifra e' visivamente simile (caso noto Inter-Juve:
+`95` letto come `55`), con la cifra corretta comunque presente nel proprio
+top-5. Il modulo CTC-regione non consultava mai il roster prima d'ora.
+
+Misura del tetto teorico su frozen con un roster oracolo (costruito dai
+`gt_jersey_number` reali per sequenza+lato, solo a scopo diagnostico — GSR
+non ha un roster reale in produzione e non va trattato come se lo avesse):
+
+```text
+run: ctc_sjn_transfer_frozen_v1/sjn_to_gsr (+ --dump-raw-scores, output
+     identico al run originale: correct=124, wrong=35 -> verificato bit-a-bit)
+accuracy_assigned: 77.99% -> 84.91% (+6.9 punti)
+transitions: correct_to_correct=124, correct_to_wrong=0,
+             wrong_to_correct=11, wrong_to_wrong=24
+net_gain: +11, changed_rows: 19
+```
+
+Zero regressioni (`correct_to_wrong=0`) — il criterio di sicurezza chiave e'
+soddisfatto. Script: `scripts/audit_roster_oracle_reranking.py` (usa
+`aggregate_frames` di `ft/features/jersey_number_ctc.py`, puro Python, gira
+anche in locale senza GPU).
+
+**Implementato** in `ft/features/jersey_region_ctc_audit.py`:
+`JerseyRegionCTCAuditor` accetta ora `roster`, `roster_reranking_enabled`,
+`roster_reranking_top_k`. Calcola un campo `roster_rerank_preview` per
+tracklet (audit-only: non scrive mai in `jersey_number`/`tracklets`,
+`identity_mutations` resta 0). Roster costruito da `ft.identity.roster` via
+`team_id`/`jersey_number` (stesso formato gia' usato da Hungarian). Team per
+display_track_id derivato da `player_rows` (majority vote), passato a
+`.run(..., player_rows=player_rows)`. Wiring in `ft/pipeline.py`. Test
+unitari in `tests/test_jersey_region_ctc_audit.py` (7 nuovi test). Config di
+prova: `configs/int_ata_jersey_region_ctc_roster_rerank_audit_v1.yaml`.
+
+Test di integrazione sulla pipeline reale (Int-Ata, 200 frame, roster
+sintetico `SNGS-151_synthetic_roster.json` solo per verifica di cablaggio,
+non risultato scientifico):
+
+```text
+roster_teams_loaded: [1, 2]
+roster_reranking_summary: tracklets=9, changed=5
+identity_mutations: 0
+```
+
+Meccanismo verificato: gira nella pipeline reale senza errori, campi
+popolati correttamente, zero mutazioni. Il tasso di cambio alto (5/9) e'
+atteso: il roster sintetico non corrisponde ai giocatori reali di Int-Ata.
+
+**Nessun roster reale disponibile per Int-Ata o altri video custom** (solo
+roster sintetici GSR in `evaluation/soccernet_gsr/rosters/` e l'esempio
+generico `configs/roster.example.json`). Prossimo passo prima di poter
+validare il guadagno reale: reperire le formazioni reali della partita.
+
+### Posa come sostituto del detector regione: bocciata
+
+Ipotesi: dato che l'orientamento da posa correla molto piu' fortemente con
+il successo del detector (81% back vs 29% front, vedi sopra) di qualunque
+segnale appreso, e la letteratura pubblica (Liu & Bhanu 2019; Koshkina et
+al. 2024, crop guidato da ViTPose) deriva il box torso/numero direttamente
+dai keypoint invece di addestrare un detector — provato a sostituire
+interamente il detector YOLO con una regola geometrica sui keypoint
+(spalle/fianchi COCO), stesso identico CTC a valle, stesso `ocr-run` frozen
+per confronto diretto.
+
+```text
+                          coverage   accuracy_assigned  accuracy_all  gt_in_top5
+YOLO detector (sjn_to_gsr)   81.6%        77.99%           71.68%       ~84%
+Pose geometria (torso)       90.0%        35.6%            32.9%        56.1%
+```
+
+La geometria da posa trova una regione piu' spesso (+8.4 coverage) ma il
+recognizer legge malissimo quello che trova (-42 punti accuracy_assigned).
+Causa probabile: il rettangolo spalle->fianchi e' troppo largo/impreciso
+rispetto al crop stretto sul solo numero su cui il CTC e' stato addestrato
+— problema di framing/scala, non di localizzazione generica. Script:
+`scripts/evaluate_pose_derived_region_ctc.py`.
+
+**Decisione**: non sostituire il detector con la geometria pura. L'uso
+valido della posa resta quello di stamattina — segnale di orientamento per
+la selezione frame, non generatore diretto del box. Non ritentare aggiustare
+le proporzioni geometriche (`top_fraction`/`bottom_fraction`/
+`side_padding_fraction`) sul frozen, gia' molto usato oggi (7-8 valutazioni
+diverse) — se ripreso, tarare su development.
+
+### Stato di fine giornata
+
+- Roster-reranking: implementato, testato, in attesa di un roster reale per
+  la validazione su video custom. Prossima azione: procurarsi le formazioni
+  reali di Int-Ata (o altro video con roster disponibile).
+- Miglioramento del detector regione: esplorato ampiamente (epoche,
+  pretraining esterno, re-selezione frame per classificatore e per posa,
+  sostituzione con geometria), nessuna soluzione a basso costo trovata.
+  Restare su `yolo26s_smoke_v1`. Riprendere solo con investimento serio
+  (dataset esterno con diversita' di broadcast validata, es. Hockey JNR
+  Dataset di Koshkina — transfer zero-shot verso il calcio validato in
+  letteratura all'87.4%; oppure annotazione mirata nel dominio target).
+- GTA (Global Tracklet Association, post-processing tracking model-agnostic)
+  proposto per il bottleneck AssA del tracking, mai testato: prossima pista
+  indipendente da detector/jersey.
+
+## Aggiornamento 2026-07-22 (3) - Roster-reranking validato su ground truth reale (Identity Benchmark V1)
+
+Seguito diretto della sezione precedente: procurato il roster reale di
+Int-Ata (gia' presente su disco, `costume-video/Int-Ata/Int-Ata.json`, mai
+cercato a fondo prima), etichettate a mano le identita' con l'infrastruttura
+gia' esistente "Identity Benchmark V1" (`ft/evaluation/identity_benchmark.py`,
+`scripts/build_identity_benchmark.py`, `scripts/evaluate_identity_benchmark.py`,
+spec in `evaluation/identity_benchmark_v1.yaml`), e misurato il guadagno
+reale del roster-reranking — non piu' solo l'oracle sintetico su GSR.
+
+**Scoperta infrastruttura pre-esistente**: il progetto ha gia' un sistema
+completo di annotazione/adjudication a doppio revisore per identita' di
+tracklet (unit singole + coppie same/different), con split
+development/test/external gia' dichiarato per i tre video custom (Int-Ata,
+Inter-Juve, Inter-Atalanta) e roster reali dichiarati per spec. Prima di
+costruire qualunque tooling nuovo per l'etichettatura richiesta dall'utente,
+va sempre controllato se esiste gia' — qui c'era, completo e mai citato
+esplicitamente in precedenza in questo handoff.
+
+**Bug scoperto e risolto: crop mancanti per pulizia disco pregressa**. Le
+run di produzione usate come `source_runs` nello spec (es.
+`Int-Ata_prtreid_conservative_final_1200f`,
+`Int-Ata_identity_evidence_v1_resetbytetrack_cutsensitive_1200f`, e le
+equivalenti per Inter-Atalanta/Inter-Juve) avevano le cartelle `crops/`
+intere cancellate manualmente per liberare spazio disco, pur avendo
+`metadata/*_tracklets.csv` (con bbox e frame per ogni crop) intatto. La
+build del benchmark falliva silenziosamente producendo migliaia di tile
+nere nelle contact sheet (nessuna eccezione Python, solo warning OpenCV
+`imread` a livello C++). Soluzione: nuovo script
+`scripts/recrop_from_tracklets.py` che rilegge `tracklets.csv` +
+`run_manifest.json` (per il `video_path` originale), riapre il video
+sorgente, e ri-ritaglia solo i crop mancanti agli stessi bbox/frame/percorso
+gia' registrati — zero re-detection/re-tracking/re-identity, solo il
+ritaglio. Rieseguito per tutte e 4 le run necessarie (Int-Ata x2,
+Inter-Atalanta, Inter-Juve x2), ~68mila crop rigenerati in totale in pochi
+minuti (nessuna GPU necessaria). Nota per il futuro: se si ripulisce lo
+spazio disco cancellando `crops/`, farlo solo su run che non serviranno mai
+piu' a costruire contact sheet/benchmark, o tenere `tracklets.csv` per poter
+rigenerare on-demand con questo script.
+
+**Etichettatura**: 202 item totali (159 unit identita' + 43 coppie),
+etichettati a mano da un solo revisore via `annotate_reviewer_a.html`
+(nessuna doppia revisione/adjudication vera, dato revisore singolo:
+`reviewer_b.csv` duplicato identico a `reviewer_a.csv` cosi'
+`adjudicate_identity_benchmark.py` produce comunque un `ground_truth.csv`
+completo per costruzione, accordo 100% per definizione sulle righe che
+richiedono seconda revisione).
+
+**`evaluate_identity_benchmark.py` non e' lo strumento giusto per misurare
+il roster-reranking**: quello script valuta la qualita' dell'assegnazione
+di identita' (player_id/tracklet), non la lettura del numero di maglia.
+Dato che il roster-reranking e' audit-only (`identity_mutations=0`, non
+tocca mai l'assegnazione di identita'), baseline e candidate risultano
+identici byte per byte su ogni metrica — comportamento atteso, non un bug.
+Serve invece confrontare direttamente `gt_jersey_number` (dal ground truth
+appena etichettato) contro `original_number`/`preview_number` del
+`roster_rerank_preview` nell'audit della run candidata. Nuovo script:
+`scripts/evaluate_roster_rerank_ground_truth.py`.
+
+**Bug scoperto durante questa valutazione: riuso di `display_track_id` fra
+segmenti di scena diversi**. La run usa `resetbytetrack` (reset degli ID di
+tracking a ogni cambio di scena), quindi lo stesso `display_track_id`
+grezzo puo' rappresentare giocatori fisici diversi in segmenti di scena
+diversi — ma `roster_rerank_preview` nell'audit e' indicizzato solo per
+`display_track_id`, senza distinguere il segmento di scena. Nel join con il
+ground truth, questo produceva lo stesso ID (es. `"4"`) associato a 6 unita'
+di identita' diverse con `gt_jersey_number` diversi (1, 22, 8, 8, 29, 19) ma
+con la stessa identica predizione — impossibile per un giocatore reale, e
+un artefatto puro di join, non un errore del modello. Fix nello script di
+valutazione: individua i `display_track_id` con piu' di un
+`gt_jersey_number` distinto associato ed esclude tutte le loro righe dal
+computo (18 righe su 7 ID esclusi, tracciati in
+`ambiguous_display_track_ids_excluded`). Limite noto da tenere a mente se si
+vuole rendere questa valutazione riutilizzabile su scala: la chiave giusta
+sarebbe `(display_track_id, scene_segment_id)`, non solo `display_track_id`.
+
+**Risultato reale (non oracle) su Int-Ata, 27 tracklet non ambigue,
+etichettate a mano**:
+
+```text
+original_accuracy_assigned:   59.3% (16/27)
+reranked_accuracy_assigned:   77.8% (21/27)
+transitions: correct_to_correct=16 correct_to_wrong=0 wrong_to_correct=5 wrong_to_wrong=6
+net_gain: +5
+changed_rows: 7 (5 hanno corretto un errore, 2 rimasti sbagliati con un numero diverso)
+```
+
++18.5pp di accuratezza, **zero regressioni** (`correct_to_wrong=0`),
+coerente in direzione con il +6.9pp misurato sull'oracle GSR frozen — qui
+persino piu' marcato, anche se il campione e' piccolo (n=27) e l'intervallo
+di confidenza sarebbe ampio. Prima validazione genuina (non sintetica) del
+guadagno del roster-reranking su un video custom con roster reale.
+
+Roster-reranking resta **audit-only** (nessuna mutazione applicata alla
+pipeline reale) nonostante questo risultato positivo, in linea con la
+disciplina propose->apply del progetto: la promozione ad "apply" andrebbe
+decisa solo dopo aver esteso l'etichettatura (campione piu' grande, magari
+anche su Inter-Juve/Inter-Atalanta) e aver sistemato la disambiguazione per
+`scene_segment_id`.
+
+## Aggiornamento 2026-07-22 (4) - Revisione end-to-end della pipeline identity/jersey: 4 bug corretti, disambiguazione scene-aware validata
+
+Richiesta dall'utente: revisione sistematica di tutta la pipeline
+identity/jersey per trovare bug che intaccano il lavoro del progetto, non
+solo il fix di oggi. Coperti: CTC/aggregazione numeri, selezione frame,
+prefix consolidation, jersey identity linker, identity graph/propagazione,
+roster, roster-aware OCR, candidati non autoritativi, evidence, gate audit,
+Hungarian, l'intero `constraints.py`, gran parte di `jersey_ocr.py`, team/
+goalkeeper/referee assignment.
+
+**Fix scene-aware nella region-CTC audit** (root cause del problema di
+disambiguazione descritto nella sezione precedente): `roster_rerank_preview`
+e l'aggregazione dei punteggi CTC in `JerseyRegionCTCAuditor.run()` erano
+indicizzate solo per `display_track_id` grezzo, fondendo l'evidenza di
+giocatori fisici diversi riusati sullo stesso ID dopo un reset di scena.
+Nuova chiave composta `tracklet_key(display_track_id, scene_segment_id)` in
+`ft/features/jersey_region_ctc_audit.py`, con fallback al solo
+`display_track_id` quando `scene_segment_id` non e' disponibile (preserva il
+comportamento nei test esistenti). `team_by_display_track_id` e
+`collect_selected_crops` aggiornate di conseguenza; il confronto con
+`primary` (meccanismo di fusion_preview preesistente, non scene-aware a
+monte) resta volutamente indicizzato per ID grezzo per non regredire quel
+percorso.
+
+**4 bug reali trovati e corretti** durante la revisione (tutti con test di
+regressione, 331 test locali passano, nessuna regressione):
+
+1. Il fix scene-aware sopra descritto.
+2. `player_jersey_from_id` (`ft/identity/identity_graph.py`) indovinava il
+   numero di maglia dal suffisso del `player_id` (es. `team1_09` -> 9) come
+   fallback quando l'OCR abbandona. Funziona per roster sintetici
+   (`team1_07`->jersey 7) ma e' rotto per il roster reale di Int-Ata
+   (`team1_05` -> Pavard, jersey vero 28). Rimossa la funzione; `build_nodes`
+   in `ft/identity/propagation.py` ora riceve `roster_by_player_id` e usa il
+   vero `jersey_number` del roster come fallback.
+3. `goalkeeper_number_one_prior` (`ft/identity/hungarian.py`) veniva
+   saltato silenziosamente ogni volta che un `jersey_score` da distribuzione
+   candidati veniva trovato -- il caso comune in produzione, dato che il
+   numero dominante di una tracklet appare quasi sempre nella sua stessa
+   `raw_jersey_distribution`. L'unico test esistente non copriva questo
+   caso. Spostata la logica fuori dal ramo if/elif cosi' si applica sempre
+   quando il numero osservato e' 1.
+4. `summarize_samples` (`ft/features/referee.py`) contava tutti i campioni
+   con un colore riconosciuto (`len(valid)`) invece di solo quelli del
+   colore vincente (`len(values)`) per il gate `min_tracklet_frames` -
+   indebolendo la protezione contro falsi positivi arbitro descritta nel
+   commento della funzione stessa. Nessun test esisteva per questa funzione
+   (ne' per `RefereeAppearanceAssigner` in generale). Confrontata con la
+   funzione gemella corretta in `goalkeeper.py`, gia' testata.
+
+Inoltre: consolidata una duplicazione (`roster_numbers_by_team` gia'
+esistente in `ft/identity/roster.py`, ridefinita per errore oggi in
+`jersey_region_ctc_audit.py`). Segnalazioni minori senza impatto reale
+(codice morto in `conflict_runs`, un `cost_margin` diagnostico in
+`gate_audit.py` potenzialmente fuorviante se il candidato selezionato non e'
+il piu' economico) annotate ma non corrette. Un presunto bug nel gate
+squadra di `jersey_identity_linker.py` (bypass a bassa confidenza) e' stato
+inizialmente segnalato ma poi ritrattato dopo aver trovato lo stesso pattern
+deliberato, simmetrico e testato in `ft/linking/tracklet_linker.py`
+(`test_linker_team_gate_blocks_confident_team_mismatch`).
+
+**Validazione su GPU**: rilanciata la pipeline reale su Int-Ata
+(`int_ata_all_fixes_verify_1200f`) con tutti i fix applicati. Risultato
+dell'audit: `tracklets=43 roster_reranking_changed=11 identity_mutations=0`
+(prima del fix scene-aware: `tracklets=35 changed=7`). Ripetuta la
+valutazione contro il ground truth etichettato a mano
+(`scripts/evaluate_roster_rerank_ground_truth.py`, aggiornato per costruire
+la stessa chiave composta `display_track_id#scene_segment_id` usando
+`ft.features.jersey_region_ctc_audit.tracklet_key`):
+
+```text
+ambiguous_display_track_ids_excluded: [] (prima: 7 ID, 18 righe escluse)
+assigned_tracks_evaluated: 36 (prima: 27)
+original_accuracy_assigned: 61.1% (22/36)
+reranked_accuracy_assigned: 72.2% (26/36)
+transitions: correct_to_correct=21 correct_to_wrong=1 wrong_to_correct=5 wrong_to_wrong=9
+net_gain: +4
+```
+
+Zero track esclusi come ambigui (prima: 7 ID / 18 righe) - la disambiguazione
+per segmento di scena funziona come previsto. Il guadagno netto scende
+leggermente rispetto alla misura precedente non disambiguata (+4 invece di
++5) perche' ora c'e' una vera regressione visibile (`correct_to_wrong=1`,
+track `4#5`: GT=19, originariamente letto correttamente 19, il reranking lo
+cambia erroneamente in 10) - un limite reale del meccanismo di roster
+reranking su top-k, non un artefatto di misura. Il quadro complessivo
+(+11.1pp, guadagno netto positivo, singola regressione isolata) resta
+comunque un miglioramento validato su dati reali etichettati a mano, ora con
+una metodologia di valutazione corretta e priva di ambiguita' di conteggio.
+
+## Aggiornamento 2026-07-22 (5) - Il reset scena e' strutturalmente irrilevante per l'AssA misurato su GSR
+
+Richiesta dell'utente: capire se ByteTrack/il reset scena si possono
+migliorare, partendo dal collo di bottiglia gia' noto (`AssA=0.5167` sul
+benchmark GSR a 12 sequenze). Prima di toccare qualunque soglia, verificato
+se il reset scena si attiva davvero sulle sequenze GSR usate per misurare
+quel numero.
+
+**Scoperta chiave**: la config del benchmark GSR
+(`gsr_detection_tracking_benchmark_v1.yaml` -> `gsr_evaluation_control.yaml`)
+eredita le impostazioni `scene_cuts` dalla config tarata specificamente per
+Int-Ata (`best_known_int_ata_number_region_scene_reset_control.yaml`, soglia
+sensibile 0.08/0.12/min_gap 40) - mai isolate/validate per GSR
+specificamente. Nuovo script diagnostico
+`scripts/audit_scene_cuts_on_sequences.py` (legge frame da video O da
+cartelle `img1/` in stile GSR/MOT, zero GPU, solo istogrammi HSV) applicato a
+due sequenze del pilota a 12 (SNGS-025, SNGS-036, 750 frame ciascuna):
+
+```text
+SNGS-025: cuts_found=0, punteggio massimo=0.0190 (soglia=0.08, hard=0.12)
+SNGS-036: cuts_found=0, punteggio massimo=0.0162
+```
+
+Il punteggio massimo raggiunto in entrambe le sequenze e' 4-5x sotto la
+soglia attuale, con correlazione tra istogrammi ancora altissima (0.98-0.99)
+anche ai picchi. Non c'e' un problema di taratura soglia da correggere: le
+clip GSR (azione continua a camera singola, ~30 secondi, nessun replay o
+cambio di camera broadcast) semplicemente non contengono il fenomeno
+(discontinuita' visiva forte) che il rilevatore e' progettato a trovare.
+Abbassare la soglia inviterebbe solo falsi positivi su rumore in-game
+(panning, giocatori in movimento), non rivelerebbe segnale reale.
+
+**Conclusione**: il reset scena e' completamente dormiente sul benchmark
+GSR (stesso comportamento gia' documentato per Inter-Atalanta con le
+impostazioni di default) - il valore `AssA=0.5167` gia' misurato e'
+prodotto interamente da ByteTrack puro (IoU+moto), senza alcun contributo
+positivo o negativo del reset scena. Qualunque tentativo di migliorare
+quel numero specifico agendo sulla soglia/logica di reset scena e'
+strutturalmente destinato a non avere effetto, perche' il meccanismo non
+scatta mai su questo dominio. Il reset scena resta rilevante solo per video
+broadcast multi-camera reali (Int-Ata, Inter-Juve, dove i tagli esistono
+davvero) - li' pero' non esiste un ground truth di tracking frame-per-frame
+(HOTA/AssA), solo l'Identity Benchmark V1 appena costruito (etichette di
+identita'/jersey, non di bounding box/tracking). Per migliorare l'AssA
+misurato su GSR serve una leva diversa dal reset scena - GTA (Global
+Tracklet Association) resta la pista piu' diretta, gia' proposta e mai
+testata.
+
+## Aggiornamento 2026-07-22 (6) - Analisi diretta della frammentazione ID grezzi su SNGS-025 (no reset scena coinvolto)
+
+Seguito diretto: dato che il reset scena e' irrilevante per GSR, spostata
+l'analisi su quanti ID viene formulati da ByteTrack contro il ground truth,
+usando artifact gia' esistenti (run `gsr_valid_pilot12_baseline_v1`,
+nessuna nuova computazione GPU).
+
+**Conteggio grezzo**: SNGS-025 (748 frame, azione continua, zero tagli
+scena). Ground truth: 25 oggetti distinti (~20 giocatori + 2 portieri + 2
+arbitri + 1 palla, da `Labels-GameState.json`). Pipeline: 41
+`raw_track_id`, 46 `display_track_id`. Per ruolo, i nostri raw:
+`{player: 35, goalkeeper: 1, referee: 5}` - notare che gli **arbitri sono
+la categoria proporzionalmente piu' frammentata** (5 raw contro ~2 reali,
+~2.5x) contro ~1.75x per i giocatori, e un portiere manca del tutto (quasi
+certamente mal classificato come "player" dal classificatore di colore).
+
+**`display_track_id` (46) > `raw_track_id` (41)**: controintuitivo, dato
+che il linking dovrebbe ridurre i frammenti fondendoli, non aumentarli.
+Causa: `_split_persistent_frame_team_conflicts` in `constraints.py`
+(`frame_team_split_enabled=True` di default, nessuna config della catena lo
+disattiva) ha creato 7 nuovi display id da conflitti di colore-squadra
+persistenti. Verificato per tutti e 7 gli split: traiettoria posizionale
+completamente fluida (salto massimo frame-a-frame 1-26px, mai una
+discontinuita'). Questo esclude uno scambio silenzioso di identita' da
+parte di ByteTrack in tutti i 7 casi - il pattern piu' probabile e' che sia
+lo **stesso giocatore tracciato correttamente**, con il classificatore di
+squadra che deriva (verosimilmente per cambio di luce/distanza dalla camera
+mentre il giocatore attraversa il campo) fino a leggere la squadra
+sbagliata in modo sostenuto (es. 231/232 frame consistenti, non rumore a
+scatti). Il meccanismo di split, in questi 7 casi su SNGS-025, sembra
+**auto-infliggere** frammentazione invece di correggere un vero errore.
+Implicazione pratica: irrigidire le condizioni di split (piu' frame
+richiesti, o migliorare la stabilita' del team classifier lungo il campo)
+potrebbe ridurre falsi split senza perdere protezione reale - non ancora
+tentato.
+
+**Il gap piu' grande resta 41 raw contro 25 GT (16 in eccesso), indipendente
+dal meccanismo sopra**. Analisi di durata di vita dei 41 raw track: alcuni
+sono perfetti (`raw_id=3,14`: 748/748 frame, zero interruzioni), altri sono
+rumore puro (`raw_id=40,41`: 2-4 frame, quasi certi falsi positivi
+istantanei), la maggior parte si interrompe a meta' clip (150-290 frame) e
+presumibilmente si ricollega altrove con un nuovo raw id.
+
+**Ricerca di coppie di frammenti candidate** (fine di un raw track entro 60
+frame e 150px dall'inizio di un altro, script ad-hoc via CSV, nessuna
+nuova run): trovate 6 coppie candidate su 41 track totali. Due casi puliti
+e ad alta confidenza:
+- `15->22` (player): gap=16 frame, distanza=11px - quasi certamente lo
+  stesso giocatore perso e riacquisito.
+- `1->23` (referee->referee): gap=33 frame, distanza=67px - spiega in
+  parte la frammentazione arbitro osservata sopra.
+
+Un caso ambiguo e istruttivo: **4 track diversi** (9, 12, 18, 21, tutti
+"player") risultano candidati per continuare come track 24, tutti vicino al
+bordo destro del frame (x~1900+, larghezza probabile ~1920) in una finestra
+temporale simile - verosimilmente un momento affollato vicino alla linea
+laterale (rimessa/corner) con piu' giocatori reali vicini
+contemporaneamente. Solo `12->24` (distanza=12px) e' verosimilmente il vero
+collegamento; gli altri 3 (distanza 47-98px) sono probabilmente giocatori
+diversi. Questo dimostra che un gate a sola distanza+tempo (quello gia'
+usato da `TrackletLinker`) non basta a disambiguare nei momenti affollati -
+serve un segnale aggiuntivo (aspetto/jersey), esattamente il tipo di
+problema per cui GTA (Global Tracklet Association, gia' proposto,
+mai testato) e' pensato.
+
+**Conclusione**: `TrackletLinker` con i gate di default sembra fondere
+solo ~2 coppie su 41 raw track in questa sequenza (41 raw -> ~39 componenti
+pre-split, +7 split team-conflict = 46 display), nonostante esistano almeno
+2-3 coppie recuperabili con alta confidenza identificabili da sola
+distanza+tempo. Prossimo passo naturale, non ancora fatto: verificare se
+questo pattern (frammentazione concentrata su alcuni ruoli/situazioni,
+coppie recuperabili mancate dal linker, split team-conflict auto-inflitti)
+si ripete sulle altre 11 sequenze del pilota, prima di investire in GTA o
+in una modifica ai gate di `TrackletLinker`.
+
+## Aggiornamento 2026-07-22 (7) - Correzione: il pitch-speed gate e' gia' stato provato e respinto (TVCalib)
+
+Nella lista di tecniche proposte per l'associazione tracking (seguito
+dell'analisi SNGS-025 sopra), avevo raccomandato come primo passo economico
+di verificare/attivare il `pitch_gate` di `TrackletLinker` (blocco/rerank di
+una fusione basato su velocita' implicita in m/s, usando posizione
+proiettata sul campo). Verifica preliminare corretta - `pitch_gate.enabled:
+false` di default, e comunque bloccato per requisito `require_source_prefix:
+"tvcalib:"` mentre GSR usa la calibrazione automatica legacy
+`auto:field_quad` - ma **non avevo controllato abbastanza a fondo se
+questo fosse gia' stato tentato con la calibrazione buona**. Lo era, in una
+sezione handoff precedente (non ancora vista/ricordata a inizio di questo
+filone): TVCalib e' stata eseguita su tutte le 12 sequenze del pilota
+(errore pitch mediano 1.10m, P90 2.71m, contro 35.78m/58.28m di
+`auto:field_quad` - qualita' geometrica confermata buona), e usata per due
+esperimenti end-to-end completi:
+
+1. **Gate rigido di velocita'** (12-14 m/s): sembrava perfetto nell'audit
+   offline (4 collegamenti sbagliati bloccati, 0 corretti bloccati), ma
+   l'ablation end-to-end ha *peggiorato* HOTA/AssA/IDF1 e il tasso di
+   switch. Respinto.
+2. **Costo morbido di reranking sulla distanza pitch** (peso 0.10): stesso
+   esito - leggero miglioramento offline (Recall@1 50%->52%), ma
+   peggioramento end-to-end su HOTA/AssA. Respinto.
+
+Decisione gia' congelata (non mia, precedente): mantenere `pitch_gate.
+enabled: false`, `pitch_reranking.enabled: false`, `calibration.tvcalib.
+enabled: false`; non fare altri sweep di soglia/peso sullo stesso pilota.
+**Correggo quindi la mia raccomandazione di oggi**: riattivare o ritarare
+il pitch-gate non e' una pista aperta, e riproverei un lavoro gia' fatto
+con piu' rigore (calibrazione migliore di quella disponibile ora) e gia'
+scartato con evidenza end-to-end chiara.
+
+**Il dato piu' prezioso di quella sezione, pero', rimane rilevante e
+rafforza la direzione GTA**: l'audit dei candidati reali del linker
+(`scripts/audit_gsr_link_candidate_ranking.py`) ha trovato che in **22
+target su 50 valutabili (44%)** il candidato corretto non esiste affatto
+nel pool generato dal linker (`max_gap=90 frame`, `max_distance=160px`) -
+non un problema di *ranking* dei candidati esistenti (gia' escluso da
+entrambi gli esperimenti sopra), ma di **candidate generation**: la finestra
+gap/distanza locale del linker attuale non arriva nemmeno a considerare il
+vero collegamento in quasi meta' dei casi. Questo e' esattamente il tipo di
+limite per cui un'associazione globale offline (GTA), con un pool di
+candidati piu' ampio e una funzione di score diversa da un semplice gate
+locale, e' pensata - rafforza la priorita' data a GTA rispetto a qualunque
+ulteriore tuning di `TrackletLinker`.
+
+**Prossimo passo**: esplorare concretamente GTA (letteratura, requisiti di
+implementazione, dati di cui ha bisogno) prima di scrivere codice.
+
+## Aggiornamento 2026-07-22 (8) - GTA: letteratura verificata, ambiente PRTReID rotto, pseudo-labeling verificato per il detector regione
+
+**GTA (Global Tracklet Association)**, letteratura verificata (Sun et al.,
+ACCV 2024W, https://arxiv.org/abs/2411.08216, codice
+https://github.com/sjc042/gta-link): non un algoritmo unico ma due
+componenti separati, entrambi basati su embedding d'aspetto (OSNet,
+checkpoint SportsMOT), non movimento:
+- **Splitter**: DBSCAN sugli embedding *dentro* una tracklet per rilevare
+  se mescola due identita' diverse (parametri paper: eps=0.6,
+  min_samples=10, max_k=3).
+- **Connector**: fonde coppie di tracklet *diverse* per distanza coseno
+  media (merge_dist_thres=0.4, min_len=100).
+
+Rischio esplicito segnalato: il Connector e' concettualmente vicino allo
+"shadow tracker" gia' respinto in passato (309 vs 45 ID switch su
+SNGS-025, aspetto non discrimina bene compagni di squadra con maglie
+quasi identiche). Deciso di partire solo dal **Splitter**, piu' sicuro e
+mai provato in questa forma (il nostro split attuale e' basato su
+colore-squadra, non aspetto generale).
+
+**Segnale incrociato trovato prima di scrivere codice**: `prtreid_
+tracklet_consistency` (gia' calcolato quando `prtreid_linking` e' attivo,
+proxy semplice dello Splitter - similarita' media al prototipo) ha
+segnalato `display_track_id=4` su Int-Ata (run
+`Int-Ata_prtreid_conservative_final_1200f`) come la tracklet con
+consistenza piu' bassa (0.8143) - **lo stesso identico track** trovato
+stamattina con 6 numeri di maglia GT diversi dopo il fix scene-aware. Due
+segnali indipendenti (conflitto GT, incoerenza d'aspetto) puntano allo
+stesso track: buona conferma indiretta che l'idea ha fondamento sui dati
+reali, prima ancora di costruire il DBSCAN vero.
+
+**Ambiente PRTReID rotto, mai sistemato del tutto**: nessun ambiente conda
+dedicato esisteva; clonato `jersey-yolo-ocr` in `prtreid-ft` per isolare il
+lavoro. `pip install monai` senza vincoli ha aggiornato in cascata anche
+torch (2.0.0+cu117 -> 2.13.0) e setuptools (rimuovendo `pkg_resources`,
+necessario a `prtreid`) - ambiente ricreato da zero con
+`pip install --no-deps monai`, che pero' ha installato monai 1.6.0
+(sintassi tipizzazione `X | None` non supportata dal parser TorchScript di
+torch 2.0.0). **Risolto**: `pip install --no-deps monai==1.2.0` (versione
+precedente all'adozione della sintassi `X | None`) - `check_prtreid_env.py`
+conferma ambiente `prtreid-ft` pienamente funzionante (tutti i moduli e i
+checkpoint OK). Ambiente pronto; lo Splitter reale (DBSCAN sugli embedding
+per-campione, non solo lo scalare di consistenza) resta da costruire come
+prossimo passo.
+
+**Dataset esterni valutati oggi per aumentare i dati del detector regione
+(tutti scartati per il detector specificamente)**:
+- DeepSport/DeepSportradar: nessuna annotazione sul numero, task diversi
+  (palla 3D, calibrazione, segmentazione, re-ID).
+- Paper NFL/Seahawks a dati sintetici: stesso dominio gia' scartato,
+  localizza via posa (gia' respinto oggi), risolve la classificazione non
+  la localizzazione.
+- TeamTrack: nessun numero di maglia annotato, camere fisheye/drone
+  sostanzialmente statiche - gli stessi autori evitano il confronto con
+  dataset broadcast per questo motivo.
+- Single-Stage Uncertainty-Aware JNR (Grad, CVPR2025W): idea
+  architetturale interessante (elimina il detector regione), ma allenato
+  su SoccerNet Jersey Number (probabile overlap con GSR, vedi sopra), zero
+  codice rilasciato, e un modello end-to-end richiede *piu'* dati non
+  meno - i nostri 435 reali gia' insufficienti per il detector piu'
+  semplice.
+- SoccerSynth-Detection (Unreal Engine, stesso gruppo TeamTrack): la base
+  tecnica piu' credibile vista oggi (motion blur simulato, transfer
+  validato per la detection giocatore), ma zero numeri di maglia
+  renderizzati, e il proprio limite dichiarato (fallisce a rilevare le
+  teste per "diversita' insufficiente nei modelli") e' un campanello
+  d'allarme diretto per dettagli fini come un numero di maglia. Base di
+  partenza sensata solo per un investimento serio futuro, non ora.
+- Idea "registrare video stile FIFA": scartata - gap sim-to-real
+  probabilmente peggiore di quanto gia' visto oggi con dati reali di
+  dominio diverso, piu' problema di licenza (gioco commerciale protetto).
+
+**Pseudo-labeling verificato - la strada scelta per oggi**: invece di
+self-training ingenuo (rischio di rinforzare i punti ciechi del modello),
+raccolti solo crop dove: (1) il detector ha trovato una regione, (2) la
+predizione CTC del singolo crop combacia col consenso multi-frame della
+tracklet, (3) quel consenso combacia col ground truth reale (Identity
+Benchmark V1) - la label e' quindi ancorata a una fonte indipendente, non
+solo al modello che si conferma da solo. Nuovo script
+`scripts/harvest_verified_region_crops.py`.
+
+Risultato su Int-Ata (run `int_ata_all_fixes_verify_1200f`): **43
+candidati verificati su 98 crop con regione rilevata**, distribuiti su
+~19 tracklet diverse - dati reali del dominio broadcast (non GSR),
+verificati indipendentemente. Contributo modesto (~10% dei 435 originali)
+ma a costo quasi zero.
+
+**Estensione a Inter-Juve/Inter-Atalanta**: nessuna run esistente aveva
+l'audit regione-CTC attivo. Nuovo script
+`scripts/build_region_ctc_audit_config_from_run.py`: legge la config gia'
+risolta dal `run_manifest.json` di una run sorgente esistente (quelle
+dichiarate in `evaluation/identity_benchmark_v1.yaml` per ciascun video,
+necessarie per allineare la numerazione `display_track_id`/
+`scene_segment_id` col ground truth gia' etichettato) e aggiunge solo il
+blocco `jersey_region_ctc_audit` sopra, senza toccare altro. Bug trovato e
+corretto: la config risolta della run Inter-Juve conteneva una chiave di
+tracking obsoleta (`strongsort`) non piu' accettata dall'attuale
+`YoloByteTracker.__init__` - probabile drift dello schema di config nel
+tempo. Fix: lo script ora filtra le chiavi di `tracking` per introspezione
+contro i parametri realmente accettati dal tracker corrente, scartando
+quelle obsolete con un avviso esplicito (invece di cambiare qualunque
+altro comportamento di detection/tracking/linking). Run di raccolta
+lanciate per entrambi i video a fine giornata, esito non ancora noto.
+
+## Aggiornamento 2026-07-23 - GTA Splitter: calibrazione eps e validazione cross-video
+
+### Splitter reale costruito e calibrato
+
+`scripts/audit_tracklet_identity_splitter.py` (gia' esistente ma mai
+validato con parametri corretti): DBSCAN su embedding PRTReID per-campione
+dentro ogni tracklet, per rilevare due identita' diverse mescolate sotto
+lo stesso `display_track_id`. Primo run su Int-Ata con i parametri di
+default del paper GTA (`eps=0.6`, `max_samples_per_tracklet=24`,
+sotto-campionamento uniforme): **0 tracklet flaggati su 89**, incluso il
+`display_track_id=4` gia' noto per certo come misto (6 numeri di maglia
+GT diversi tra segmenti di scena, e gia' il proxy scalare
+`prtreid_tracklet_consistency` lo aveva isolato come il piu' basso).
+Falso negativo totale del parametro di default.
+
+Diagnosticata la causa con uno script dedicato
+(`scripts/diag_track4_distances.py`, non versionato - one-off): estratti
+tutti i 1159 embedding del track 4 (non sotto-campionati) e calcolata la
+matrice di distanza coseno completa. Distanze intra-identita' (stesso
+blocco temporale): ~0.01-0.03. Distanze inter-identita' (blocchi
+temporali lontani, presumibilmente giocatori diversi): ~0.29-0.41. Con
+`eps=0.6` nessuna distanza, nemmeno tra identita' diverse, supera mai la
+soglia - il DBSCAN colla tutto in un cluster unico per costruzione, non
+per mancanza di segnale. Causa doppia: `eps` tarato sul paper originale
+(OSNet + SportsMOT, dominio diverso) troppo permissivo per PRTReID su
+crop broadcast soccer, e sotto-campionamento a 24 frame troppo aggressivo
+per catturare la struttura a blocchi su tracklet lunghe.
+
+Fix: `--max-samples-per-tracklet` default `24 -> 0` (nessun limite, usa
+tutti i crop disponibili), `--dbscan-eps` default `0.6 -> 0.15`,
+`--dbscan-min-samples` default `3 -> 5`. Rilanciato su Int-Ata,
+`--only-display-track-id 4`: **isolato correttamente in 2 cluster**
+(291 + 868 campioni) - split quasi esatto sul confine reale tra segmenti
+di scena.
+
+### Validazione cross-video
+
+Sweep completo con i parametri calibrati sui tre video con run
+PRTReID-enabled (Int-Ata gia' esistente; Inter-Juve/Inter-Atalanta
+costruite oggi via nuovo script `scripts/add_prtreid_to_config.py`, che
+inietta il blocco `prtreid` - identico a quello di
+`Int-Ata_prtreid_conservative_final_1200f` - sopra una config
+tracking/linking gia' allineata alla source run del ground truth, senza
+toccare altro):
+
+```text
+video           tracklet valutati   flaggati   confermati da GT reale
+Int-Ata               89                5      1 vero positivo (5 identita'
+                                                mescolate su 5 segmenti di
+                                                scena), 4 inconclusivi
+                                                (GT troppo rado in quei punti,
+                                                non falsi positivi accertati)
+Inter-Juve            39                0      0 attesi - coerente
+                                                (nessun display_track_id ha
+                                                >1 gt_jersey_number distinto
+                                                nel benchmark)
+Inter-Atalanta        20                0      0 attesi - coerente
+```
+
+Cross-check contro il ground truth eseguito con nuovo script
+`scripts/crosscheck_splitter_flags_against_gt.py` (per ogni
+`display_track_id` flaggato, elenca tutti gli item GT che lo referenziano
+e i `gt_jersey_number` distinti attraverso i segmenti di scena).
+
+**Conclusione onesta**: lo Splitter con i parametri calibrati non produce
+falsi positivi grossolani (zero flag dove il GT non conosce nessun
+mixing) ed e' capace di isolare correttamente l'unico caso di mixing
+reale osservato finora, con uno split quasi esatto sul confine vero. Ma
+un solo vero positivo non e' sufficiente per stimare un tasso di
+richiamo (recall) affidabile, e i 4 casi inconclusivi di Int-Ata restano
+da etichettare a mano se si vuole un secondo punto dato. L'assenza di
+casi positivi su Inter-Juve/Inter-Atalanta e' plausibilmente dovuta a
+tracklet piu' continue in quei clip (Inter-Juve: quasi tutte le tracklet
+coprono l'intero segmento di 1200 frame senza interruzioni;
+Inter-Atalanta: clip piu' corto, max ~292 campioni per tracklet), quindi
+meno occasioni strutturali di mixing indotto da reset di scena rispetto a
+Int-Ata. Non ancora deciso se/come integrare lo Splitter nel percorso
+operativo (resta audit-only, non applica nessuno split).
+
+### Pseudo-labeling verificato: raccolto completato su Inter-Juve e Inter-Atalanta
+
+Eseguito `scripts/harvest_verified_region_crops.py` sulle run di raccolta
+lanciate ieri sera:
+
+```text
+video            crop con regione   verificati   tracklet distinti
+Int-Ata                  98              43              ~19
+Inter-Juve               11               5               1 (bassa diversita')
+Inter-Atalanta           22              13               8
+totale                  131              61              ~28
+```
+
+Inter-Juve ha una resa molto piu' bassa (5/11, tutti dallo stesso
+tracklet `1#0`) - contributo quasi nullo in termini di varieta' per il
+training del detector, anche se non e' un errore: la config aveva
+`max_crops_per_tracklet=5` e questo video ha prodotto meno tracklet
+idonei nella run sorgente. Inter-Atalanta ha resa migliore (13/22, 8
+tracklet diversi: numeri 6, 7, 8, 10, 23, 28, 36, 59).
+
+Pool complessivo: 61 nuovi crop verificati contro i 435 originali del
+training set del detector regione (`gsr_train_manual_v1`) - circa +14%.
+Contributo reale ma modesto; non ancora deciso se sufficiente per
+giustificare un nuovo retraining del detector (i tre retraining gia'
+tentati con piu' epoche/pretraining esterno non erano stati promossi,
+vedi sezione precedente - il pool aggiuntivo qui e' dati reali nuovi, non
+piu' training sugli stessi dati, quindi il confronto non e' direttamente
+lo stesso esperimento).
+
+## Aggiornamento 2026-07-23 (2) - Allargare la finestra di candidate generation del linker: respinto
+
+### Motivazione
+
+Seguito diretto del dato piu' rilevante emerso ieri (sezione "correzione
+pitch-gate"): in 22 target su 50 (44%) il candidato corretto non entra
+nemmeno nel pool valutato dal linker, per via della finestra locale
+`max_gap=90` frame / `max_distance=160px` (`ft/linking/tracklet_linker.py`).
+Prima di investire su GTA, testato il fix piu' economico possibile:
+allargare semplicemente questi due parametri, lasciando invariati
+team-gate e appearance-gate a valle.
+
+### Esperimento
+
+Nuova config one-variable `configs/gsr_detection_tracking_conf012_widelinker_v1.yaml`
+sopra la baseline congelata `conf012` (stesso pilot12, stesso modello):
+`linking.max_gap: 90 -> 180`, `linking.max_distance: 160.0 -> 250.0`.
+
+Nota laterale utile: aggiunta in questa occasione una var booleana
+`export.save_video` (default `true`, invariato ovunque tranne il profilo
+benchmark GSR dove ora e' `false`) in `ft/pipeline.py`
+(`render_output_phase` ritorna subito se disabilitato) - il benchmark
+detection/tracking legge solo i CSV di detection/tracklet, mai il video
+annotato, quindi disattivarlo risparmia tempo di encoding senza toccare
+nessuna metrica.
+
+### Risultato: respinto
+
+```text
+delta (widelinker - baseline conf012), 12 sequenze:
+  display HOTA:  -0.00183 (3 migliorate, 2 pari, 7 peggiorate)
+  display AssA:  -0.00242 (3 migliorate, 2 pari, 7 peggiorate)
+  display IDF1:  +0.00129 (5 migliorate, 2 pari, 5 peggiorate, CI attraversa lo zero)
+  display MOTA:  -0.00001 (11 pari, 1 peggiorata)
+  frammentazioni/1000 GT: 0.0 in tutte le 12 sequenze, nessun cambiamento
+  raw HOTA/IDF1: 0.0 in tutte le 12 sequenze (atteso, il linker non tocca il raw tracker)
+```
+
+Il dato piu' informativo e' che le **frammentazioni sono identiche su
+tutte e 12 le sequenze**: allargare la finestra rende eleggibili piu'
+candidati, ma team-gate/appearance-gate a valle li scartano quasi sempre
+comunque; i pochi che passano peggiorano leggermente l'associazione
+(falsi collegamenti accettati) invece di recuperare quelli veri mancanti.
+
+**Conclusione**: coerente con l'esito gia' visto su TVCalib (gate fisico)
+e sul reranking morbido sulla distanza pitch - qualunque intervento
+*locale* del linker (guardare solo la coppia di tracklet candidata, in
+ordine temporale greedy, indipendentemente da quanto ampia sia la
+finestra) non recupera il gap del 44%. Rafforza ulteriormente la
+priorita' di un'associazione *globale* offline (GTA Connector) rispetto a
+qualunque altro tuning locale di `TrackletLinker`. Non ripetere sweep di
+soglia su questi due parametri sullo stesso pilot12.
+
+## Aggiornamento 2026-07-23 (3) - GTA Connector: respinto, precisione 7.3%
+
+### Motivazione e metodologia
+
+Seguito diretto del punto precedente: prima di scrivere qualunque logica
+di merge nella pipeline reale, costruito un audit offline puro (nuovo
+script `scripts/audit_gta_connector.py`, zero mutazione) che replica
+l'idea del Connector di GTA - fondere coppie di raw tracklet *diverse*,
+non sovrapposte nel tempo, la cui distanza coseno tra prototipi PRTReID
+media e' sotto soglia (`merge_dist_thres=0.4`, `min_len=100`, parametri
+del paper) - e confronta ogni proposta con il ground truth GSR offline
+(mai usato nella logica di proposta). Rischio esplicito da verificare:
+il Connector e' concettualmente vicino allo "shadow tracker"
+appearance-based gia' respinto in passato (309 vs 45 ID switch su
+SNGS-025, causa nota: l'aspetto non discrimina bene compagni di squadra
+con maglie quasi identiche).
+
+Eseguito su tutte le 12 sequenze pilot (run congelata `conf012`, nessuna
+nuova inferenza - solo tracklets.csv + frame gia' estratti + PRTReID):
+
+```text
+totale coppie proposte:        1307
+coppie con GT scorabile:        1307
+fusioni corrette:                 96
+fusioni sbagliate:              1211
+precisione:                    7.3%
+sbagliate stesso team:           531
+sbagliate team diverso:          345
+sbagliate team ignoto:           335
+```
+
+### Risultato: respinto, e piu' severo del previsto
+
+Precisione **7.3%** - inutilizzabile cosi' com'e'. Ancora piu' rilevante:
+delle fusioni sbagliate, **345 sono tra squadre diverse**, non solo tra
+compagni di squadra. L'ipotesi di partenza (aspetto confuso solo tra
+maglie simili) spiega parte del problema (531 casi) ma non tutto - la
+soglia `0.4` e' semplicemente troppo permissiva in questo dominio per
+l'embedding medio-tracklet di PRTReID, indipendentemente dalla somiglianza
+di maglia. Causa probabile: mismatch di dominio del checkpoint
+(allenato su SoccerNet, non sui nostri crop) o limite intrinseco della
+media di un embedding su tracklet lunghe con pose/illuminazione molto
+variabili (a differenza dello Splitter, che confronta campioni
+*all'interno* della stessa tracklet e ha funzionato bene con lo stesso
+embedding).
+
+**Decisione**: Connector respinto. Non fare uno sweep di soglia piu'
+stretta come prossimo tentativo automatico: con quasi un terzo degli
+errori gia' cross-team a soglia 0.4, restringere la soglia rischia solo
+di eliminare anche le poche fusioni corrette senza risolvere il problema
+di fondo. GTA nel suo complesso chiude qui con un bilancio misto onesto:
+Splitter validato su un caso reale confermato (vedi sopra), Connector
+respinto con evidenza chiara. Riprendere l'idea di associazione globale
+solo con un embedding diverso/fine-tuned sul dominio target, non con
+altro tuning di soglia sullo stesso PRTReID pretrained.
+
+## Aggiornamento 2026-07-23 (4) - Pseudo-labeling: allargata la finestra di raccolta e recuperati i "misread" corretti dal contesto
+
+### Allargata la finestra di export per tracklet
+
+`jersey_region_ctc_audit` limitava l'export a `max_crops_per_tracklet=5`
+per tracklet, indipendentemente da quanto fosse lunga (alcune tracklet
+Int-Ata superano 1000 frame). Reso parametrico in
+`scripts/build_region_ctc_audit_config_from_run.py`
+(`--max-crops-per-tracklet`, `--min-frame-gap`, default invariati a 5/5)
+e creata una config dedicata `configs/int_ata_jersey_region_ctc_pseudolabel_harvest_v1.yaml`
+(30/3) separata da quella "congelata" usata per il confronto scientifico
+CTC (`int_ata_jersey_region_ctc_roster_rerank_audit_v1.yaml`, lasciata
+invariata a 5/5 - non toccare quel profilo, e' il riferimento del test
+ufficiale). Stesso allargamento applicato anche a Inter-Juve/Inter-Atalanta.
+
+Nota laterale: incontrato di nuovo il crash CUDA transitorio "illegal
+memory access" gia' documentato per questa GPU (RTX 2080, 7.8GB),
+questa volta durante l'inferenza del detector principale (non
+training) e con due processi `ft.cli run` concorrenti sulla GPU - la
+VRAM non era satura (2.9/8GB), quindi non e' un OOM pulito. Non
+approfondito oltre; workaround usato: aspettare che l'altra run finisca
+e rilanciare in sequenza.
+
+### Recuperati i "misread" corretti dal contesto (non solo gli accordi puliti)
+
+Domanda del giorno che ha portato al fix: ha senso ri-analizzare
+un'informazione (es. un numero letto male dal detector) alla luce di
+conclusioni acquisite piu' avanti (consenso multi-frame, roster-rerank)?
+Risposta: si', ed esisteva gia' un punto preciso dove questo veniva
+scartato invece che sfruttato.
+
+`scripts/harvest_verified_region_crops.py` teneva solo i crop dove la
+lettura CTC del singolo frame (`ctc_top1`) **concordava gia'** col
+consenso finale della tracklet (`ctc_disagrees_with_consensus` scartava
+tutto il resto). I crop scartati per questo motivo sono pero' i casi
+piu' interessanti: frame dove il CTC ha letto male quel singolo crop, ma
+il consenso finale (verificato contro il ground truth reale, non contro
+se stesso) e' comunque noto per certo - errori del recognizer gia'
+risolti dal contesto multi-frame/roster. Rietichettarli con l'etichetta
+corretta li rende esempi verificati e potenzialmente piu' preziosi
+(hard example), senza rischio di auto-rinforzo perche' l'ancora resta il
+GT indipendente, non l'accordo del modello con se stesso - stessa
+disciplina del pseudo-labeling gia' in uso.
+
+Aggiunto flag opt-in `--include-corrected-misreads` (default `False`,
+comportamento pre-esistente invariato se omesso) che include questi casi
+taggati distintamente (`verification_type: corrected_misread` vs
+`clean_agreement`), per trasparenza - non li confondiamo con gli accordi
+puliti nell'output.
+
+Risultato su Int-Ata (stesso run `int_ata_all_fixes_verify_1200f`, nessuna
+nuova inferenza):
+
+```text
+total_crops_with_region=98
+verified_candidates=63 (prima: 43)
+  clean_agreement=43
+  corrected_misread=20
+rejected_reasons: no_gt_for_track=7, no_tracklet_consensus=16,
+                  consensus_not_ground_truth=12
+```
+
+**+20 crop recuperati (+46% sul pool Int-Ata)**, a costo computazionale
+zero (letti dagli stessi dati gia' esportati, nessuna nuova run).
+Prossimo passo naturale: ri-eseguire l'harvest con lo stesso flag su
+Inter-Juve/Inter-Atalanta una volta completate le run allargate lanciate
+oggi (`inter_juve_pseudolabel_harvest_wide_1200f`,
+`inter_atalanta_pseudolabel_harvest_wide` - quest'ultima interrotta dal
+crash CUDA, da rilanciare in sequenza).
+
+Non ancora testato (deliberatamente rimandato, rischio piu' alto e
+vicino a percorsi gia' respinti - linker allargato, Connector): ri-
+eseguire detection/tracking stesso usando le conclusioni della prima
+passata come prior (es. per recuperare frame dove il detector non ha
+trovato nessuna regione). Valutare solo dopo aver misurato il guadagno
+reale di questo fix piu' economico.
+
+### Risultato finale su Inter-Juve e Inter-Atalanta: pool quadruplicato
+
+Rilanciato l'harvest con `--include-corrected-misreads` sulle run
+allargate (30 crop/tracklet, gap minimo 3) completate per entrambi i
+video (Inter-Atalanta rilanciata con successo dopo il crash CUDA
+transitorio, nessun errore alla seconda esecuzione in sequenza):
+
+```text
+video            crop con regione   verificati (clean + corrected)
+Int-Ata                  98              63 (43 + 20)
+Inter-Juve              109              92 (70 + 22)
+Inter-Atalanta          151             122 (72 + 50)
+totale                  358             277
+```
+
+**Pool totale: 277 crop verificati contro i 435 originali del training
+set del detector (`gsr_train_manual_v1`) - +64%**, un contributo molto
+piu' sostanziale del +14% misurato ieri con la finestra stretta
+(5 crop/tracklet, solo accordi puliti). I due fattori si sono
+rinforzati: allargare `max_crops_per_tracklet` ha aumentato il numero
+grezzo di crop disponibili, e includere i `corrected_misread` ha quasi
+raddoppiato la resa su Inter-Atalanta (50 dei 122 verificati, il 41%)
+e Inter-Juve (22/92, il 24%) - segno che il recognizer sbaglia spesso
+sul singolo frame anche quando il contesto (multi-frame + roster) lo
+corregge senza ambiguita'.
+
+**Decisione da prendere**: con 277 crop (quasi il doppio del training
+set originale di 435), la domanda "vale la pena un retraining del
+detector?" e' ora concreta e non piu' marginale come con il pool da 61.
+Prossimo passo naturale: costruire il training set unito (originale +
+pseudo-labeled, mantenendo lo split sequenza-disgiunto gia' usato) e
+ripetere l'esperimento di retraining gia' fatto tre volte ieri (stavolta
+con piu' dati reali nuovi, non solo piu' epoche/pretraining esterno sugli
+stessi dati) - misurare hard-miss-rate e coverage@0.05/0.25 come nelle
+tre run precedenti, stesso protocollo, per confronto diretto.
+
+## Aggiornamento 2026-07-23 (5) - Retraining con pseudo-labeling: coverage isolata migliora, end-to-end peggiora
+
+### Dataset unito e training
+
+Aumentato ulteriormente il pool di pseudo-labeling (config
+`max_crops_per_tracklet=30`, `min_frame_gap=3`, invece di 5/5, sulle
+run gia' completate) e aggiunto il recupero dei "corrected_misread"
+(vedi sezione precedente) su tutti e tre i video: **640 crop verificati
+totali** (Int-Ata 426, Inter-Juve 92, Inter-Atalanta 122) - molto piu'
+dei 61/277 stimati con le config strette. Nuovo script
+`scripts/merge_pseudolabel_region_dataset.py`: unisce questi 640 crop
+nel solo partizionamento `images/train`/`labels/train` del dataset
+originale (`gsr_train_manual_v1`, 435 immagini), lasciando la
+validation (110 immagini, sequenze GSR) byte-identica - i video custom
+non fanno parte dello split train/val/frozen GSR, quindi nessun rischio
+di leakage. Dataset unito: **1075 immagini di training** (435 + 640).
+
+Training: stessi parametri delle tre run precedenti (seed `20260719`,
+`yolo26s.pt`, batch 16, patience 10). Fermato per early stopping dopo
+24 epoche (best a epoca 14). Checkpoint:
+`runs/jersey_number_region/yolo26s_pseudolabel_v1/weights/best.pt`
+sha256 `977d7f500896cf0b5dd5574254c849b1a058ccc05ff8a4dc4e8087829f11c50c`.
+
+### Coverage isolata: pattern diverso, apparentemente migliore
+
+Stesso audit delle tre run precedenti
+(`scripts/audit_jersey_number_region_detector_coverage.py`, ocr-run
+`readability_finetuned_surface`, confidence 0.25):
+
+```text
+                          coverage@0.25  hard_miss  fully_blind  coverage@0.05
+smoke (10 epoche)              60.7%       25.0%       12/173        75.0%
+full GSR-only (43 epoche)      62.8%       27.2%       13/173        72.8%
+SJN->GSR (25 epoche)           63.7%       28.1%       13/173        71.9%
+pseudolabel (24 epoche)        62.9%       15.5%       15/173        84.5%
+```
+
+A differenza delle tre run precedenti (dove piu' training peggiorava
+sistematicamente hard-miss/coverage a soglie basse), qui hard-miss
+crolla quasi a meta' e coverage@0.05 sale al valore piu' alto misurato
+finora. Unico dato in controtendenza: `fully_blind_tracklets` sale
+leggermente (15 vs 12-13).
+
+### End-to-end (CTC fisso, stesso ocr-run "finetuned_sar" della tabella originale): PEGGIORE su ogni metrica
+
+Prima di promuovere il checkpoint, misurato l'impatto reale con
+`scripts/evaluate_jersey_number_region_ctc_ocr_run.py`, CTC fisso
+(`jersey_number_ctc_sjn_to_gsr_v1.pth`), stesso protocollo esatto della
+tabella frozen originale (ocr-run
+`jersey_ocr_finetune/recognizer_ablation_frozen_v1/finetuned_sar`,
+confidence 0.25, box-padding 0.25):
+
+```text
+                         SJN->GSR (yolo26s_smoke_v1)   pseudolabel (yolo26s_pseudolabel_v1)
+region coverage          0.8162                        0.8132
+track coverage           0.9191                        0.9017
+correct                   124                            117
+wrong                      35                             39
+accuracy all             0.7168                         0.6763
+accuracy assigned        0.7799                         0.7500
+GT in top-5              84.4%                          81.5%
+```
+
+**Peggiore su ogni singola metrica**, nonostante il miglioramento netto
+sulla coverage isolata. Contraddizione solo apparente: l'audit di
+coverage misura se il detector trova *una* regione, non quanto bene la
+localizza (IoU/precisione del box). Il nuovo detector, allenato anche
+sui crop "corrected_misread" (regioni corrette dal contesto ma piu'
+"rumorose" come esempi di training), sembra aver imparato a rilevare
+piu' spesso ma con box meno precisi - lo stesso identico pattern gia'
+visto con la geometria da posa (trova la regione piu' spesso ma il
+recognizer legge quello che trova molto peggio, li' il crollo era
+drastico 78%->36%, qui piu' contenuto ma stessa dinamica).
+
+**Decisione**: checkpoint `yolo26s_pseudolabel_v1` **non promosso**.
+Resta operativo `yolo26s_smoke_v1`. Risultato comunque prezioso: conferma
+che aumentare volume/diversita' dei dati di training non basta se non si
+controlla anche la qualita' di localizzazione (non solo presenza/assenza
+del box) - prossimo passo, se si vuole insistere su questa direzione,
+sarebbe un audit IoU per-crop tra il box del nuovo detector e quello
+del vecchio sugli stessi campioni rilevati da entrambi, per confermare
+l'ipotesi della localizzazione piu' rumorosa prima di provare a
+correggerla (es. filtrando i crop "corrected_misread" piu' estremi dal
+training set, o pesandoli meno).
+
+## Aggiornamento 2026-07-23 (6) - Nuovo video Por-Uzb (Mondiale 2026) e nuova feature: escalation OCR sui tracklet senza numero
+
+### Setup del video
+
+Aggiunto un nuovo video custom `Por-Uzb` (Portogallo-Uzbekistan,
+broadcast Mondiale 2026). Roster costruito a mano da formazioni Sky
+Sport (fetch web) nello stesso formato di `Int-Ata.json`
+(`player_id`/`team_id`/`jersey_number`/`role`/`position_prior`), ma
+**senza inventare dati biometrici** (altezza, piede, nazionalita') per
+i singoli giocatori, trattandosi di persone reali identificabili - a
+differenza del roster Int-Ata (anch'esso persone reali, non fittizie:
+correzione fatta a valle, quei dati biometrici lì erano gia' presenti
+da una sessione precedente, non verificati da fonte indipendente in
+questa sessione). 52 giocatori (26 per squadra, 11 titolari + 15
+riserve), nessun numero duplicato per squadra.
+
+Due bug incontrati e risolti sulla prima run:
+1. `max_frames: 300` ereditato silenziosamente da una config a monte
+   della catena (probabile residuo di uno smoke-test) - troncava il
+   video (554 frame reali) senza errori o avvisi. Fix: passare sempre
+   `--max-frames` esplicito e verificare nel `run_manifest.json` prima
+   di fidarsi dell'output.
+2. Crash CUDA "illegal memory access" transitorio (stessa instabilita'
+   nota della GPU) - risolto rilanciando lo stesso comando.
+
+### Diagnosi bassa coverage jersey
+
+Con soglie di default (`min_votes=2`, `min_winner_margin=0.15`), solo
+17/27 tracklet ottenevano un numero. Causa: crop giocatore piccoli
+(mediana 55px lato minimo, sotto la soglia dove negli audit del
+detector regione la coverage crolla) - ma **nota bene**: Por-Uzb usa il
+backend `mmocr+easyocr` (lettura diretta del testo), non la pipeline
+YOLO-regione+CTC auditata nei giorni precedenti - le soglie
+44px/55px/63px di quegli audit non si applicano direttamente qui,
+il meccanismo (testo piccolo piu' difficile da leggere) e' solo
+analogo, non lo stesso sottosistema.
+
+Allargare le soglie OCR (`min_confidence 0.25->0.10`,
+`min_winner_margin 0.15->0.08`, `min_votes 2->1`) ha portato la coverage
+a 27/27 tracklet, ma indebolendo il criterio di accettazione per tutti.
+
+### Nuova feature: escalation on-demand, non tuning globale
+
+Domanda del giorno: ha senso, se un tracklet non ottiene un numero dal
+campione iniziale, andare a leggere altri crop invece di abbassare la
+soglia per tutti? Risposta: si', e il motivo per cui l'OCR non guarda
+gia' tutti i frame e' puro costo (campionare ~86 crop per tracklet
+costa gia' 15-45 minuti con mmocr+easyocr; leggerli tutti costerebbe
+~6x).
+
+Implementato in `ft/features/jersey_ocr.py`: nuovo parametro
+`escalate_on_unassigned` (default `false`, nessun cambiamento per le
+run esistenti). Se un tracklet non raggiunge `min_votes` con il
+campione iniziale, la pipeline pesca fino a `escalation_max_extra_crops`
+(default 20) crop **non ancora usati** dal pool rimanente di quel
+tracklet specifico, li fa leggere, e ri-vota includendoli. Il costo
+extra si paga solo per i tracklet che ne hanno bisogno. Diagnostica:
+ogni tracklet riporta `escalated: true/false` in `*_jersey_ocr.json`.
+
+Bug trovato e corretto durante il primo test: passato erroneamente la
+stringa `"escalation"` come `pass_index` (il codice lo usa per
+formattare nomi di file di debug con `{pass_index:02d}`, causando
+`ValueError: Unknown format code 'd' for object of type 'str'`) - fix:
+usare `self.temporal_passes` (un intero, sempre maggiore di qualunque
+indice di pass normale) come indice dedicato per i crop di escalation.
+
+Risultato su Por-Uzb, stesse soglie strette originali (non allargate):
+
+```text
+                                          tracklet assegnati
+baseline (soglie strette, no escalation)       17/27
+escalation (soglie strette, con retry)         21/27
+loose (soglie allargate, no escalation)        27/27
+```
+
+L'escalation da sola recupera 4 tracklet su 10 che fallivano (40%)
+mantenendo i criteri di accettazione originali (piu' severi, minor
+rischio di falsi positivi) - miglioramento isolato e reale, non
+compensato abbassando la barra per tutti. Non ancora confrontato contro
+ground truth reale su Por-Uzb (nessun benchmark manuale costruito per
+questo video finora) - il numero misura solo *quanti* tracklet ottengono
+un'assegnazione, non se il numero assegnato sia corretto.
+
+## Aggiornamento 2026-07-24 - Nuovi video (Por-Uzb, Esp-Arg, Usa-Bel), fix portiere per colore, bug critico jersey_frame_selection mode=propose
+
+### Roster per tre nuovi video Mondiale 2026
+
+Aggiunti `Por-Uzb` (Portogallo-Uzbekistan), `Esp-Arg` (Spagna-Argentina),
+`Usa-Bel` (USA-Belgio). Roster costruiti da fetch web (Sky Sport /
+Eurosport). Per persone reali identificabili: nessun dato biometrico
+inventato (altezza, piede, nazionalita'), solo numero/nome/ruolo
+verificati dalla fonte; dove la fonte non riportava i numeri delle
+riserve (Eurosport per Esp-Arg/Usa-Bel), roster limitato ai soli 11
+titolari per squadra piuttosto che inventare numeri.
+
+### Bug del colore portiere: il verde puro si confonde col prato
+
+Il rilevatore di ruolo portiere (`GoalkeeperAppearanceAssigner`,
+`ft/features/goalkeeper.py`) si attiva solo se il roster fornisce
+`metadata.kit_color` per il portiere (letto da
+`goalkeeper_color_ranges_by_team_from_roster`). Aggiunto inizialmente
+verde fosforescente (`#39FF14`) per il portiere Uzbekistan (Nematov):
+risultato, quasi tutti i 27 tracklet di Por-Uzb sono stati classificati
+come "goalkeeper" (falsi positivi diffusi, punteggi 0.2-0.7 su quasi
+ogni tracklet). Causa: il matching e' basato solo sulla tonalita' HSV
+(`h_tolerance=12`), e il verde di una maglia da portiere e' strutturalmente
+troppo vicino alla tonalita' del prato per essere distinto in modo
+affidabile - non e' un problema della sfumatura scelta, e' un limite
+strutturale del classificatore per QUALSIASI verde. Fix: rimosso il
+colore per quel portiere (resta senza rinforzo di ruolo, come gia' fatto
+deliberatamente per il portiere Belgio su richiesta esplicita "verde ma
+non lo mettiamo"). Il teal/azzurro (`#20B2AA` Diogo Costa, `#00BFFF`
+Unai Simon, `#FFD700` giallo per Freese) non ha mostrato lo stesso
+problema - tonalita' lontane dal verde prato restano sicure.
+
+### Bug critico: `jersey_frame_selection.mode: propose` non scrive mai il jersey_number
+
+Provato il selettore di leggibilita' gia' validato
+(`legibility_resnet34_soccer_20240215.pth`, checkpoint verificato via
+sha256) per sostituire il campionamento cieco (86+ crop/tracklet) con
+al massimo `top_k=5` crop scelti per leggibilita' reale - motivazione:
+ridurre drasticamente il tempo di calcolo (lo stage OCR impiegava
+15min-2h25 a run). Copiata la config di riferimento gia' validata su
+GSR (`gsr_legibility_selector_balanced.yaml`), incluso `mode: propose`.
+
+Risultato: **0 tracklet su 23 con jersey_number nel CSV finale**,
+nonostante il diagnostico interno (`*_jersey_ocr.json`) mostrasse
+correttamente 10/23 tracklet con `status: assigned` e voti validi.
+Causa identificata in `ft/pipeline.py` (righe ~588-606):
+
+```python
+observational_propose = any(
+    cfg.get("enabled", False) and str(cfg.get("mode", "audit")).lower() == "propose"
+    for cfg in (selector_cfg, subject_cfg, prefix_cfg)
+)
+if not observational_propose and (...):
+    _apply_jersey(jersey_assignments, player_rows, tracks, ...)
+```
+
+Con `mode: propose` su un modulo abilitato, `observational_propose=True`
+e **`_apply_jersey` non viene mai chiamato per nessun tracklet della
+run** - non solo per quelli toccati dal selettore. Non e' un bug del
+codice: e' il comportamento voluto quando si usa `propose` per fare
+audit di un selettore *sopra* un profilo operativo gia' esistente e
+funzionante (`propose` = "calcola e confronta, non toccare l'output
+reale"). Il nostro caso era diverso: il selettore era l'**unica** fonte
+di jersey number nel profilo, quindi serviva `mode: apply`. Fix:
+cambiato `mode: propose -> apply` in
+`configs/custom_video_legibility_selector_v1.yaml`. Non ancora
+verificato il risultato con il fix (run rilanciata, esito pendente).
+
+**Lezione generale**: prima di riusare una config "propose"-only gia'
+validata come base per un nuovo caso d'uso, verificare cosa significa
+`propose` in quello specifico punto della pipeline - il nome e' condiviso
+da piu' moduli (`jersey_frame_selection`, `jersey_subject_filter`,
+`jersey_prefix_consolidation`) con la stessa convenzione ("non mutare
+l'output reale"), ma l'impatto pratico dipende da cosa altro sta gia'
+scrivendo `jersey_number` in quella run.
+
+### Pulizia disco macchina remota
+
+`~/FT` era arrivato a 55G. Investigazione mostra che il grosso non era
+nei crop immagine (`crops/`, solo 3.7G totali) ma in export JSON
+ridondanti gia' duplicati in CSV: **125 file `*_tracklets.json`** (9.7G,
+CSV gemello sempre presente, nessuno script letto oggi li usa) cancellati
+in sicurezza. Attenzione: **`*_identity_assignments.json` NON ha un CSV
+gemello** (125 file, 2.7G) - probabile unica copia delle decisioni di
+assegnazione identita', non cancellare senza verificare se serve
+all'evaluator del benchmark. Cancellate anche le 66 cartelle `SNGS-*`
+in `artifacts/costume-video` (5.3G, esperimenti GSR di meta' luglio gia'
+riassunti in handoff.md, nessuna nelle `source_runs` protette). Lista
+delle run intoccabili (source_runs dichiarate in
+`evaluation/identity_benchmark_v1.yaml` + run citate per nome nei
+risultati definitivi di handoff.md):
+`Int-Ata_identity_evidence_v1_resetbytetrack_cutsensitive_1200f`,
+`Int-Ata_prtreid_conservative_final_1200f`,
+`Inter-Juve_scenecuts_loose_noreset_gkfallback_spreadgate_propagation_strict_linker_legacyappearance_1200f`,
+`Inter-Juve_identity_evidence_patch_1200f`,
+`Inter-Atalanta_identity_evidence_v1_resetbytetrack_full`,
+`int_ata_all_fixes_verify_1200f`, `inter_juve_pseudolabel_harvest_wide_1200f`,
+`inter_atalanta_pseudolabel_harvest_wide`.
+
+### Secondo giro di pulizia: sprechi strutturali fermati alla fonte, non solo puliti
+
+Cercato cosa la pipeline continua a *creare* senza che nessuno lo legga
+mai, non solo cosa cancellare una tantum:
+
+- **`jersey_ocr_debug/`**: fino a 12 varianti di immagine (torso,
+  torso_clahe, upper_back, number_band, ecc.) per ogni crop OCR, mai
+  ispezionate in nessuna sessione. Trovate **16G** accumulate solo nelle
+  run di questa sessione - piu' grande di `tracklets.json` (9.7G) e
+  `SNGS-*` (5.3G) messi insieme. Causa: `jersey_ocr.debug_crops: true`
+  di default in `configs/default.yaml`. Cambiato a `false`.
+- **`*_tracklets.json`**: stessa causa strutturale del ritrovamento
+  precedente (9.7G) - `export.save_final_json: true` di default lo
+  rigenera ad ogni run anche se nessuno script lo legge mai (tutti usano
+  il `.csv` gemello). Cambiato a `false`.
+- **`output_videos/*.mp4`**: overlay di visualizzazione, mai letto da
+  nessuno script, generato anche per run puramente diagnostiche (sweep
+  di soglia) dove nessuno guarda il video. Non disattivato di default
+  (a volte serve davvero per ispezione visiva, es. verifica del fix
+  portiere) - da disattivare per-run con `export.save_video: false`
+  quando si sa gia' che non servira'.
+- **`.ft_cache/`, cache pip/conda/torch**: non strutturale (si
+  rigenerano da sole quando servono), ma ~15G liberati con
+  `conda clean --all`, `pip cache purge`, rimozione `~/.cache/torch`.
+- **`*_pre_identity.json/csv`**: controllato, dimensione trascurabile
+  (0 byte trovati nelle run attuali) - non serve intervenire.
+
+Bilancio pulizia disco totale di oggi: **~46G liberati** su ~55G di
+partenza, con due sprechi strutturali (debug crops, tracklets.json)
+disattivati alla fonte per tutte le run future, non solo ripuliti una
+volta.
+
+## Aggiornamento 2026-07-24 (2) - Segnale `full_body_sufficient`: filtri ROI sui crop OCR, validato e implementato
+
+### Domanda di partenza
+
+Non i filtri logici (roster_filter/goalkeeper_filter/gate Hungarian, gia'
+investigati oggi), ma i filtri *sull'immagine* usati dall'OCR: le regioni
+ROI (`full_body`, `back_number_wide`, `upper`, `torso`, `number_band`,
+ecc. - vedi `legacy_ocr_regions()`/`number_roi_regions()` in
+`ft/features/jersey_ocr.py`) ritagliate dal crop prima di leggere il
+numero. Troppi filtri/regioni potrebbero peggiorare il problema invece di
+aiutarlo?
+
+### Metodologia: ablation offline, zero inferenza GPU nuova
+
+Ogni detection gia' salvata in `*_jersey_ocr.json`/`ocr_diagnostics.json`
+porta il campo `variant` (nome regione + trasformazione, es.
+`roi_number_band_clahe`). Riusando direttamente le funzioni reali
+`aggregate_detections_by_crop()`/`vote_numbers()` di
+`ft/features/jersey_ocr.py` (non una riscrittura), e' possibile
+ri-simulare la decisione di voto di un tracklet sotto un sottoinsieme di
+detection diverso (es. solo regione `full_body`) senza rileggere nessun
+crop. Testato contro due run di valutazione OCR gia' esistenti su
+SoccerNet-GSR con ground truth reale, mai ispezionate prima in questa
+sessione:
+
+- `evaluation_outputs/gsr_jersey_ocr_mmocr_50s/gsr_val_mmocr_easyocr_50s_5000t`
+  (830 tracklet, 50 sequenze).
+- `evaluation_outputs/gsr_jersey_ocr_mmocr_10s_v2/gsr_val_mmocr_easyocr_10s_1000t`
+  (157 tracklet, 10 sequenze indipendenti, usato come validazione).
+
+Baseline della simulazione riprodotto esattamente il `metrics.json` gia'
+salvato (`accuracy_assigned=0.4305`, `coverage=0.7024` sul campione da 50
+sequenze) - conferma che la metodologia e' fedele.
+
+### Risultato: `full_body` da solo e' molto piu' preciso, ma con meno coverage
+
+| Policy | 50 seq: coverage | 50 seq: accuracy | 10 seq: coverage | 10 seq: accuracy |
+|---|---|---|---|---|
+| baseline (tutte le regioni) | 70.2% | 43.1% | 66.9% | 54.3% |
+| solo `full_body` | ~29% | **75.2%** | ~32% | **84.3%** |
+
+Un cascade a due stadi (prova prima `full_body` da solo, ripiega su tutte
+le regioni solo se non raggiunge il quorum voti) NON migliora
+l'accuracy pooled, perche' le decisioni di stadio 2 (fallback) sono
+sistematicamente solo ~20% accurate su **entrambi** i campioni
+indipendenti (20.0% e 20.4%) - troppo vicino al rumore per compensare la
+perdita di coverage.
+
+Il punto utile non e' il cascade come sostituto della decisione, ma la
+**stratificazione**: sapere se la decisione (quella con tutte le
+regioni, la stessa gia' in uso oggi) sarebbe *anche* raggiungibile dalla
+sola regione `full_body` e' un segnale di affidabilita' forte e
+riproducibile, confermato su due campioni GSR indipendenti prima di
+fidarsene (richiesta esplicita: "prima validalo su un altro dataset
+GSR").
+
+### Implementazione in produzione (non solo ablation)
+
+Segnale chiamato `full_body_sufficient` (booleano), implementato in tre
+punti:
+
+1. **`ft/features/jersey_ocr.py`**: nuova funzione `is_full_body_variant()`
+   (stesso stile di `is_template_variant()`/`should_direct_recognize_variant()`
+   gia' presenti, substring-check su `"full_body"` nel nome variant - tutte
+   le regioni strette non contengono questa substring, verificato). Nel
+   loop principale `recognize()`, dopo il voto finale (incluso l'eventuale
+   escalation), viene ricalcolato un secondo voto usando solo le detection
+   `full_body` (stessa aggregazione per-crop, stessi parametri
+   `min_raw_confidence`/`digit_confusion_overrides` della decisione reale).
+   Se questo secondo voto raggiunge da solo `min_votes`, `full_body_sufficient
+   = True`. Zero costo aggiuntivo: nessun nuovo crop letto, nessuna nuova
+   inferenza OCR - solo un secondo voto sulle detection gia' calcolate.
+   Il campo finisce sia nei diagnostics per-tracklet sia nel dict `voted`
+   (quindi nelle assignments quando accettate).
+2. **`ft/pipeline.py`**: `_apply_jersey()` promuove il segnale a campo
+   piatto `jersey_full_body_sufficient` su row e track, stesso pattern di
+   `jersey_votes`/`jersey_confidence`/`jersey_winner_margin`.
+3. **`ft/identity/hungarian.py`**: nuovo parametro
+   `narrow_region_jersey_score_penalty` (default `0.15`,
+   `identity.narrow_region_jersey_score_penalty` in `configs/default.yaml`).
+   Quando `jersey_full_body_sufficient is False`:
+   - `_has_reliable_jersey_match()`/`_has_reliable_jersey()`: alza di 0.15
+     sia la soglia di `candidate_score` che quella di `winner_margin`
+     richieste per concedere `reliable_jersey` nel gate di assegnazione -
+     evidenza raggiunta solo con regioni strette deve essere piu' forte per
+     passare, invece di essere scartata a priori;
+   - `jersey_reliability()`: dimezza il peso soft-cost usato in `_score()`
+     (influenza sia il bonus per match che la penalita' per mismatch, oltre
+     al prior "numero 1 = portiere").
+
+Scelta deliberata di non trasformare il segnale in un veto secco
+(`reliable_jersey = False` sempre quando narrow-region): non c'e' ancora
+una validazione end-to-end sul benchmark identity reale (solo sulla
+metrica OCR isolata), quindi il segnale abbassa la fiducia in modo
+graduale invece di bloccare, seguendo lo stesso principio "unknown
+invece di identita' debole" gia' applicato altrove, ma senza introdurre
+un cambio di comportamento troppo aggressivo senza misura diretta
+sull'identity benchmark.
+
+### Verifica sul codice effettivamente spedito (non solo sulla logica derivata)
+
+Rieseguita la stratificazione con le funzioni *reali* appena modificate
+(`is_full_body_variant`, `aggregate_detections_by_crop`, `vote_numbers`)
+sugli stessi due dataset GSR, usando pero' la decisione baseline (tutte
+le regioni, quella realmente usata come `jersey_number`) come risposta
+scorata, e il flag `full_body_sufficient` solo come segnale di
+affidabilita' (esattamente come viene consumato in produzione, non come
+decisione alternativa):
+
+| Dataset | `full_body_sufficient=True` | `full_body_sufficient=False` |
+|---|---|---|
+| 50 sequenze | 76.5% (182/238) | 20.0% (69/345) |
+| 10 sequenze (indipendente) | 90.2% (46/51) | 20.4% (11/54) |
+
+Pattern confermato, anzi il bucket `True` risulta ancora piu' forte
+misurato cosi' (76.5%/90.2%) che nell'ablation con cascade a se stante
+(75.2%/84.3%) - coerente: qui la decisione scorata e' quella con tutte
+le detection, che tende ad avere piu' evidenza totale a supporto quando
+`full_body` da solo bastava comunque.
+
+Nessun bug di trascrizione tra logica validata e codice shippato.
+`min_votes`/`min_raw_confidence`/`max_candidates_per_crop`/
+`min_crop_candidate_ratio` letti dal run stesso (`ocr_diagnostics.json`),
+non hardcoded.
+
+File nuovo per riprodurre la verifica: `scripts/verify_full_body_signal.py`
+(importa direttamente da `ft.features.jersey_ocr`, va eseguito da `~/FT`).
+
+### Bug reale trovato al primo run end-to-end: il segnale non arrivava mai al gate
+
+Prima run di verifica end-to-end su un video reale (non GSR):
+`Usa-Bel`, config `usa_bel_jersey_ocr_all_crops_v1.yaml` (stesso profilo
+"tutti i crop" di Por-Uzb, con `number_region.enabled: false` per
+evitare un doppio caricamento MMOCR/EasyOCR nello stesso processo - una
+combinazione che aveva gia' causato un crash CUDA "illegal memory
+access" al primo tentativo, non legato al nuovo segnale).
+
+Al primo run pulito (v2): OCR grezza assegna 7/23 tracklet, ma solo
+**3 identita' finali confermate** (Richards, Courtois, Adams) invece
+delle ~7 attese. Prima di concludere che la nuova penalita'
+(`narrow_region_jersey_score_penalty`) fosse troppo aggressiva, verificato
+il funnel completo (stesso principio "misurare prima di cambiare soglie"
+gia' applicato altrove in questo handoff): per il tracklet 15
+(jersey=1, votes=33, winner_margin=0.319 - ampiamente sopra anche la
+soglia alzata di 0.25), il gate segnava comunque `reliable_jersey=False`.
+Causa trovata in `ft/identity/hungarian.py`: la funzione `summarize()`
+- che costruisce l'oggetto "tracklet" su cui gira davvero il gate
+Hungarian, raggruppando le righe per tracklet - **non ricopiava mai** il
+campo `jersey_full_body_sufficient` scritto da `pipeline.py` sulle righe
+grezze. Segue lo stesso pattern gia' usato per
+`jersey_votes`/`jersey_confidence`/`jersey_head_confidence`/
+`jersey_winner_margin` (aggregati con `mean()`/`max_int()` sulle righe
+che condividono il `jersey_number` vincente), ma il nuovo campo non era
+stato aggiunto a quella lista. Risultato pratico: `tracklet.get(
+"jersey_full_body_sufficient")` era sempre `None` durante l'assegnazione
+reale, quindi la penalita' non poteva mai scattare - il calo a 3
+identita' non era causato dalla nuova penalita' (di fatto inattiva), ma
+da un problema pre-esistente (probabile bias "OCR legge 1 quando
+incerta", gia' documentato sopra, con 3 tracklet diversi che leggevano
+tutti "1").
+
+Fix: aggiunta la riga mancante in `summarize()`,
+`mode([row.get("jersey_full_body_sufficient") for row in items if
+row.get("jersey_number") == jersey_number and
+row.get("jersey_full_body_sufficient") is not None])`, stesso pattern
+delle altre metriche jersey aggregate per tracklet.
+
+Rerun (v3) dopo il fix: **7 identita' finali confermate** (Freese #24,
+Courtois #1, Richards #3, Adams #4, Dest #2, Trossard #10, Robinson #5),
+tutte plausibili rispetto al roster reale. Nota a margine: nello stesso
+rerun l'OCR grezza e' salita a 21/23 assegnati (da 7/23) pur non avendo
+toccato `jersey_ocr.py` tra le due run - spiegazione piu' probabile:
+cache OCR condivisa (`~/FT/.ft_cache`, non legata alla cartella
+artifacts) popolata nel frattempo da un'altra run rimasta attiva sullo
+stesso video con config quasi identica. Non e' quindi un confronto
+pulito v2-vs-v3 sull'effetto isolato del gate, ma il risultato finale
+(7 identita' reali, nessun crash, segnale confermato attivo nel gate)
+e' l'esito atteso.
+
+**Lezione**: dopo aver aggiunto un nuovo campo per-tracklet in
+`ft/pipeline.py`, verificare sempre se esiste un punto di aggregazione
+a monte (qui `HungarianPlayerIdentifier.summarize()`) che ricostruisce
+l'oggetto "tracklet" da zero raggruppando le righe - un campo scritto
+solo sulle righe/track non arriva automaticamente li' se non viene
+esplicitamente ricopiato, anche se il resto del codice (gate,
+`jersey_reliability()`) lo legge correttamente per nome.
+
+## Aggiornamento 2026-07-24 (3) - Roster arbitro, frammentazione ID chiarita, e trasparenza del gate identita'
+
+### Roster: le particolarita' di ogni partita vanno nel file roster, non nei config di run
+
+Richiesta di aggiungere l'arbitro (rosso, pantaloncini neri, confermato da
+un frame reale del video) a Usa-Bel. Primo tentativo: config-level override
+di `referee.color_ranges` in `usa_bel_jersey_ocr_all_crops_v1.yaml`.
+Corretto dall'utente: la convenzione di questo progetto e' che le
+particolarita' di una singola partita (colore portiere, colore arbitro)
+vanno nel roster (`metadata.kit_color` su un'entry con `role: goalkeeper`
+o `role: referee`), non in un config di run - stessa logica gia' seguita
+per i portieri, gia' usata altrove nel roster (`referee_yellow` in
+Inter-Atalanta.json). Annullato l'override di config, aggiunta invece
+un'entry `referee_red` a `Usa-Bel.json` (`role: referee`,
+`metadata.kit_color: "red"`). Un solo colore basta (il rosso da solo e'
+gia' distintivo, dato che nessuna delle due squadre gioca in rosso;
+il nero avrebbe rischiato di confondersi con la maglia scura USA).
+
+### Frammentazione ID: 33 visti nel video, 23 identita' reali - nessun bug
+
+L'utente ha notato ID fino a "33" nel video renderizzato per un video con
+solo ~22 giocatori + arbitro, temendo una frammentazione grave del
+tracking. Misurato invece di ipotizzare: `Usa-Bel_linking.json` mostra
+**25 track grezzi -> 23 tracklet finali** (solo 2 fusioni necessarie,
+entrambe accettate), con 295/298 candidati di fusione scartati per
+"gap" - cioe' track che coesistono nello stesso momento, quindi
+*correttamente* non fusi (persone diverse viste insieme). 18 dei 27 track
+nel CSV durano 450+ frame su 470 totali - tracking stabile.
+
+La spiegazione del "33" visto a occhio: `display_track_id` di default
+**e' semplicemente l'ID grezzo del tracker** (`ft/linking/
+tracklet_linker.py:194`, `track.setdefault("display_track_id",
+int(raw_track_id))`), mai rinumerato da 1 a N. Il tracker assegna un
+numero sempre crescente ogni volta che rileva/ritrova qualcosa, anche per
+frammenti di pochi frame poi scartati dall'export finale (durata minima).
+Vedere "ID33" nel video non significa 33 identita' reali - il contatore
+interno era arrivato li', ma diversi numeri intermedi appartenevano a
+rilevamenti troppo corti per contare. Nessun intervento necessario su
+tracker/linker per questo video.
+
+### Nuovo strumento: `scripts/identity_gate_report.py`
+
+L'utente ha messo in discussione se l'assegnazione Hungarian sia utile o
+"faccia solo perdere tempo/risorse" data la complessita' accumulata
+(reliable_jersey, goalkeeper_singleton, strong_combined,
+narrow_region_jersey_score_penalty...). Prima di ripensare l'architettura,
+costruita trasparenza sull'esistente: script che incrocia
+`{video}_identity_assignments.json` (assignments, chiavi codificate
+`str(-(display_track_id*100000+1))`), `{video}_jersey_ocr.json` e
+`{video}_candidate_scores.csv` in un report leggibile per-tracklet (stato,
+quale criterio del gate ha deciso, valori esatti contro soglie, evidenza
+OCR incluso `full_body_sufficient`, miglior candidato roster). Zero nuova
+run necessaria, riusa dati gia' prodotti.
+
+Eseguito su Usa-Bel, due scoperte concrete e azionabili:
+
+1. **`visual_similarity` e' sempre `None`, su tutti i 23 tracklet, senza
+   eccezioni.** Il componente "somiglianza visiva" del costo Hungarian e
+   l'intero percorso `strong_combined` (che lo richiede) sono
+   **strutturalmente inerti**, non solo in questa run - causa: ogni
+   giocatore nel roster ha `"visual_embedding": null` (nessun roster
+   finora fornisce profili visivi), quindi `visual_distance()` non ha
+   nulla con cui confrontare l'embedding del tracklet. Questo non e' un
+   componente "poco utile", e' un componente morto per qualsiasi video
+   che non fornisca profili visivi nel roster - probabilmente tutti i
+   video processati finora.
+2. **La vera causa della bassa copertura (7/23 assegnati) e' il bias OCR
+   gia' documentato ("legge 1 quando incerta"), non l'architettura del
+   gate**: 8 tracklet su 23 (35%) leggono il numero "1" (track 1, 5, 8,
+   11, 13, 15, 19, 20). Solo uno (track 17, Courtois) trova un candidato
+   roster reale con jersey=1; gli altri 7 restano correttamente
+   "insufficient_assignment_evidence" perche' nessun altro giocatore ha
+   quel numero - il gate li rifiuta invece di assegnarli a caso, che e'
+   il comportamento voluto, non uno spreco.
+
+Anomalia isolata non ancora spiegata: track 10 ha `assignment_gate` mai
+valutato (`pass=None`, tutti i campi `None`, `confidence=0.0`) nonostante
+un'evidenza OCR forte (numero=7, 22 voti) - probabilmente escluso dal
+matching Hungarian per qualche motivo strutturale (matrice non quadra,
+ruolo non-player), da investigare separatamente se rilevante.
+
+**Conclusione provvisoria sulla domanda "le varie parti aiutano o
+sprecano risorse?"**: il gate (reliable_jersey/goalkeeper_singleton)
+sembra funzionare correttamente e conservativamente dato il bias OCR
+presente; il componente visivo/strong_combined e' morto per mancanza di
+dati roster, non per un difetto della logica stessa. Prossimo passo
+concordato con l'utente: investigare il bias OCR sul numero "1" prima di
+decidere se investire nel popolare profili visivi nel roster.
+
+### Bias OCR sul numero "1": diagnosticato, correzione testata e RESPINTA
+
+Su Usa-Bel, 8/23 tracklet (35%) hanno vinto il voto con numero "1".
+Ispezionata la distribuzione completa dei candidati (non solo il
+vincitore) per tutte e 8: track 1 mostra il pattern gia' noto di
+troncamento `number_band` ("1": 51 voti vs "10": 34 voti, margine 0.025 -
+quasi un pareggio, "10" letto parzialmente come "1"); le altre 7 mostrano
+"1" vincere su alternative diverse ogni volta (7, 4, 3, 6...) senza un
+pattern fisso di confusione tra due cifre specifiche - coerente col bias
+gia' documentato su GSR (`confusion.csv`: molte cifre vere ->1) come
+"risposta di ripiego" del modello quando incerto, non una confusione
+visiva specifica.
+
+Testata una correzione mirata (`scripts/test_distrust_one_bias.py`,
+stessa metodologia offline zero-nuova-inferenza gia' validata per
+`full_body_sufficient`) su entrambi i campioni GSR: se il vincitore e' 1
+con `winner_margin` sotto soglia, o (a) scartarlo (`demote`) o (b) usare
+il secondo candidato al suo posto (`promote_runner_up`).
+
+- `demote`: su entrambi i campioni il numero di risposte corrette resta
+  **identico a ogni soglia** (251/830 e 57/157) - tutti gli "1" scartati
+  erano comunque sbagliati, quindi `accuracy_assigned` sale solo perche'
+  il denominatore (copertura) scende; `accuracy_all` resta piatta. Nessun
+  guadagno reale, solo un miglioramento cosmetico della metrica.
+- `promote_runner_up`: sul campione da 50 sequenze guadagna **+10
+  risposte corrette** (251->261, `accuracy_all` 30.2%->31.4%),
+  sembrava confermare l'ipotesi di troncamento. Ma sul campione
+  indipendente da 10 sequenze **il guadagno e' zero a qualsiasi soglia**
+  (57->57, invariato) - non si riproduce, a differenza di
+  `full_body_sufficient` che aveva replicato in modo quasi identico su
+  entrambi i campioni.
+
+**Decisione: RESPINTA, non implementata.** Non supera la stessa barra di
+validazione (conferma su un secondo campione indipendente) gia' applicata
+con successo a `full_body_sufficient` in questa stessa sessione. Il
+miglioramento visto sul campione da 50 sequenze e' piu' probabilmente un
+artefatto di quel campione specifico che un effetto generalizzabile. Non
+riprovare senza nuova evidenza.
+
+### Portiere: il bug "squadra sbagliata" non si riproduce su Usa-Bel v3
+
+Controllato `Usa-Bel_goalkeeper_colour.json`: solo il track 18 ha uno
+score sostanziale (0.499, `is_goalkeeper_palette: True`) con
+`team_id: 1` (USA) - **gia' corretto**, non invertito su Belgio come
+temuto. Il rilevamento colore/squadra del portiere funziona bene in
+questa run.
+
+Il comportamento confuso osservato (Freese assegnato a un tracklet
+diverso da quello visivamente portiere) ha una spiegazione diversa e piu'
+semplice: track 18 (il vero portiere) legge dall'OCR il numero "4"
+(sbagliato, comune per i portieri: crop piccoli/angolazioni difficili),
+quindi il gate lo lascia "unknown". Track 21 (un tracklet diverso, non
+marcato come portiere per colore) legge correttamente "24" e vince
+l'assegnazione a Freese tramite `reliable_jersey`, perche' l'assegnazione
+Hungarian e' uno-a-uno globale: chi ha il costo piu' basso su un giocatore
+si prende quello slot, lasciando l'altro tracklet senza identita' invece
+di due tracklet con lo stesso nome. Non e' un bug della logica - il bug
+originario "squadra sbagliata" temuto dall'utente era probabilmente
+specifico di una run precedente (v1/v2, prima dei fix di oggi) o una
+confusione con il caso analogo gia' documentato su Por-Uzb (verde
+fosforescente/prato).
+
+### Nota per il futuro: `escalate_on_unassigned` e' inerte sotto il profilo "tutti i crop"
+
+Prima di riabilitare `escalate_on_unassigned` su
+`usa_bel_jersey_ocr_all_crops_v1.yaml` per provare a recuperare copertura,
+notato che il profilo ha gia' `max_crops_per_tracklet: 100000` (legge
+gia' tutti i crop disponibili al primo giro). L'escalation pesca crop
+*non ancora usati* quando il primo voto fallisce - con "tutti i crop"
+gia' letti, non resta nulla da pescare in piu': il flag non avrebbe
+nessun effetto in questa combinazione (stesso motivo per cui era gia'
+lasciato disattivato di proposito in `por_uzb_jersey_ocr_all_crops_v1.yaml`).
+Il test corretto dell'escalation richiede un budget di crop limitato
+(es. il default) con l'escalation attiva sopra - verifica se recupera
+una copertura simile a "tutti i crop" ma a costo inferiore, non un
+miglioramento aggiuntivo sopra "tutti i crop" gia' letto. Decisione
+rimandata all'utente: rilanciare Usa-Bel identico (v3, verifica
+riproducibilita') oppure con budget limitato + escalation (vero test
+dell'ipotesi).
+
+### Stato a fine sessione 2026-07-24
+
+Lavoro completato e verificato: segnale `full_body_sufficient`
+implementato end-to-end (jersey_ocr.py -> pipeline.py ->
+hungarian.py, bug di propagazione trovato e corretto); arbitro
+aggiunto al roster Usa-Bel (rosso, via `metadata.kit_color`, non
+config); frammentazione ID chiarita (23 identita' reali, non 33 -
+l'ID visto a video e' quello grezzo del tracker, mai rinumerato);
+bias OCR sul numero "1" diagnosticato e correzione testata e respinta;
+bug "portiere squadra sbagliata" non riprodotto nella run attuale;
+nuovo strumento `scripts/identity_gate_report.py` per trasparenza
+del gate identita' (riusabile su qualsiasi run futura). Scoperta
+aperta e non ancora sfruttata: `visual_similarity`/`strong_combined`
+sono strutturalmente inerti per mancanza di profili visivi nel roster
+- potenziale leva piu' alta per aumentare la copertura identita', ma
+richiede capire da dove ottenere le foto di riferimento dei giocatori.
+Decisione pendente sulla prossima run Usa-Bel: ripetizione identica
+(v3) vs budget crop limitato + escalation attiva (test vero
+dell'ipotesi di risparmio).
+
+## Aggiornamento 2026-07-25 - Budget crop stretto su Usa-Bel, revisione hungarian.py, soglia reliable_jersey gia' al pavimento
+
+### Usa-Bel: `max_crops_per_tracklet=5` collassa la coverage OCR, non e' un bug di overlay
+
+Lanciata la run pendente (`usa_bel_jersey_ocr_top5_crops_v1.yaml`, unica
+variabile cambiata vs il profilo "tutti i crop" gia' validato:
+`max_crops_per_tracklet: 5` invece di `100000`, resto identico incluso
+`escalate_on_unassigned: false`). Al primo sguardo il video renderizzato
+non mostrava numeri; verificato con `identity_gate_report.py` che non e'
+un problema di overlay ma un collasso reale a monte, nell'OCR:
+
+```text
+                                   baseline (tutti i crop)   top-5
+tracklet assegnate                        7/23 (30%)         2/22 (9%)
+tracklet con zero rilevazioni OCR            0/23            12/22 (55%)
+tracklet con voti sotto soglia (1 voto)      0/23             5/22 (23%)
+```
+
+17/22 tracklet (77%) non producono nemmeno una cifra rilevata con budget
+5, anche quelle con 400-1200 frame disponibili. Causa probabile, coerente
+con un risultato gia' documentato (sezione 7.1 del brief): la selezione
+dei 5 crop (`select_spread_crops`, spread temporale + `crop_quality`) non
+e' un proxy affidabile per "questo crop mostra un numero leggibile" -
+stesso motivo per cui i classificatori di legibility testati in passato
+(clean-back AP 0.932, readability accuracy 0.981) miglioravano poco o
+nulla le decisioni OCR track-level quando collegati. Con "tutti i crop" il
+problema non si pone; con un budget stretto, *quali* crop leggere diventa
+il collo di bottiglia, e l'euristica attuale non e' adatta a questo scopo.
+Non testato `escalate_on_unassigned` sopra il budget stretto: il problema
+sembra "quali crop", non "quanti", quindi probabilmente non avrebbe
+aiutato granche' - da verificare solo se si decide di investire in una
+selezione migliore a monte.
+
+### Revisione di `ft/identity/hungarian.py`: due soglie "reliable_jersey" quasi omonime, una delle due strutturalmente morta
+
+Richiesta esplicita dell'utente di rileggere il file perche' "confusionario".
+Letto tutto (900 righe), trovati questi punti concreti:
+
+1. **`_has_reliable_jersey(tracklet)`** (riga 455, 4 parametri costruttore:
+   `reliable_jersey_min_votes=5`, `_min_confidence`, `_min_head_confidence`,
+   `_min_winner_margin=0.10`) controlla la qualita' intrinseca della lettura
+   OCR della tracklet. **`_has_reliable_jersey_match(tracklet, player)`**
+   (riga 520, soglia diversa: `reliable_jersey_min_candidate_score=0.45`)
+   controlla se l'evidenza supporta *quel* giocatore specifico. Il gate
+   finale (`assignment_gate`, riga 478) chiama **solo la seconda**. La prima
+   viene usata altrove per un compito diverso (bonus/penalita' nella cost
+   matrix, riga 372) e raggiunta dalla seconda solo come fallback raro
+   (riga 542, quando la distribuzione grezza OCR e' vuota). Risultato
+   pratico: i 4 parametri di `_has_reliable_jersey` sembrano governare "cosa
+   serve per fidarsi del numero nel gate identita'" ma quasi mai lo fanno -
+   stesso tipo di scoperta gia' fatta per `visual_similarity`/`strong_combined`
+   (morti per mancanza di embedding nel roster).
+2. **Ipotesi plausibile (non ancora confermata su `candidate_scores.csv`)**
+   per il mistero del track 1 Zielinski su Inter-Juve (assegnato a Zielinski
+   nonostante l'OCR avesse votato "2", il numero di Dumfries, come vincitore):
+   `identity_gate_report.py` stampa solo il numero *vincitore* della
+   tracklet, ma il gate valuta `jersey_candidate_score` sul candidato
+   specifico per il numero atteso (7, Zielinski) dentro la distribuzione
+   grezza - che puo' avere voti minoritari sufficienti anche se non e' il
+   vincitore assoluto. Non un bug, ma un buco di trasparenza nel report (non
+   mostra lo score del candidato realmente valutato dal gate, solo il
+   vincitore).
+3. La costante di saturazione voti (`min(1.0, votes/3.0)`) e' hardcoded e
+   duplicata identica in 4 punti (righe 836, 789, 824, 875), mai
+   fattorizzata ne' esposta come parametro di config.
+4. Gestione di `preserved_dropped_jersey_evidence` duplicata in due forme
+   diverse (flag booleano threaded a parametro nella cost matrix, early
+   return hardcoded nel gate) per la stessa regola.
+
+Deciso di non fare un rewrite ampio subito (le soglie sono il prodotto di
+sessioni di misura reale, commenti a riga 65-69 e 877-881 citano percentuali
+validate). Proposto un primo giro a basso rischio (rinominare/documentare le
+due funzioni, fattorizzare la costante voti/3, marcare esplicitamente inerte
+il ramo `visual_similarity`) ma l'utente ha preferito prima un test a
+impatto diretto sulla coverage (vedi sotto) prima di tornare al cleanup.
+
+### Sweep offline `reliable_jersey_min_candidate_score` su Int-Ata: leva gia' al pavimento pratico
+
+Ipotesi: se il vero gate che decide l'assegnazione e' `_has_reliable_jersey_match`
+(soglia `reliable_jersey_min_candidate_score`, non i 4 parametri "morti"
+sopra), forse abbassarla recupera coverage reale. Test offline, zero nuova
+run GPU, stessa metodologia gia' validata per `full_body_sufficient`/il bias
+"1": nuovo script `scripts/sweep_reliable_jersey_min_candidate_score.py`,
+riusa direttamente `evaluate_identity_units()`/`identity_metrics()` da
+`ft/evaluation/identity_benchmark.py` (lo stesso codice di una promozione
+ufficiale) e `jersey_candidate_score()` da `hungarian.py`, patchando solo
+`player_id` per le tracklet che il gate accetterebbe a soglia piu' bassa.
+Eseguito solo su **Int-Ata** (unico dei 3 video del benchmark identita' in
+split `development` - stessa regola "non tarare sul test" gia' seguita per
+GSR, Inter-Juve/Inter-Atalanta non toccate).
+
+**Bug di metodologia trovato e corretto nello script stesso, prima di
+fidarsi dei numeri**: la prima versione derivava "gia' assegnato" da
+`identity_assignments.json` (solo stadio Hungarian grezzo) e trovava 0/78
+tracklet gia' assegnate, mentre il baseline reale (`tracklets.csv`, output
+finale) ne mostrava 30 - segno che una parte consistente delle identita' di
+Int-Ata arriva da uno stadio successivo di propagazione/linking, non dal
+gate Hungarian isolato. La prima versione dello script stava percio'
+sovrascrivendo tracklet gia' correttamente identificate dalla propagazione
+con ipotesi di flip proprie. Corretto: "gia' assegnato" ora si legge
+direttamente da `tracklets.csv` (verita' finale), non da
+`identity_assignments.json`. Dopo il fix: 26/78 gia' assegnate (vicino alle
+30 unit del baseline benchmark, scarto residuo plausibile per via
+dell'aggregazione in "unit" del benchmark).
+
+**Scoperta preliminare**: la soglia realmente usata in produzione su
+Int-Ata e' **0.2**, non 0.45 come da `config.py`/`default.yaml` (default
+ormai superato/non rappresentativo - nessuna run reale lo usa). Controllato
+anche Inter-Juve, Inter-Atalanta, Usa-Bel (x2 run): **0.2 ovunque, nessun
+drift reale**. Le uniche differenze apparenti (`narrow_region_jersey_score_penalty`
+None su Int-Ata/Inter-Juve/Inter-Atalanta vs 0.15 esplicito su Usa-Bel;
+`assignment_scope` None su Int-Ata/Inter-Atalanta vs valore esplicito
+altrove) sono quasi certamente solo "non sovrascritto nel manifest", non
+comportamento diverso a runtime.
+
+Risultati sweep (soglie sotto 0.2 = piu' permissivo del reale; baseline
+reale: 30 unit assegnate, 11 corrette, 19 sbagliate, precision 36.7%):
+
+```text
+soglia   flip unknown->assigned   nuove corrette   nuove sbagliate   precision
+0.30              16                    5                12           34.0%
+0.25              21                    5                16           31.4%
+0.20 (reale)      29*                   5*               ...          -
+0.15              37                    5                35           22.9%
+```
+
+*a soglia 0.2 (= produzione) la simulazione offline non trova 0 flip come
+dovrebbe teoricamente, confermando che lo script e' un'approssimazione del
+gate reale (non verifica `unknown_threshold=0.55` sul cost-matrix ne' le
+collisioni Hungarian quando piu' tracklet flippate competono per lo stesso
+giocatore) - i numeri assoluti vanno presi come indicativi, non esatti.
+
+Pattern qualitativo pero' robusto su tutto il range testato: `newly_correct`
+si ferma a 5 dopo soglia 0.3 e non cresce piu', mentre `newly_wrong`
+continua a salire senza limite (12 -> 16 -> 27 -> 35). **Conclusione:
+questa leva e' gia' stata sfruttata fino al suo pavimento pratico** -
+abbassare ulteriormente `reliable_jersey_min_candidate_score` sotto il
+valore gia' in uso (0.2) non aggiunge identita' corrette, solo errori.
+Non e' la via per un guadagno di coverage significativo. Prossimo passo
+concordato con l'utente: da decidere tra tornare al cleanup di
+`hungarian.py` o investigare un'altra leva (es. profili visivi nel roster
+per sbloccare `strong_combined`, gia' individuata come scoperta aperta il
+24/07).

@@ -1,0 +1,14 @@
+base_config: gsr_jersey_pipeline_baseline_apply_v1.yaml
+
+# Arm B on the pipeline surface: region CTC decides, primary SAR falls back.
+# Same selection, same crops, same tracking as the baseline profile; the only
+# difference is the priority order in `sources`.
+#
+# NOT VALIDATED. Declared in
+# evaluation/jersey_heldout_manifests/jersey_policy_heldout_v1_preregistration.md
+# as arm B. Do not run on GSR test.
+
+decision_policy:
+  jersey_number:
+    sources: [jersey_region_ctc, jersey_ocr_primary]
+    on_abstain: fallback

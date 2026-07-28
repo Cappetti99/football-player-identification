@@ -23,6 +23,13 @@ def main():
     parser.add_argument("--detector-batch-size", type=int, default=16)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--detector-device", default="0")
+    parser.add_argument(
+        "--dump-raw-scores",
+        default=None,
+        help="optional path to also write per-frame candidate log-probabilities and "
+        "weights per track, for offline comparison of aggregation strategies. Does "
+        "not change any existing output when omitted.",
+    )
     args = parser.parse_args()
     if args.detector_batch_size < 1:
         parser.error("--detector-batch-size must be at least 1")
@@ -77,7 +84,7 @@ def main():
         transforms.Resize(tuple(metadata["image_size"])), transforms.ToTensor(),
         transforms.Normalize(metadata["normalization"]["mean"], metadata["normalization"]["std"]),
     ])
-    tracks = defaultdict(lambda: {"scores": [], "weights": []})
+    tracks = defaultdict(lambda: {"scores": [], "weights": [], "frames": []})
     for start in range(0, len(region_items), args.batch_size):
         batch = region_items[start:start + args.batch_size]
         with torch.no_grad():
@@ -86,6 +93,7 @@ def main():
             key = (row["sequence"], row["gt_track_id"])
             tracks[key]["scores"].append(candidate_log_probabilities(logits[:, index, :]))
             tracks[key]["weights"].append(row["detector_confidence"])
+            tracks[key]["frames"].append(row["frame"])
 
     output_rows = []
     for key, reference in sorted(predictions.items()):
@@ -103,6 +111,8 @@ def main():
         })
     output = Path(args.output_dir).resolve(); output.mkdir(parents=True, exist_ok=False)
     write_csv(output / "predictions.csv", output_rows)
+    if args.dump_raw_scores:
+        dump_raw_scores(args.dump_raw_scores, tracks, predictions)
     metrics = summarize(output_rows, selected, region_items)
     metrics.update({
         "ocr_run": str(root), "ctc_checkpoint": str(Path(args.ctc_checkpoint).resolve()),
@@ -112,6 +122,28 @@ def main():
     })
     (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     print(json.dumps(metrics, indent=2))
+
+
+def dump_raw_scores(path, tracks, predictions):
+    """Persist per-frame candidate log-probabilities and weights per track.
+
+    Purely additive diagnostic export: lets a separate offline script compare
+    alternative aggregation strategies against the exact same per-frame CTC
+    outputs, without re-running the detector or the recognizer.
+    """
+    payload = {}
+    for key, data in tracks.items():
+        reference = predictions.get(key, {})
+        payload[f"{key[0]}::{key[1]}"] = {
+            "sequence": key[0],
+            "gt_track_id": key[1],
+            "eval_track_id": reference.get("eval_track_id"),
+            "gt_jersey_number": reference.get("gt"),
+            "frames": data["frames"],
+            "weights": data["weights"],
+            "scores": data["scores"],
+        }
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def read_predictions(path):

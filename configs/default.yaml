@@ -163,7 +163,11 @@ jersey_ocr:
   promote_roster_candidate: true
   min_promoted_candidate_confidence: 0.12
   min_promoted_candidate_votes: 1
-  debug_crops: true
+  # Disabled: writes up to ~12 debug image variants per OCR crop
+  # (jersey_ocr_debug/) that are never inspected in practice and accumulate
+  # fast (16G across this session's runs alone). Re-enable per-run only when
+  # actually debugging OCR variant selection.
+  debug_crops: false
   # GSR OCR evaluation showed template-only votes over-predict "1"; keep it opt-in
   # until the template candidate is confirmed by OCR or has very strong evidence.
   template_matching: false
@@ -174,6 +178,10 @@ jersey_ocr:
   aggregate_by_crop: true
   max_candidates_per_crop: 3
   min_crop_candidate_ratio: 0.35
+  # If the first (cheaper) crop sample doesn't reach min_votes, pull more
+  # crops from the unused pool and retry -- only for tracklets that need it.
+  escalate_on_unassigned: false
+  escalation_max_extra_crops: 20
   mmocr_device: cuda:0
   mmocr_det: dbnet_resnet18_fpnc_1200e_icdar2015
   mmocr_rec: SAR
@@ -209,25 +217,43 @@ jersey_ocr_secondary_audit:
   cache_dir: .ft_cache/ocr_secondary_audit
   debug_crops: false
 
-# Frozen YOLO number-region + numeric CTC experiment. This stage consumes the
-# primary OCR selected crops and exports diagnostics only.
+# Frozen YOLO number-region + numeric CTC recognizer, pretrained on SJN-210k
+# and fine-tuned on GSR. Promoted to decide jersey_number ahead of the SAR OCR
+# (see decision_policy below) after the held-out policy experiment showed a
+# large, statistically significant gain on both the offline and pipeline
+# surfaces (evaluation/jersey_heldout_manifests/jersey_policy_heldout_v1*).
+# Still audit_only at this stage: it never mutates state directly, it only
+# emits evidence that the decision layer arbitrates.
 jersey_region_ctc_audit:
-  enabled: false
+  enabled: true
   mode: audit
   audit_only: true
-  ctc_checkpoint: null
-  ctc_checkpoint_sha256: null
-  detector_checkpoint: null
-  detector_checkpoint_sha256: null
+  ctc_checkpoint: /home/cappetti/FT/models/jersey_number_ctc_sjn_to_gsr_v1.pth
+  ctc_checkpoint_sha256: 11c6356895c94e734b795d9ca2403580187d1d726c5aada51273738042c7c1c5
+  detector_checkpoint: /home/cappetti/FT/runs/jersey_number_region/yolo26s_smoke_v1/weights/best.pt
+  detector_checkpoint_sha256: ec3c4d06df75aff92f49779827e6cff96d99b84da496ced8a76ecfbb12c02ae4
   detector_confidence: 0.25
-  box_padding: 0.10
+  box_padding: 0.25
   batch_size: 64
   detector_batch_size: 8
   device: cuda
   detector_device: "0"
   min_override_confidence: 0.90
+  fusion_preview_enabled: false
   max_crops_per_tracklet: 5
   min_frame_gap: 5
+
+# Which producer's evidence becomes the jersey_number decision. jersey_region_ctc
+# decides first; the SAR primary is the fallback where the CTC abstains (e.g.
+# no legible region crop). Promoted from the conservative fallback-only default
+# after evaluation/jersey_heldout_manifests/jersey_policy_heldout_v1_preregistration.md
+# arm B: +37 correct tracklets vs 3 regressions on the pipeline surface
+# (p=1.9e-8), +46 vs 2 on the offline surface (p=8.4e-12). Do not revert this
+# without re-running the held-out benchmark.
+decision_policy:
+  jersey_number:
+    sources: [jersey_region_ctc, jersey_ocr_primary]
+    on_abstain: fallback
 
 # Optional SoccerNet legibility selector. Its upstream checkpoint is CC BY-NC
 # 3.0 and remains external to this repository.
@@ -294,6 +320,7 @@ identity:
   position_prior_tiebreak_only: true
   require_assignment_evidence: true
   reliable_jersey_min_candidate_score: 0.45
+  narrow_region_jersey_score_penalty: 0.15
   strong_evidence_min_team_confidence: 0.75
   strong_evidence_min_visual_similarity: 0.82
   strong_evidence_min_tracklet_frames: 45
@@ -359,5 +386,9 @@ export:
   deduplicate_crops: true
   save_pre_identity_json: false
   save_pre_identity_csv: true
-  save_final_json: true
+  # Disabled: duplicates *_tracklets.csv (same data, JSON-serialized) and is
+  # never read by any script in this repo -- 125 files, 9.7G found
+  # accumulated across this session's runs alone before being deleted.
+  save_final_json: false
   save_final_csv: true
+  save_video: true

@@ -32,6 +32,15 @@ class HungarianPlayerIdentifier:
         position_prior_tiebreak_only=True,
         require_assignment_evidence=True,
         reliable_jersey_min_candidate_score=0.45,
+        narrow_region_jersey_score_penalty=0.15,
+        # strong_evidence_* / the "strong_combined" gate path are currently
+        # inert on every video processed so far: they require a non-None
+        # visual_similarity, which requires player.visual_embedding in the
+        # roster, and no roster built so far provides one (see handoff.md,
+        # identity_gate_report.py findings on Usa-Bel: visual_similarity is
+        # None on 23/23 tracklets, no exceptions). Not dead code to remove --
+        # this activates automatically once a roster ships visual_embedding
+        # per player -- but do not assume it currently affects any decision.
         strong_evidence_min_team_confidence=0.75,
         strong_evidence_min_visual_similarity=0.82,
         strong_evidence_min_tracklet_frames=45,
@@ -61,6 +70,11 @@ class HungarianPlayerIdentifier:
         self.position_prior_tiebreak_only = bool(position_prior_tiebreak_only)
         self.require_assignment_evidence = bool(require_assignment_evidence)
         self.reliable_jersey_min_candidate_score = float(reliable_jersey_min_candidate_score)
+        # Raises the reliable-jersey bar for tracklets whose OCR decision only
+        # reached vote quorum through narrow ROI regions (torso/number_band),
+        # not full_body alone -- validated at ~20% accuracy vs ~75-84% for
+        # full_body-sufficient decisions on two independent GSR samples.
+        self.narrow_region_jersey_score_penalty = float(narrow_region_jersey_score_penalty)
         self.strong_evidence_min_team_confidence = float(strong_evidence_min_team_confidence)
         self.strong_evidence_min_visual_similarity = float(strong_evidence_min_visual_similarity)
         self.strong_evidence_min_tracklet_frames = int(strong_evidence_min_tracklet_frames)
@@ -152,6 +166,14 @@ class HungarianPlayerIdentifier:
                     row.get("jersey_winner_margin", 0.0)
                     for row in items
                     if row.get("jersey_number") == jersey_number
+                ),
+                "jersey_full_body_sufficient": mode(
+                    [
+                        row.get("jersey_full_body_sufficient")
+                        for row in items
+                        if row.get("jersey_number") == jersey_number
+                        and row.get("jersey_full_body_sufficient") is not None
+                    ]
                 ),
                 "num_frames": len(items),
                 "start_frame": frames[0],
@@ -355,7 +377,7 @@ class HungarianPlayerIdentifier:
         elif observed is not None and expected is not None:
             reliability = jersey_reliability(tracklet)
             components["jersey"] = -0.40 * reliability if int(observed) == int(expected) else 0.55 * max(0.25, reliability)
-            if self.enforce_unique_team_jersey and self._has_reliable_jersey(tracklet):
+            if self.enforce_unique_team_jersey and self._tracklet_jersey_reading_is_reliable(tracklet):
                 same_known_team = (
                     tracklet.get("team_id") is not None
                     and player.get("team_id") is not None
@@ -365,16 +387,26 @@ class HungarianPlayerIdentifier:
                     components["team_jersey_constraint"] = 0.90
                 elif same_known_team and int(observed) == int(expected):
                     components["team_jersey_constraint"] = -0.20 * reliability
-            if self.goalkeeper_number_one_prior and int(observed) == 1:
-                role = str(player.get("role") or "").lower()
-                if role in {"goalkeeper", "keeper", "gk"}:
-                    components["goalkeeper_number_one_prior"] = -self.number_one_goalkeeper_bonus * reliability
-                elif role:
-                    components["goalkeeper_number_one_prior"] = self.number_one_non_goalkeeper_penalty * reliability
         elif expected is not None:
             # Missing jersey is a weak penalty, not a blocker. Many broadcast
             # crops never expose a readable back number.
             components["jersey"] = 0.35
+
+        # Independent of which jersey-scoring branch fired above: whenever the
+        # tracklet's own observed number is 1, this structural goalkeeper/#1
+        # prior should still apply. It must not be gated behind jersey_score,
+        # since the tracklet's own raw_jersey_distribution almost always
+        # contains its own mode number as a candidate -- so jersey_score is
+        # found whenever observed == expected == 1, which would otherwise
+        # silently skip this prior in the common case where a distribution is
+        # available (see handoff.md for the discovered gap).
+        if self.goalkeeper_number_one_prior and observed is not None and int(observed) == 1:
+            reliability = jersey_reliability(tracklet)
+            role = str(player.get("role") or "").lower()
+            if role in {"goalkeeper", "keeper", "gk"}:
+                components["goalkeeper_number_one_prior"] = -self.number_one_goalkeeper_bonus * reliability
+            elif role:
+                components["goalkeeper_number_one_prior"] = self.number_one_non_goalkeeper_penalty * reliability
 
         if self.number_region_cost_enabled and expected is not None:
             number_region_score = number_region_candidate_score(
@@ -400,6 +432,9 @@ class HungarianPlayerIdentifier:
             else:
                 components["position_prior"] = min(max(0.25, self.position_prior_max_cost), dist / 120.0)
 
+        # player.visual_embedding is always None until a roster ships one, so
+        # visual_cost/visual_similarity are currently always None in practice
+        # (see the strong_evidence_* comment on the constructor).
         visual_cost = visual_distance(tracklet.get("visual_embedding"), player.get("visual_embedding") or player.get("visual_profile"))
         visual_similarity = None
         if visual_cost is not None:
@@ -428,7 +463,21 @@ class HungarianPlayerIdentifier:
             "visual_similarity": visual_similarity,
         }
 
-    def _has_reliable_jersey(self, tracklet):
+    def _tracklet_jersey_reading_is_reliable(self, tracklet):
+        """Intrinsic quality of the tracklet's own OCR reading, independent of
+        any specific roster player. Gated by reliable_jersey_min_votes/
+        _min_confidence/_min_head_confidence/_min_winner_margin.
+
+        NOTE: this is NOT the check that assignment_gate() uses to decide the
+        "reliable_jersey" pass/fail reason -- that is
+        _jersey_evidence_supports_player() below, which uses a different
+        threshold (reliable_jersey_min_candidate_score) and looks at evidence
+        for one specific player, not the tracklet's own reading in isolation.
+        This method is only used for the team/jersey uniqueness constraint in
+        cost_details() and as a rare fallback inside
+        _jersey_evidence_supports_player() when the raw OCR distribution is
+        empty. Do not assume it gates the main assignment decision.
+        """
         if tracklet.get("jersey_number") is None:
             return False
         if int(tracklet.get("jersey_votes") or 0) < self.reliable_jersey_min_votes:
@@ -439,7 +488,10 @@ class HungarianPlayerIdentifier:
         if head_confidence is not None and float(head_confidence or 0.0) < self.reliable_jersey_min_head_confidence:
             return False
         winner_margin = tracklet.get("jersey_winner_margin")
-        if winner_margin is not None and float(winner_margin or 0.0) < self.reliable_jersey_min_winner_margin:
+        min_winner_margin = self.reliable_jersey_min_winner_margin
+        if tracklet.get("jersey_full_body_sufficient") is False:
+            min_winner_margin += self.narrow_region_jersey_score_penalty
+        if winner_margin is not None and float(winner_margin or 0.0) < min_winner_margin:
             return False
         return True
 
@@ -448,13 +500,16 @@ class HungarianPlayerIdentifier:
         if not self.require_assignment_evidence:
             return {"pass": True, "reason": "gate_disabled"}
 
-        reliable_jersey = self._has_reliable_jersey_match(tracklet, player)
+        reliable_jersey = self._jersey_evidence_supports_player(tracklet, player)
         goalkeeper_singleton = self._has_goalkeeper_singleton_match(tracklet, player)
         team_match = same_team(tracklet, player)
         team_confidence = float(tracklet.get("mean_team_confidence", 0.0) or 0.0)
         visual_similarity = details.get("visual_similarity")
         position_distance = details.get("position_prior_distance")
         tracklet_frames = int(tracklet.get("num_frames") or 0)
+        # strong_combined is currently always False in practice: it requires
+        # visual_similarity is not None, which requires roster
+        # visual_embedding -- see the constructor's strong_evidence_* comment.
         strong_combined = (
             team_match
             and team_confidence >= self.strong_evidence_min_team_confidence
@@ -490,12 +545,23 @@ class HungarianPlayerIdentifier:
             "tracklet_frames": int(tracklet_frames),
         }
 
-    def _has_reliable_jersey_match(self, tracklet, player):
+    def _jersey_evidence_supports_player(self, tracklet, player):
+        """The check assignment_gate() actually uses for the "reliable_jersey"
+        pass/fail reason. Unlike _tracklet_jersey_reading_is_reliable() above,
+        this does not require the tracklet's own top-voted number to match
+        the player -- it scores whatever candidate exists for the player's
+        expected number inside the tracklet's raw OCR distribution, even if
+        that candidate is not the tracklet's overall winner. A minority
+        candidate can still clear reliable_jersey_min_candidate_score.
+        """
         if tracklet.get("preserved_dropped_jersey_evidence"):
             return False
         expected = player.get("jersey_number")
         if expected is None:
             return False
+        min_candidate_score = self.reliable_jersey_min_candidate_score
+        if tracklet.get("jersey_full_body_sufficient") is False:
+            min_candidate_score += self.narrow_region_jersey_score_penalty
         raw_candidates = tracklet.get("raw_jersey_distribution") or tracklet.get("jersey_raw_candidates") or []
         candidate_score = jersey_candidate_score(tracklet, expected, field="raw_jersey_distribution")
         if candidate_score is None:
@@ -504,12 +570,16 @@ class HungarianPlayerIdentifier:
             # Roster filtering can promote a valid alternative after dropping
             # impossible numbers. The gate should still look at the raw OCR
             # strength, otherwise weak second-place candidates become identities.
-            return candidate_score is not None and candidate_score >= self.reliable_jersey_min_candidate_score
+            return candidate_score is not None and candidate_score >= min_candidate_score
         candidate_score = jersey_candidate_score(tracklet, expected)
-        if candidate_score is not None and candidate_score >= self.reliable_jersey_min_candidate_score:
+        if candidate_score is not None and candidate_score >= min_candidate_score:
             return True
         observed = tracklet.get("jersey_number")
-        return observed is not None and int(observed) == int(expected) and self._has_reliable_jersey(tracklet)
+        return (
+            observed is not None
+            and int(observed) == int(expected)
+            and self._tracklet_jersey_reading_is_reliable(tracklet)
+        )
 
     def _has_reliable_number_region(self, tracklet):
         evidence = tracklet.get("number_region_evidence") or {}
@@ -756,7 +826,7 @@ def number_region_candidate_score(tracklet, expected, min_votes=2, min_mean_conf
         mean_confidence = clamp(candidate.get("mean_confidence", 0.0), 0.0, 1.0)
         if votes < int(min_votes) or mean_confidence < float(min_mean_confidence):
             continue
-        score = compatibility * mean_confidence * min(1.0, max(1, votes) / 3.0)
+        score = compatibility * mean_confidence * vote_confidence_scale(votes)
         best = score if best is None else max(best, score)
     return best
 
@@ -791,7 +861,7 @@ def number_region_reliability(tracklet):
     confidence = clamp(evidence.get("winner_mean_confidence", 0.0), 0.0, 1.0)
     votes = int(evidence.get("winner_votes") or 0)
     consecutive = int(evidence.get("max_consecutive_support") or 0)
-    vote_score = min(1.0, max(1, votes) / 3.0)
+    vote_score = vote_confidence_scale(votes)
     consecutive_score = min(1.0, max(1, consecutive) / 2.0)
     return clamp(confidence * vote_score * consecutive_score, 0.0, 1.0)
 
@@ -803,7 +873,7 @@ def jersey_candidate_score(tracklet, expected, field="jersey_distribution"):
         if int(candidate.get("jersey_number")) == int(expected):
             confidence = clamp(candidate.get("confidence", 0.0), 0.0, 1.0)
             votes = int(candidate.get("votes", 0) or 0)
-            return confidence * min(1.0, max(1, votes) / 3.0)
+            return confidence * vote_confidence_scale(votes)
     return None
 
 
@@ -842,7 +912,14 @@ def jersey_reliability(tracklet):
     votes = int(tracklet.get("jersey_votes") or 0)
     if votes <= 0:
         return 0.2
-    return clamp(conf * min(1.0, votes / 3.0), 0.15, 1.0)
+    reliability = clamp(conf * vote_confidence_scale(votes), 0.15, 1.0)
+    if tracklet.get("jersey_full_body_sufficient") is False:
+        # Decision only reached vote quorum via narrow ROI regions, not
+        # full_body alone -- validated ~20% accurate vs ~75-84% (see
+        # narrow_region_jersey_score_penalty). Halve the soft-cost weight
+        # given to this evidence rather than only gating the hard pass/fail.
+        reliability *= 0.5
+    return reliability
 
 
 def visual_distance(a, b):
@@ -861,3 +938,16 @@ def visual_distance(a, b):
 
 def clamp(value, low, high):
     return max(low, min(high, float(value)))
+
+
+# Shared by jersey_candidate_score, number_region_candidate_score,
+# number_region_reliability and jersey_reliability: a vote count below this
+# saturates the confidence weight linearly instead of counting at full
+# strength (e.g. 1 vote -> 1/3 weight, 2 votes -> 2/3 weight, 3+ votes -> full
+# weight). Kept as one constant so the four call sites cannot silently drift
+# apart if this is ever retuned.
+VOTE_SATURATION_COUNT = 3.0
+
+
+def vote_confidence_scale(votes):
+    return min(1.0, max(1, int(votes or 0)) / VOTE_SATURATION_COUNT)

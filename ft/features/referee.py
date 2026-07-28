@@ -287,6 +287,6 @@ def summarize_samples(samples):
     return {
         "color": color,
         "score": float(np.mean(values)),
-        "num_samples": len(valid),
+        "num_samples": len(values),
         "shorts_black_score": float(np.mean([sample.get("shorts_black_score", 0.0) for sample in valid])),
     }

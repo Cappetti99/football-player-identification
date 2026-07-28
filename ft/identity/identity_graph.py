@@ -338,7 +338,7 @@ class IdentityGraphBuilder:
         return True
 
     def _score_jersey(self, edge, source, target):
-        expected = to_int(source.jersey_number) or player_jersey_from_id(source.player_id)
+        expected = to_int(source.jersey_number)
         observed = to_int(target.jersey_number)
         if expected is None:
             edge.jersey_score = 0.0
@@ -386,20 +386,6 @@ class IdentityGraphBuilder:
             return False
         edge.appearance_score = max(0.0, similarity)
         return True
-
-
-def player_jersey_from_id(player_id):
-    """Extract jersey number from roster ids such as team1_09."""
-    if player_id in EMPTY:
-        return None
-    parts = str(player_id).rsplit("_", 1)
-    if len(parts) != 2:
-        return None
-    try:
-        number = int(parts[1])
-    except ValueError:
-        return None
-    return number if 1 <= number <= 99 else None
 
 
 def overlaps(a_start, a_end, b_start, b_end):

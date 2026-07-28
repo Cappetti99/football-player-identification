@@ -352,6 +352,18 @@ DEFAULT_CONFIG = {
         "short_vote_weights": [1.0, 0.75, 0.50, 0.25],
         "selected_short_vote_weight": None,
     },
+    # Which producer's evidence becomes a decision, in priority order: the
+    # first source that decided a subject wins, later ones only fill its
+    # abstentions. jersey_region_ctc outranks the SAR primary since the
+    # held-out policy experiment (arm B) measured a large gain on two
+    # independent surfaces; the ordering is the whole promotion, no model or
+    # threshold changed with it.
+    "decision_policy": {
+        "jersey_number": {
+            "sources": ["jersey_region_ctc", "jersey_ocr_primary"],
+            "on_abstain": "fallback",
+        },
+    },
     "number_region": {
         "enabled": False,
         "audit_only": True,

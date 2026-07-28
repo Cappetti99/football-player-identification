@@ -1,0 +1,24 @@
+base_config: best_known_int_ata_number_region_scene_reset_control.yaml
+
+# Crop-budget ablation, single variable vs. usa_bel_jersey_ocr_all_crops_v1.yaml:
+# max_crops_per_tracklet down from 100000 (every usable crop) to 5. Everything
+# else (acceptance thresholds, escalate_on_unassigned left at the config
+# default of false, number_region disabled) stays identical to the all-crops
+# run so the coverage/accuracy delta is attributable to the crop budget alone.
+# temporal_passes stays 1: select_spread_crops already spreads the 5 picks
+# across the tracklet's frame range and blends in top-quality crops
+# (ft/features/jersey_ocr.py:select_spread_crops), so this is not "first 5
+# frames seen" but a temporally-spread, quality-weighted top-5.
+#
+# Purpose: measure whether a tight crop budget loses coverage/accuracy
+# relative to reading every crop, before deciding whether
+# escalate_on_unassigned is worth testing on top of a limited budget.
+jersey_ocr:
+  max_crops_per_tracklet: 5
+  temporal_passes: 1
+
+# Same transitory CUDA instability workaround as usa_bel_jersey_ocr_all_crops_v1.yaml:
+# this run is testing crop budget / the identity gate, not re-validating the
+# number_region audit.
+number_region:
+  enabled: false

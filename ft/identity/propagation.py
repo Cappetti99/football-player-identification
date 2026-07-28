@@ -43,7 +43,7 @@ class IdentityPropagationEngine:
 
     def apply(self, tracks, summaries, assignments):
         """Apply propagation to tracks and return audit diagnostics."""
-        nodes = build_nodes(tracks, summaries, assignments)
+        nodes = build_nodes(tracks, summaries, assignments, self.roster_by_player_id)
         diagnostics = {
             "enabled": True,
             "status": "ok",
@@ -210,8 +210,18 @@ class IdentityPropagationEngine:
         return applied
 
 
-def build_nodes(tracks, summaries, assignments):
-    """Build graph nodes from Hungarian summaries plus current track state."""
+def build_nodes(tracks, summaries, assignments, roster_by_player_id=None):
+    """Build graph nodes from Hungarian summaries plus current track state.
+
+    jersey_number prefers the tracklet's own observed OCR evidence; when that
+    is missing (common given the OCR abstention rate) but the tracklet is
+    already assigned a player_id, it falls back to that player's real jersey
+    number from the roster -- not a guess parsed out of the player_id string,
+    which only happens to match the jersey number for some roster ID
+    conventions (e.g. synthetic "team1_07") and not others (e.g. real rosters
+    keyed by roster order, where "team1_05" can be jersey number 28).
+    """
+    roster_by_player_id = roster_by_player_id or {}
     positions = first_last_positions_by_display(tracks)
     nodes = []
     for summary in summaries:
@@ -222,6 +232,9 @@ def build_nodes(tracks, summaries, assignments):
             player_id = None
         display_id = int(summary.get("display_track_id") or track_id)
         first_position, last_position = positions.get(display_id, (None, None))
+        jersey_number = to_int(summary.get("jersey_number"))
+        if jersey_number is None and player_id is not None:
+            jersey_number = to_int((roster_by_player_id.get(player_id) or {}).get("jersey_number"))
         nodes.append(
             TrackletNode(
                 display_track_id=track_id,
@@ -230,7 +243,7 @@ def build_nodes(tracks, summaries, assignments):
                 identity_confidence=float(assignment.get("confidence") or 0.0),
                 team_id=to_int(summary.get("team_id")),
                 mean_team_confidence=float(summary.get("mean_team_confidence") or 0.0),
-                jersey_number=to_int(summary.get("jersey_number")),
+                jersey_number=jersey_number,
                 jersey_votes=int(summary.get("jersey_votes") or 0),
                 jersey_confidence=float(summary.get("jersey_confidence") or 0.0),
                 jersey_head_confidence=float(summary.get("jersey_head_confidence") or 0.0),

@@ -1,5 +1,5 @@
-from ft.identity.identity_graph import IdentityGraphBuilder, TrackletNode, player_jersey_from_id
-from ft.identity.propagation import IdentityPropagationEngine
+from ft.identity.identity_graph import IdentityGraphBuilder, TrackletNode
+from ft.identity.propagation import IdentityPropagationEngine, build_nodes
 
 
 def test_identity_graph_builds_same_player_edge():
@@ -138,7 +138,7 @@ def test_identity_graph_cut_bridge_ignores_spatial_jump_when_team_jersey_match()
     assert edges[0].jersey_match is True
 
 
-def test_identity_graph_uses_summary_jersey_before_player_id_suffix():
+def test_identity_graph_matches_same_jersey_number_between_tracklets():
     source = TrackletNode(
         display_track_id=58,
         player_id="team1_05",
@@ -362,11 +362,43 @@ def test_identity_propagation_can_disable_goalkeeper_sources():
     assert tracks["players"][2][60]["player_id"] == "unknown"
 
 
-def test_player_jersey_from_id_parsing():
-    assert player_jersey_from_id("team1_09") == 9
-    assert player_jersey_from_id("team2_23") == 23
-    assert player_jersey_from_id("unknown") is None
-    assert player_jersey_from_id("referee_yellow") is None
+def test_build_nodes_falls_back_to_real_roster_jersey_number_when_ocr_is_missing():
+    # Real rosters aren't guaranteed to encode the jersey number in the
+    # player_id suffix -- team1_05 here is Pavard, jersey number 28, not 5.
+    # When the tracklet's own OCR summary has no jersey_number (a common
+    # abstention), build_nodes must resolve the roster's real number for an
+    # already-assigned player_id rather than guessing from the id string.
+    roster_by_player_id = {"team1_05": {"player_id": "team1_05", "jersey_number": 28}}
+    tracks = {"players": [{}]}
+    summaries = [summary(10, 0, 0, team_id=1, jersey_number=None)]
+    assignments = {10: {"player_id": "team1_05", "confidence": 0.9}}
+
+    nodes = build_nodes(tracks, summaries, assignments, roster_by_player_id)
+
+    assert len(nodes) == 1
+    assert nodes[0].player_id == "team1_05"
+    assert nodes[0].jersey_number == 28
+
+
+def test_build_nodes_prefers_ocr_jersey_number_over_roster_fallback():
+    roster_by_player_id = {"team1_05": {"player_id": "team1_05", "jersey_number": 28}}
+    tracks = {"players": [{}]}
+    summaries = [summary(10, 0, 0, team_id=1, jersey_number=5)]
+    assignments = {10: {"player_id": "team1_05", "confidence": 0.9}}
+
+    nodes = build_nodes(tracks, summaries, assignments, roster_by_player_id)
+
+    assert nodes[0].jersey_number == 5
+
+
+def test_build_nodes_leaves_jersey_number_none_when_player_is_unassigned():
+    tracks = {"players": [{}]}
+    summaries = [summary(10, 0, 0, team_id=1, jersey_number=None)]
+
+    nodes = build_nodes(tracks, summaries, {}, {"team1_05": {"jersey_number": 28}})
+
+    assert nodes[0].player_id is None
+    assert nodes[0].jersey_number is None
 
 
 def summary(track_id, start, end, team_id=None, jersey_number=None, jersey_votes=0, jersey_confidence=0.0):
@@ -394,11 +426,13 @@ if __name__ == "__main__":
     test_identity_graph_blocks_temporal_overlap()
     test_identity_graph_can_allow_temporal_overlap_for_partial_apply()
     test_identity_graph_cut_bridge_ignores_spatial_jump_when_team_jersey_match()
-    test_identity_graph_uses_summary_jersey_before_player_id_suffix()
+    test_identity_graph_matches_same_jersey_number_between_tracklets()
     test_identity_graph_blocks_goalkeeper_role_mismatch()
     test_identity_propagation_applies_to_unknown_tracklet()
     test_identity_propagation_blocks_frame_conflict()
     test_identity_propagation_can_apply_only_non_conflicting_frames()
     test_identity_propagation_can_disable_goalkeeper_sources()
-    test_player_jersey_from_id_parsing()
+    test_build_nodes_falls_back_to_real_roster_jersey_number_when_ocr_is_missing()
+    test_build_nodes_prefers_ocr_jersey_number_over_roster_fallback()
+    test_build_nodes_leaves_jersey_number_none_when_player_is_unassigned()
     print("identity propagation tests passed")

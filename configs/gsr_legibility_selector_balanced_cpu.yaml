@@ -1,0 +1,13 @@
+base_config: gsr_legibility_selector_balanced.yaml
+
+# CPU variant of the frozen legibility frame selector, for hosts where CUDA is
+# unavailable. Thresholds, top_k, checkpoint and its SHA-256 are inherited
+# unchanged from the parent profile -- only the device differs, so the selected
+# frames are the same decision rule, not a different one.
+#
+# Introduced because the NVIDIA driver on `lie` is version-mismatched with the
+# loaded kernel module (NVML "Driver/library version mismatch"), which needs a
+# reboot. Any run using this profile must record device=cpu in its manifest.
+
+jersey_frame_selection:
+  device: cpu

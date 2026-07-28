@@ -1,0 +1,24 @@
+base_config: gsr_jersey_region_ctc_sjn_to_gsr_audit_v1.yaml
+
+# PLUMBING ONLY -- never use this profile to produce evaluation numbers.
+#
+# Same frozen thresholds and checkpoints as the parent profile; the only
+# difference is that every model runs on CPU. It exists so the evidence
+# additivity gate (scripts/verify_evidence_additive.py) can compare a control
+# run against a candidate run on a host where CUDA is unavailable.
+#
+# The gate checks that emitting evidence leaves the legacy artifacts
+# bit-identical. That property does not depend on the compute device, as long
+# as control and candidate use the same one -- which is why overriding the
+# device here does not reopen the frozen configuration.
+
+jersey_frame_selection:
+  device: cpu
+
+jersey_region_ctc_audit:
+  device: cpu
+  detector_device: cpu
+
+jersey_ocr:
+  easyocr_gpu: false
+  mmocr_device: cpu

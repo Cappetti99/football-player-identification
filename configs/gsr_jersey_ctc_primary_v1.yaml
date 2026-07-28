@@ -1,0 +1,15 @@
+base_config: gsr_jersey_region_ctc_sjn_to_gsr_audit_v1.yaml
+
+# NOT VALIDATED. Aggressive counterpart of gsr_jersey_ctc_fallback_coverage_v1:
+# the region CTC decides first and the primary SAR is the fallback. Unlike the
+# conservative profile this CAN regress an already-correct tracklet, so it does
+# not satisfy the project's zero-regression promotion gate and must never be
+# used in `apply` on that basis alone.
+#
+# Declared in evaluation/jersey_heldout_manifests/jersey_policy_heldout_v1_preregistration.md
+# as arm B, before any joint result was observed. Do not run it on GSR test.
+
+decision_policy:
+  jersey_number:
+    sources: [jersey_region_ctc, jersey_ocr_primary]
+    on_abstain: fallback

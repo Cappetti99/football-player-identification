@@ -1,0 +1,10 @@
+base_config: default.yaml
+
+# Conservative arm (A) for custom/out-of-domain video probes: SAR decides
+# first, region CTC only fills in where SAR abstains. Used to compare against
+# the CTC-primary default on videos where the CTC's out-of-domain accuracy is
+# in question (see handoff.md, Inter-Juve full-video check).
+decision_policy:
+  jersey_number:
+    sources: [jersey_ocr_primary, jersey_region_ctc]
+    on_abstain: fallback

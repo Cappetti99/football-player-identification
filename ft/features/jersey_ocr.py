@@ -1,4 +1,8 @@
+import contextlib
+import io
+import os
 import re
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -66,6 +70,8 @@ class JerseyOCR:
         frame_selector=None,
         subject_filter=None,
         prefix_consolidator=None,
+        escalate_on_unassigned=False,
+        escalation_max_extra_crops=20,
     ):
         # Backend configuration controls how candidates are proposed. It must
         # remain separate from the voting thresholds that decide whether a
@@ -137,6 +143,11 @@ class JerseyOCR:
         self.frame_selector = frame_selector
         self.subject_filter = subject_filter
         self.prefix_consolidator = prefix_consolidator
+        # Only tracklets that fail the initial vote pay for a second, larger
+        # sample -- most tracklets already succeed on the first pass, so this
+        # avoids paying the cost of a bigger sample for every tracklet.
+        self.escalate_on_unassigned = bool(escalate_on_unassigned)
+        self.escalation_max_extra_crops = max(0, int(escalation_max_extra_crops))
         # Cache OCR proposals, not final identities. Changing downstream voting
         # can therefore reuse expensive recognition without freezing decisions.
         self.cache = JsonDiskCache(self.cache_dir, "jersey_ocr") if self.cache_enabled else DisabledCache()
@@ -274,6 +285,69 @@ class JerseyOCR:
                 selector_accepted = self.frame_selector.accept_decision(
                     display_id, voted if use_selector else None, len(selector_rows or [])
                 )
+            # 5. Abstain unless independent evidence reaches the configured
+            # minimum. Unknown is safer than propagating one accidental digit.
+            accepted = bool(voted and voted["votes"] >= self.min_votes)
+            if use_selector:
+                accepted = bool(selector_accepted)
+            escalated = False
+            if not accepted and self.escalate_on_unassigned and not use_selector:
+                # Only the tracklets that failed the first vote pay for a
+                # second, larger sample -- everyone else keeps the original
+                # (cheaper) crop budget. Pull unused crops the first pass never
+                # looked at, so this is genuinely new evidence, not a re-read.
+                already_selected = {row.get("crop_path") for _, row in selected}
+                remaining_items = [
+                    row for row in legacy_usable_items
+                    if row.get("crop_path") not in already_selected
+                ]
+                extra_rows = select_spread_crops(
+                    remaining_items, self.escalation_max_extra_crops, pass_index=0, pass_count=1,
+                )
+                if extra_rows:
+                    escalated = True
+                    escalation_pass_index = self.temporal_passes
+                    for row in extra_rows:
+                        selected.append((escalation_pass_index, row))
+                        detections.extend(self._recognize_row(row, display_id, escalation_pass_index))
+                    detections = apply_crop_quality_vote_weights(
+                        detections,
+                        selected,
+                        enabled=self.crop_quality_vote_weighting,
+                        min_weight=self.crop_quality_min_vote_weight,
+                        power=self.crop_quality_vote_power,
+                    )
+                    voting_detections = self._voting_detections(detections)
+                    voted = vote_numbers(
+                        voting_detections,
+                        min_raw_confidence=self.min_raw_confidence,
+                        digit_confusion_overrides=self.digit_confusion_overrides,
+                    )
+                    decision = ocr_decision_diagnostics(
+                        detections,
+                        voting_detections,
+                        voted,
+                        min_votes=self.min_votes,
+                        min_raw_confidence=self.min_raw_confidence,
+                    )
+                    accepted = bool(voted and voted["votes"] >= self.min_votes)
+
+            # Validated on two independent SoccerNet-GSR samples (offline
+            # ablation against real ground truth, see handoff.md): a decision
+            # reachable from full_body-region detections alone is ~75-84%
+            # accurate, while one that only reaches vote quorum through the
+            # narrower ROI regions (torso/number_band/etc) is only ~20%
+            # accurate -- barely better than noise. Recomputed here from the
+            # already-read detections, so it costs no extra crops/inference.
+            full_body_voted = vote_numbers(
+                self._voting_detections(
+                    [item for item in detections if is_full_body_variant(item.get("variant"))]
+                ),
+                min_raw_confidence=self.min_raw_confidence,
+                digit_confusion_overrides=self.digit_confusion_overrides,
+            )
+            full_body_sufficient = bool(full_body_voted and full_body_voted["votes"] >= self.min_votes)
+
             diagnostics[diagnostic_key(track_id)] = {
                 "display_track_id": int(display_id),
                 "segment_index": segment_index,
@@ -300,24 +374,23 @@ class JerseyOCR:
                 "voting_detection_count": len(voting_detections),
                 "voted": voted,
                 "decision": decision,
+                "escalated": escalated,
+                "full_body_sufficient": full_body_sufficient,
             }
-            # 5. Abstain unless independent evidence reaches the configured
-            # minimum. Unknown is safer than propagating one accidental digit.
-            accepted = bool(voted and voted["votes"] >= self.min_votes)
-            if use_selector:
-                accepted = bool(selector_accepted)
             if accepted:
                 voted["display_track_id"] = int(display_id)
                 voted["segment_index"] = segment_index
                 voted["segment_start_frame"] = segment_start_frame(segment_index, self.segment_frames)
                 voted["segment_end_frame"] = segment_end_frame(segment_index, self.segment_frames)
+                voted["full_body_sufficient"] = full_body_sufficient
                 assignments[track_id] = voted
             if self.progress_every > 0 and (index % self.progress_every == 0 or index == len(grouped_items)):
                 print(
                     f"FT jersey OCR: tracklets={index}/{len(grouped_items)}"
                     f" assigned={len(assignments)}"
                     f" last_track={track_id}"
-                    f" detections={len(detections)}",
+                    f" detections={len(detections)}"
+                    f" escalated={escalated}",
                     flush=True,
                 )
         return assignments, {
@@ -340,6 +413,8 @@ class JerseyOCR:
             "aggregate_by_crop": self.aggregate_by_crop,
             "max_candidates_per_crop": self.max_candidates_per_crop,
             "min_crop_candidate_ratio": self.min_crop_candidate_ratio,
+            "escalate_on_unassigned": self.escalate_on_unassigned,
+            "escalation_max_extra_crops": self.escalation_max_extra_crops,
             "mmocr": {
                 "device": self.mmocr_device,
                 "det": self.mmocr_det,
@@ -873,12 +948,13 @@ class MMOCRBackend:
             rec_inputs.append(image)
             rec_channels.append("direct")
 
-        det_data = self.textdetinferencer(
-            [image],
-            return_datasamples=True,
-            batch_size=1,
-            progress_bar=False,
-        )["predictions"][0]
+        with _suppress_stdout():
+            det_data = self.textdetinferencer(
+                [image],
+                return_datasamples=True,
+                batch_size=1,
+                progress_bar=False,
+            )["predictions"][0]
         for polygon in pred_instance_polygons(det_data.pred_instances):
             quad = self.bbox2poly(self.poly2bbox(polygon)).tolist()
             rec_input = self.crop_img(image, quad)
@@ -889,12 +965,13 @@ class MMOCRBackend:
         if not rec_inputs:
             return []
 
-        rec_predictions = self.textrecinferencer(
-            rec_inputs,
-            return_datasamples=True,
-            batch_size=self.batch_size,
-            progress_bar=False,
-        )["predictions"]
+        with _suppress_stdout():
+            rec_predictions = self.textrecinferencer(
+                rec_inputs,
+                return_datasamples=True,
+                batch_size=self.batch_size,
+                progress_bar=False,
+            )["predictions"]
         rows = []
         for prediction, channel in zip(rec_predictions, rec_channels):
             result = self.textrecinferencer.pred2dict(prediction)
@@ -953,12 +1030,13 @@ class MMOCRRecognitionBackend:
                     rows.append((text, mmocr_score(scores[index] if index < len(scores) else None)))
             return rows
 
-        predictions = self.textrecinferencer(
-            [image],
-            return_datasamples=True,
-            batch_size=1,
-            progress_bar=False,
-        )["predictions"]
+        with _suppress_stdout():
+            predictions = self.textrecinferencer(
+                [image],
+                return_datasamples=True,
+                batch_size=1,
+                progress_bar=False,
+            )["predictions"]
         rows = []
         for prediction in predictions:
             result = self.textrecinferencer.pred2dict(prediction)
@@ -1045,7 +1123,11 @@ def call_mmocr_inferencer_quiet(inferencer, inputs, **kwargs):
 
     MMOCR versions differ in which quiet flags they accept. The first call
     disables known console outputs; the fallback preserves compatibility with
-    older versions that reject one of those keyword arguments.
+    older versions that reject one of those keyword arguments. `progress_bar`
+    is not always honoured by the internal det/rec sub-inferencers on every
+    MMOCR version, so stdout is also muted around the call as a backstop --
+    this is a single call per crop batch, so nothing we log ourselves happens
+    inside it.
     """
     quiet_kwargs = {
         **kwargs,
@@ -1053,12 +1135,42 @@ def call_mmocr_inferencer_quiet(inferencer, inputs, **kwargs):
         "show": False,
         "print_result": False,
     }
+    with _suppress_stdout():
+        try:
+            return inferencer(inputs, **quiet_kwargs)
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and "unknown argument" not in str(exc).lower():
+                raise
+            return inferencer(inputs, **kwargs)
+
+
+@contextlib.contextmanager
+def _suppress_stdout():
+    """Redirect stdout to /dev/null for the duration of the block.
+
+    Used only around third-party inference calls whose progress bars ignore
+    their own quiet flags on some library versions; never around code that
+    does its own logging. If stdout has no real file descriptor (e.g. some
+    wrapped stream), this silently does nothing rather than raising --
+    a noisy progress bar is cosmetic, never worth failing the run over.
+    """
     try:
-        return inferencer(inputs, **quiet_kwargs)
-    except (TypeError, ValueError) as exc:
-        if isinstance(exc, ValueError) and "unknown argument" not in str(exc).lower():
-            raise
-        return inferencer(inputs, **kwargs)
+        sys.stdout.flush()
+        original_fd = os.dup(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        yield
+        return
+    with open(os.devnull, "w") as devnull:
+        os.dup2(devnull.fileno(), sys.stdout.fileno())
+        try:
+            yield
+        finally:
+            # Flush while still redirected, so anything buffered during the
+            # suppressed block lands in devnull instead of leaking out once
+            # the original descriptor is restored below.
+            sys.stdout.flush()
+            os.dup2(original_fd, sys.stdout.fileno())
+            os.close(original_fd)
 
 
 def mmocr_prediction_text_scores(prediction):
@@ -1808,6 +1920,10 @@ def template_candidate_allowed(candidate, backend_numbers):
     if number < 10:
         return False
     return float(candidate.get("confidence", 0.0) or 0.0) >= 0.78
+
+
+def is_full_body_variant(name):
+    return "full_body" in str(name or "")
 
 
 def is_template_variant(name):

@@ -1,0 +1,24 @@
+base_config: int_juve_jersey_region_ctc_sjn_to_gsr_audit_v1.yaml
+
+# Arm B on a custom broadcast video: the region CTC decides, the primary SAR
+# falls back. The parent is the frozen custom-video audit profile; its name
+# says int_juve but nothing in it is video-specific -- video, roster and model
+# all come from the command line -- so it serves as the baseline arm for any
+# custom clip.
+#
+# Purpose here is diagnostic, not a contest. Custom clips have no jersey ground
+# truth, so accuracy cannot be measured. What can be measured is whether the
+# region detector covers enough tracklets for the ordering question to mean
+# anything at all: on Inter-Juve its coverage collapsed to 7.96% against ~61%
+# on GSR. If coverage is that low here too, the CTC decides almost nothing and
+# the GSR result does not transfer.
+#
+# The roster filter stays active (roster_aware: true inherited), so an emitted
+# number outside the squad list is a detectable error even without labels.
+#
+# NOT VALIDATED. Never run on GSR test.
+
+decision_policy:
+  jersey_number:
+    sources: [jersey_region_ctc, jersey_ocr_primary]
+    on_abstain: fallback
