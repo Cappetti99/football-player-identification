@@ -83,7 +83,8 @@ The pipeline separates the two real teams from richer semantic groups.
   - each recognizer (primary OCR, region CTC) appends immutable evidence instead of mutating shared state;
   - `ft.decision.jersey_policy` arbitrates between sources via a configurable, ordered `decision_policy.jersey_number.sources` list, with `fallback` or `abstain` semantics;
   - promoting a recognizer to decide is a configuration change, not a code change;
-  - `scripts/verify_evidence_additive.py` checks that a config change to this layer is bit-identical to the legacy path when no source list is overridden.
+  - `scripts/verify_evidence_additive.py` checks that a config change to this layer is bit-identical to the legacy path when no source list is overridden;
+  - the default profile (`configs/default.yaml`) currently promotes the region CTC recognizer ahead of the primary OCR (`sources: [jersey_region_ctc, jersey_ocr_primary]`), validated on SoccerNet-GSR across the offline, pipeline, and GS-HOTA surfaces; out-of-domain broadcast video has not been validated to the same standard.
 - Hungarian assignment from tracklets to roster players, with optional per-scene assignment scope.
 - Identity constraints:
   - no duplicate `player_id` in the same frame;
