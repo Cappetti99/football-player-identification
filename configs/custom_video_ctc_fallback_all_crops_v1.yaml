@@ -1,0 +1,13 @@
+base_config: custom_video_ctc_fallback_v1.yaml
+
+# Same "read every usable crop" profile already validated for jersey_ocr on
+# Usa-Bel/Por-Uzb (configs/usa_bel_jersey_ocr_all_crops_v1.yaml), applied
+# instead to the region CTC audit's own crop budget. max_crops_per_tracklet
+# set above any tracklet's usable-region count, so the selector always keeps
+# every candidate region instead of spacing out a sample of 5.
+# min_frame_gap dropped to 0 for the same reason: with the crop cap removed,
+# a temporal-spacing floor would just throw away adjacent regions for no
+# selection benefit.
+jersey_region_ctc_audit:
+  max_crops_per_tracklet: 100000
+  min_frame_gap: 0

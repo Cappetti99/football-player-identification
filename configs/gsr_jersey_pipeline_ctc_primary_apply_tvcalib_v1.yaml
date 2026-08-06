@@ -1,0 +1,18 @@
+base_config: gsr_jersey_pipeline_ctc_primary_apply_v1.yaml
+
+# Arm B (region CTC primary) + TVCalib calibration. Same TVCalib override as
+# gsr_jersey_pipeline_baseline_apply_tvcalib_v1.yaml (arm A); the only
+# difference between the two files is decision_policy.jersey_number.sources,
+# inherited unchanged from gsr_jersey_pipeline_ctc_primary_apply_v1.yaml.
+# Same per-sequence caveat: per_sample_output.json below is for SNGS-082.
+calibration:
+  enabled: true
+  auto: false
+  tvcalib:
+    enabled: true
+    path: evaluation_outputs/tvcalib_gsr_val_10s/SNGS-082/per_sample_output.json
+    per_frame: true
+    coordinate_system: tvcalib_centered
+    frame_offset: 0
+    nearest_frame: true
+    max_frame_gap: 75

@@ -14,18 +14,30 @@ The central design choice is conservative identification: a missing identity is 
 
 ## What The Pipeline Does
 
+![Pipeline architecture](docs/ArchitetturaTesi.png)
+
+Stage order as executed by `ft.pipeline.run_pipeline`. Note that team
+assignment runs twice, with tracklet linking interleaved between the passes:
+the first pass supplies the team consistency gate the linker needs, the second
+pass re-estimates teams on the linked tracklets.
+
 ```text
 video
+  -> scene-cut detection
   -> YOLO detector
   -> ByteTrack tracking
-  -> optional tracklet linking
-  -> pitch transform / calibration fallback
-  -> team assignment
-  -> referee and goalkeeper colour cues from roster metadata
+  -> pitch transform (TVCalib when available, field-quad fallback otherwise)
+  -> team assignment, first pass
+  -> referee colour cues from roster metadata
+  -> tracklet linking (optionally PRTReID-assisted)
+  -> team assignment, second pass
+  -> goalkeeper detection
   -> semantic groups
   -> crop and metadata export
-  -> optional localized number-region OCR
-  -> jersey OCR with EasyOCR / MMOCR fallback and template matching
+  -> jersey number recognition
+       -> primary OCR (EasyOCR / MMOCR, optional template matching)
+       -> region detector + CTC recogniser
+       -> decision layer arbitrates between the sources
   -> roster-aware OCR filtering
   -> Hungarian tracklet-to-player assignment, optionally scoped by scene cuts
   -> hard identity constraints
@@ -138,6 +150,102 @@ multi-object tracking metrics on both raw and FT-linked identities, bootstrap
 aggregates, and diagnostic charts. See
 [`docs/gsr_detection_tracking_benchmark.md`](docs/gsr_detection_tracking_benchmark.md)
 for the frozen protocol and remote commands.
+
+## Results
+
+End-to-end performance is measured with GS-HOTA (Somers et al., CVPR 2024),
+which multiplies a localisation similarity on the pitch by an identity
+similarity requiring team, role and jersey number to all agree.
+
+Two configurations differing in one line, the ordering of the jersey sources,
+were compared on a 12-sequence validation pilot and then on 12 sequences drawn
+at random from the frozen test split under a
+[pre-registered protocol](evaluation/jersey_heldout_manifests/gsr_test_final_v1_preregistration.md).
+Arm A puts the primary OCR first, arm B the region CTC recogniser.
+
+| Block | Arm A | Arm B | Delta | 95% CI |
+|---|---:|---:|---:|---|
+| Validation (12 seq) | 0.2097 | 0.2870 | +0.0772 | [0.0476, 0.1067] |
+| Test (12 seq) | 0.2759 | 0.3235 | +0.0476 | [0.0262, 0.0685] |
+
+On the test block arm B wins in 10 sequences, ties 1 and loses 1, two-sided
+sign test p = 0.012. The gain is carried by GS-DetA (+0.0566, [0.0293,
+0.0838]); GS-AssA and GS-LocA have intervals containing zero, as expected for
+two arms sharing every stage except the jersey source. Arm B is the promoted
+default.
+
+### Oracle ablation
+
+Each module in turn is replaced with ground truth and GS-HOTA recomputed, to
+attribute the distance from a perfect score. Test block, macro mean over 12
+sequences, 95% sequence-level bootstrap CI.
+
+| Configuration | jersey | Arm A | Arm B |
+|---|---|---:|---:|
+| baseline | real | 0.285 [0.221, 0.352] | 0.338 [0.268, 0.407] |
+| + oracle calibration | real | 0.392 [0.308, 0.484] | 0.470 [0.378, 0.571] |
+| + oracle team | real | 0.309 [0.256, 0.362] | 0.365 [0.314, 0.419] |
+| + oracle role | real | 0.292 [0.229, 0.358] | 0.344 [0.275, 0.414] |
+| all attributes but jersey | real | 0.444 [0.375, 0.523] | 0.528 [0.456, 0.613] |
+| + oracle jersey | oracle | 0.463 [0.369, 0.534] | 0.464 [0.370, 0.536] |
+| all attributes but calibration | oracle | 0.522 [0.473, 0.571] | 0.523 [0.474, 0.572] |
+| all attributes but team | oracle | 0.671 [0.557, 0.763] | 0.673 [0.558, 0.764] |
+| all attributes but role | oracle | 0.723 [0.664, 0.779] | 0.724 [0.666, 0.781] |
+| all attributes oracle | oracle | 0.752 [0.692, 0.811] | 0.754 [0.694, 0.812] |
+| full oracle (sanity) | oracle | 1.000 | 1.000 |
+
+The rows are grouped by whether the jersey number is real or replaced. The
+difference between the arms survives throughout the first group, between 0.052
+and 0.084 points, and collapses to 0.001-0.002 throughout the second: the
+entire difference between the two configurations is the jersey number, which
+is what the ablation is meant to establish.
+
+Isolated cost of each module, meaning what it still costs once every other one
+is perfect. Costs are not additive, because GS-HOTA multiplies localisation by
+identity and failures on the same subject overlap.
+
+| Module | Validation | Test |
+|---|---:|---:|
+| jersey number | 0.281 | 0.226 |
+| detection and tracking | 0.257 | 0.246 |
+| calibration | 0.231 | 0.231 |
+| team | 0.181 | 0.081 |
+| role | 0.161 | 0.029 |
+
+Jersey, detection and calibration agree between the two blocks and no single
+one of them dominates. Team and role do not agree, and the reason is the team
+stage abstaining rather than being wrong: it leaves `team_id` empty on roughly
+half the players in six of the twelve validation sequences, against one of
+twelve on test. The team figure therefore measures abstention as much as
+misclassification, and its ranking against the other modules is a property of
+the block rather than of the system.
+
+Reproduce with `scripts/run_gsr_gs_hota_benchmark.py`,
+`scripts/aggregate_gsr_gs_hota_benchmark.py` and
+`scripts/aggregate_gs_hota_ablation.py`; the full test-split run is driven by
+`scripts/run_test_final_v1.sh`. Provenance for every number is recorded in
+[`docs/ablation_study_results.md`](docs/ablation_study_results.md) and
+[`docs/additional_thesis_metrics.md`](docs/additional_thesis_metrics.md).
+
+### Caveats
+
+- One test sequence, SNGS-125, has 56.5% of its annotations without pitch
+  coordinates. Those subjects cannot be scored by GS-HOTA and are excluded,
+  while the sequence still carries a full one-twelfth of the macro mean. It is
+  retained rather than dropped, because the condition depends only on the
+  annotations and removing it after seeing results would be selection.
+  Excluding it gives +0.0458 instead of +0.0476.
+- The test split is not untouched: it had been used once before, for the
+  recogniser pretraining comparison. This is a second use and is disclosed as
+  such in the pre-registration.
+- These results are SoccerNet-GSR. Out-of-domain behaviour is different and is
+  described under Current Limitations.
+- The team stage abstains far more often than expected on some sequences. On
+  SNGS-137 it emits no team at all, and since GS-HOTA requires team, role and
+  jersey to agree simultaneously, that sequence scores only on referees and is
+  structurally blind to the A/B comparison: both arms return 0.0925 despite
+  arm B reading 0.609 jersey accuracy against 0.463. It is kept in the mean, so
+  the reported difference is conservative by one sequence out of twelve.
 
 ## Installation
 
@@ -524,18 +632,71 @@ python3 -m ft.cli run --help
   stack and should be kept separate from the lightweight runtime environment.
 - The single-font template matcher is disabled by default because it did not
   improve the controlled SoccerNet-GSR evaluation and can over-predict `1`.
-- Pitch calibration can use TVCalib outputs when available; otherwise it falls back to a simple field-quad estimate.
+- Pitch calibration can use TVCalib outputs when available; otherwise it falls
+  back to a simple field-quad estimate, whose median position error is roughly
+  35 m against 1.1 m for TVCalib. GS-HOTA tolerates only a few metres, so it is
+  not meaningful without TVCalib.
+- **The system is calibrated to GSR-like footage.** On custom broadcast video
+  the jersey-number region detector, trained on GSR crops only, drops from 61%
+  region coverage to between 29% and 4%, and removing the crop budget entirely
+  does not recover it. The promoted policy degrades gracefully there, falling
+  back to the primary OCR where the CTC path abstains, but the measured gain
+  does not transfer.
+- The contaminated-tracklet detector is audit-only and applies no split.
+- **Team assignment abstains silently.** On six of twelve validation sequences
+  it leaves `team_id` empty on roughly half the players, and on one test
+  sequence on all of them. The stage is accurate when it does answer, above
+  90% on emitted labels almost everywhere, so the problem is coverage rather
+  than correctness. Because downstream identity constraints and GS-HOTA both
+  require a team, an abstention here propagates as a failure further on.
 
-## Thesis Direction
+## Project Status
 
-The project is aimed at evaluating weak-signal identity reconstruction in football broadcast video:
+The thesis work this repository supports is **complete**. The pipeline runs
+end to end, the decision layer is in place, and the promoted configuration has
+been validated on SoccerNet-GSR across the offline, pipeline and GS-HOTA
+surfaces and confirmed once on the frozen test split under a pre-registered
+protocol.
 
-- robust person detection and tracking;
-- team and role semantics;
-- jersey-number OCR;
-- roster-aware filtering;
-- visual and trajectory cues;
-- conservative assignment to real players;
-- explicit diagnostics for every failure mode.
+The repository is kept as an experimental pipeline and as the source of the
+artifacts behind the reported numbers. It is not maintained as a product, and
+no support or backward-compatibility guarantee is offered.
 
-This makes the repository useful both as an experimental pipeline and as a source of artifacts for thesis analysis.
+## Future Work
+
+Ordered by how much the evidence in this repository points at them.
+
+1. **Retrain the region detector on broadcast-like data.** This is the single
+   binding constraint on transfer. The recogniser reads well; outside GSR
+   almost nothing reaches it to be read. 277 verified crops from custom video
+   have been collected and never used for training.
+2. **Find out why team assignment abstains.** It is accurate when it answers
+   but silent on roughly half the players in half the validation sequences,
+   and an abstention costs as much as an error once GS-HOTA requires team,
+   role and jersey to agree together. This was surfaced late and has not been
+   diagnosed; the colour-sampling minimum in the team palette stage is the
+   first place to look.
+3. **Pose-derived region boxes** as a training-free replacement for the learned
+   region detector, evaluated on custom video rather than on GSR, where the
+   learned detector is already at its best.
+4. **Revisit the promotion criterion.** The zero-regression rule was fixed in
+   advance and has now rejected two substantial improvements produced by
+   different approaches. A criterion that forbids any new wrong emission makes
+   any coverage increase impossible by construction; a cost-benefit rule would
+   be more honest about the trade-off actually being made.
+5. **Integrate the tracklet splitter.** It has one confirmed true positive and
+   zero flags on 59 tracklets known to be clean, so precision is plausible but
+   recall is not estimable. Integration needs a targeted measurement, asking
+   whether the jersey number becomes correct on the tracklets that were split,
+   because with one known case no aggregate metric would move detectably.
+6. **Widen linker candidate generation.** The correct continuation is absent
+   from the candidate list in 22 of 50 inspected cases, so the bottleneck is
+   candidate generation and not ranking. Geometric constraints from
+   calibration were tried first and changed HOTA by less than 0.001, which is
+   consistent with a problem upstream of ranking.
+7. **Test the diversity hypothesis directly.** Everything trained on the
+   scarce in-domain data failed to generalise and everything importing
+   knowledge from a broader domain worked, but that is an inference from a
+   pattern rather than a test. A learning curve over subsets, and the same
+   sample size drawn from few versus many sequences, would separate quantity
+   from variety.

@@ -18,3 +18,15 @@ base_config: gsr_jersey_region_ctc_sjn_to_gsr_audit_v1.yaml
 
 jersey_frame_selection:
   mode: audit
+
+# Arm A (conservative): SAR decides, region CTC only fills in where SAR
+# abstains. Declared explicitly rather than left to inherit ft/config.py's
+# default -- that default has since been changed (region CTC promoted ahead
+# of SAR, see docs/additional_thesis_metrics.md / handoff.md) for reasons
+# unrelated to this pre-registered A/B comparison. Without this override,
+# gsr_jersey_pipeline_ctc_primary_apply_v1.yaml (arm B) would silently
+# resolve to the same policy as this file, collapsing the comparison.
+decision_policy:
+  jersey_number:
+    sources: [jersey_ocr_primary, jersey_region_ctc]
+    on_abstain: fallback

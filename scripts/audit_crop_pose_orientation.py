@@ -85,11 +85,28 @@ def main():
             annotate_orientation(row, result, args.keypoint_confidence_threshold)
 
     per_track = tracklet_breakdown(rows)
+    pose_detected_count = sum(1 for row in rows if row["pose_detected"])
+    # "unreliable" collapses two distinct failure modes that need separate
+    # rates: missing (the pose model finds no person at all in the crop) vs.
+    # failure (a person is found but the shoulder keypoints are too low
+    # confidence to determine orientation). Conflating them hides whether the
+    # bottleneck is person detection or keypoint confidence.
+    missing_count = len(rows) - pose_detected_count
+    failure_count = sum(
+        1 for row in rows if row["pose_detected"] and row["orientation"] == "undetermined"
+    )
+    reliable_count = pose_detected_count - failure_count
     summary = {
         "pose_checkpoint": args.pose_checkpoint,
         "keypoint_confidence_threshold": args.keypoint_confidence_threshold,
         "total_crops": len(rows),
-        "pose_detected": sum(1 for row in rows if row["pose_detected"]),
+        "pose_detected": pose_detected_count,
+        "reliable_count": reliable_count,
+        "reliable_rate": ratio(reliable_count, len(rows)),
+        "missing_count": missing_count,
+        "missing_rate": ratio(missing_count, len(rows)),
+        "failure_count": failure_count,
+        "failure_rate": ratio(failure_count, len(rows)),
         "orientation_counts": counts_by(rows, "orientation"),
         "detected_vs_orientation": cross_tab(rows, "orientation", "detected"),
         "hard_miss_vs_orientation": cross_tab(
@@ -192,6 +209,10 @@ def cross_tab(rows, key_a, key_b):
 
 def truthy(value):
     return str(value).strip().lower() == "true"
+
+
+def ratio(numerator, denominator):
+    return float(numerator) / float(denominator) if denominator else 0.0
 
 
 def read_csv(path):

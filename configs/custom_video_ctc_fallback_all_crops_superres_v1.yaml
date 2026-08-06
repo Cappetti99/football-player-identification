@@ -1,0 +1,13 @@
+base_config: custom_video_ctc_fallback_all_crops_v1.yaml
+
+# NOT VALIDATED. Region crops on custom broadcast video are often tiny
+# (~20-40px on a side, see handoff.md / thesis "Il limite" slide). This
+# bicubic-upscales any region crop smaller than super_resolution_max_side
+# before it reaches the CTC recognizer, mirroring jersey_ocr's own
+# super_resolve_small_crop for the primary OCR. Off by default in
+# ft/features/jersey_region_ctc_audit.py; enabling it here is a config-only
+# change, no code change needed to test it.
+jersey_region_ctc_audit:
+  super_resolution_enabled: true
+  super_resolution_scale: 4
+  super_resolution_max_side: 100

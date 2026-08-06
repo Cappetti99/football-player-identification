@@ -39,6 +39,7 @@ def main():
     deta = macro[f"{args.source}_deta"]["mean"]
     assa = macro[f"{args.source}_assa"]["mean"]
     hota = macro[f"{args.source}_hota"]["mean"]
+    mota = macro[f"{args.source}_mota"]["mean"]
     recall = macro["det_recall_50"]["mean"]
     ap50 = macro["ap50"]["mean"]
     ap75 = macro["ap75"]["mean"]
@@ -47,14 +48,14 @@ def main():
 
     print(f"source: {args.source} (after FT linking)" if args.source == "display" else "source: raw ByteTrack")
     print(f"sequence_count: {payload['sequence_count']}")
-    print(f"DetA={deta:.3f}  AssA={assa:.3f}  HOTA={hota:.3f}")
+    print(f"DetA={deta:.3f}  AssA={assa:.3f}  HOTA={hota:.3f}  MOTA={mota:.3f}")
     print(f"recall@0.50={recall*100:.1f}%  AP50={ap50:.3f}  AP75={ap75:.3f}")
     print(f"ID switches={switches}  fragmentations={fragments}")
 
     fig, ax = plt.subplots(figsize=(4.6, 4.2))
-    labels = ["DetA", "AssA", "HOTA"]
-    values = [deta, assa, hota]
-    colors = ["#2E86AB", "#C0392B", "#7F8C8D"]
+    labels = ["DetA", "AssA", "HOTA", "MOTA"]
+    values = [deta, assa, hota, mota]
+    colors = ["#2E86AB", "#C0392B", "#7F8C8D", "#F0A202"]
     bars = ax.bar(labels, values, color=colors, width=0.55)
     for bar, value in zip(bars, values):
         ax.annotate(f"{value:.3f}", (bar.get_x() + bar.get_width() / 2, value),

@@ -15,6 +15,7 @@ from ft.evaluation.gsr_detection_tracking import (
     average_precision,
     detection_summary,
     evaluate_frames,
+    gs_hota_summary,
     hota_summary,
     role_breakdown,
     size_breakdown,
@@ -172,6 +173,24 @@ def main():
     raw_hota = hota_summary(gt, pred, id_key="raw_pred_identity_id")
     add_hota(summary["tracking"], display_hota)
     add_hota(summary["tracking_raw"], raw_hota)
+
+    # GT team is "left"/"right"; pred_team is our own numeric team_id. They
+    # are not directly comparable, so IdSim needs the same left/right mapping
+    # already computed from matched pairs for the "team" accuracy summary
+    # above -- applied here to every predicted row, not just matched ones,
+    # since gs_hota_summary scores unmatched rows too.
+    team_mapping = choose_team_mapping(matches)
+    pred_for_gs_hota = {
+        frame: [
+            {**row, "pred_team": team_mapping.get(row["pred_team"], row["pred_team"])}
+            for row in frame_rows
+        ]
+        for frame, frame_rows in pred.items()
+    }
+    display_gs_hota = gs_hota_summary(gt, pred_for_gs_hota, id_key="pred_identity_id")
+    raw_gs_hota = gs_hota_summary(gt, pred_for_gs_hota, id_key="raw_pred_identity_id")
+    add_gs_hota(summary["tracking"], display_gs_hota)
+    add_gs_hota(summary["tracking_raw"], raw_gs_hota)
 
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -455,6 +474,26 @@ def add_hota(target, hota):
         "assa_at_0_50": hota["at_0_50"]["assa"],
         "hota_thresholds": hota["thresholds"],
         "hota_per_alpha": hota["per_alpha"],
+    })
+
+
+def add_gs_hota(target, gs_hota):
+    """Somers et al. CVPR24 GS-HOTA: pitch-position + role/team/jersey
+    identity similarity in place of bounding-box IoU. Requires GT/prediction
+    rows to carry gt_position_pitch/pred_position_pitch (metres) and the
+    role/team/jersey attribute pairs, as load_ground_truth/load_predictions
+    already provide."""
+    target.update({
+        "gs_hota": gs_hota["gs_hota"],
+        "gs_deta": gs_hota["gs_deta"],
+        "gs_assa": gs_hota["gs_assa"],
+        "gs_loca": gs_hota["loca"],
+        "gs_hota_tau_metres": gs_hota["tau_metres"],
+        "gs_hota_at_0_50": gs_hota["at_0_50"]["gs_hota"],
+        "gs_deta_at_0_50": gs_hota["at_0_50"]["gs_deta"],
+        "gs_assa_at_0_50": gs_hota["at_0_50"]["gs_assa"],
+        "gs_hota_thresholds": gs_hota["thresholds"],
+        "gs_hota_per_alpha": gs_hota["per_alpha"],
     })
 
 

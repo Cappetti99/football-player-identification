@@ -447,6 +447,165 @@ def hota_summary(gt, pred, id_key="pred_identity_id", thresholds=HOTA_THRESHOLDS
     }
 
 
+def gs_hota_similarity(gt_row, pred_row, tau=5.0):
+    """Sim_GS-HOTA(P, G) = LocSim(P, G) x IdSim(P, G).
+
+    From Somers et al., "SoccerNet Game State Reconstruction: End-to-End
+    Athlete Tracking and Identification on a Minimap" (CVPR24 CVSports
+    workshop, arXiv:2404.11335, eq. 3-5). LocSim is a Gaussian kernel over
+    Euclidean pitch distance in metres (not bounding-box IoU); tau=5m is the
+    paper's own distance-tolerance parameter. IdSim requires role, team and
+    jersey number to all match, except an attribute is skipped when the
+    ground truth does not provide it (e.g. a referee's jersey number).
+    """
+    gt_point = gt_row.get("gt_position_pitch")
+    pred_point = pred_row.get("pred_position_pitch")
+    if gt_point is None or pred_point is None:
+        return 0.0
+    dx = float(gt_point[0]) - float(pred_point[0])
+    dy = float(gt_point[1]) - float(pred_point[1])
+    squared_distance = dx * dx + dy * dy
+    loc_sim = math.exp(math.log(0.05) * squared_distance / (float(tau) ** 2))
+
+    for gt_key, pred_key in (
+        ("gt_role", "pred_role"),
+        ("gt_team", "pred_team"),
+        ("gt_jersey", "pred_jersey"),
+    ):
+        gt_value = gt_row.get(gt_key)
+        if gt_value is None:
+            continue
+        if gt_value != pred_row.get(pred_key):
+            return 0.0
+    return loc_sim
+
+
+def gs_hota_summary(gt, pred, id_key="pred_identity_id", thresholds=HOTA_THRESHOLDS, tau=5.0):
+    """GS-HOTA: HOTA's global-alignment procedure with Sim_GS-HOTA in place
+    of bounding-box IoU. Requires gt_position_pitch/pred_position_pitch
+    (metres) and the role/team/jersey attribute pairs on every row, as
+    loaded by scripts/evaluate_ft_gsr.py's load_ground_truth/load_predictions.
+    """
+    gt_counter = identity_counts(gt, "gt_track_id")
+    pred_counter = identity_counts(pred, id_key)
+    gt_ids = sorted(gt_counter, key=str)
+    pred_ids = sorted(pred_counter, key=str)
+    gt_index = {value: index for index, value in enumerate(gt_ids)}
+    pred_index = {value: index for index, value in enumerate(pred_ids)}
+    gt_counts = np.asarray([gt_counter[value] for value in gt_ids], dtype=np.float64)
+    pred_counts = np.asarray([pred_counter[value] for value in pred_ids], dtype=np.float64)
+
+    frame_data = []
+    potential_matches = np.zeros((len(gt_ids), len(pred_ids)), dtype=np.float64)
+    for frame in sorted(set(gt) | set(pred)):
+        gt_rows = gt.get(frame, [])
+        pred_rows = pred.get(frame, [])
+        gt_indices = np.asarray(
+            [gt_index[row["gt_track_id"]] for row in gt_rows], dtype=np.int64
+        )
+        pred_indices = np.asarray(
+            [pred_index[row[id_key]] for row in pred_rows], dtype=np.int64
+        )
+        similarities = np.asarray(
+            [
+                [gs_hota_similarity(gt_row, pred_row, tau) for pred_row in pred_rows]
+                for gt_row in gt_rows
+            ],
+            dtype=np.float64,
+        )
+        if not gt_rows or not pred_rows:
+            similarities = np.zeros((len(gt_rows), len(pred_rows)), dtype=np.float64)
+        if similarities.size:
+            denominator = (
+                similarities.sum(axis=0)[None, :]
+                + similarities.sum(axis=1)[:, None]
+                - similarities
+            )
+            similarity_iou = np.divide(
+                similarities,
+                denominator,
+                out=np.zeros_like(similarities),
+                where=denominator > 0,
+            )
+            potential_matches[np.ix_(gt_indices, pred_indices)] += similarity_iou
+        frame_data.append((gt_indices, pred_indices, similarities))
+
+    alignment_denominator = (
+        gt_counts[:, None] + pred_counts[None, :] - potential_matches
+    )
+    global_alignment = np.divide(
+        potential_matches,
+        alignment_denominator,
+        out=np.zeros_like(potential_matches),
+        where=alignment_denominator > 0,
+    )
+
+    per_alpha = []
+    for threshold in thresholds:
+        match_counts = np.zeros_like(potential_matches)
+        tp = 0
+        localization_sum = 0.0
+        for gt_indices, pred_indices, similarities in frame_data:
+            if not similarities.size:
+                continue
+            score = global_alignment[np.ix_(gt_indices, pred_indices)] * similarities
+            row_indices, column_indices = linear_sum_assignment(-score)
+            valid = similarities[row_indices, column_indices] >= threshold
+            row_indices = row_indices[valid]
+            column_indices = column_indices[valid]
+            if not len(row_indices):
+                continue
+            matched_gt = gt_indices[row_indices]
+            matched_pred = pred_indices[column_indices]
+            np.add.at(match_counts, (matched_gt, matched_pred), 1)
+            tp += len(row_indices)
+            localization_sum += float(similarities[row_indices, column_indices].sum())
+
+        fn = int(gt_counts.sum()) - tp
+        fp = int(pred_counts.sum()) - tp
+        association_denominator = (
+            gt_counts[:, None] + pred_counts[None, :] - match_counts
+        )
+        association_accuracy = np.divide(
+            match_counts,
+            association_denominator,
+            out=np.zeros_like(match_counts),
+            where=association_denominator > 0,
+        )
+        assa = ratio(float((match_counts * association_accuracy).sum()), tp)
+        if tp == 0 and (fn or fp):
+            assa = 0.0
+        deta = ratio(tp, tp + fn + fp)
+        hota = (
+            math.sqrt(max(0.0, deta * assa))
+            if deta is not None and assa is not None
+            else None
+        )
+        per_alpha.append(
+            {
+                "alpha": float(threshold),
+                "gs_hota": hota,
+                "gs_deta": deta,
+                "gs_assa": assa,
+                "loca": ratio(localization_sum, tp) if tp else (0.0 if fn or fp else None),
+                "det_recall": ratio(tp, tp + fn),
+                "det_precision": ratio(tp, tp + fp),
+            }
+        )
+
+    alpha_50 = min(per_alpha, key=lambda row: abs(row["alpha"] - 0.50))
+    return {
+        "tau_metres": float(tau),
+        "thresholds": [row["alpha"] for row in per_alpha],
+        "gs_hota": mean(row["gs_hota"] for row in per_alpha if row["gs_hota"] is not None),
+        "gs_deta": mean(row["gs_deta"] for row in per_alpha if row["gs_deta"] is not None),
+        "gs_assa": mean(row["gs_assa"] for row in per_alpha if row["gs_assa"] is not None),
+        "loca": mean(row["loca"] for row in per_alpha if row["loca"] is not None),
+        "at_0_50": dict(alpha_50),
+        "per_alpha": per_alpha,
+    }
+
+
 def size_breakdown(evaluation, image_width, image_height):
     image_area = float(image_width) * float(image_height)
     result = {}

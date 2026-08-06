@@ -41,6 +41,7 @@ costume-video/**
 *.onnx
 *.engine
 *.weights
+*.tgz
 
 # Local secrets
 .env

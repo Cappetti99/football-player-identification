@@ -33,6 +33,9 @@ class JerseyRegionCTCAuditor:
         roster=None,
         roster_reranking_enabled=False,
         roster_reranking_top_k=5,
+        super_resolution_enabled=False,
+        super_resolution_scale=4,
+        super_resolution_max_side=100,
     ):
         self.ctc_checkpoint = verified_file(ctc_checkpoint, ctc_checkpoint_sha256)
         self.detector_checkpoint = verified_file(
@@ -53,6 +56,9 @@ class JerseyRegionCTCAuditor:
         self.roster_reranking_enabled = bool(roster_reranking_enabled)
         self.roster_reranking_top_k = int(roster_reranking_top_k)
         self.roster_by_team = roster_numbers_by_team(roster or []) if roster_reranking_enabled else {}
+        self.super_resolution_enabled = bool(super_resolution_enabled)
+        self.super_resolution_scale = max(1, int(super_resolution_scale))
+        self.super_resolution_max_side = max(1, int(super_resolution_max_side))
 
     def run(self, jersey_diagnostics, primary_assignments, frame_selection_rows=None, player_rows=None):
         import torch
@@ -94,6 +100,12 @@ class JerseyRegionCTCAuditor:
                 )
                 if image is None:
                     continue
+                image = upscale_small_region(
+                    image,
+                    enabled=self.super_resolution_enabled,
+                    scale=self.super_resolution_scale,
+                    max_side=self.super_resolution_max_side,
+                )
                 regions.append({
                     **row,
                     "image": image,
@@ -262,6 +274,9 @@ class JerseyRegionCTCAuditor:
             "roster_reranking_enabled": self.roster_reranking_enabled,
             "roster_reranking_top_k": self.roster_reranking_top_k,
             "roster_teams_loaded": sorted(self.roster_by_team),
+            "super_resolution_enabled": self.super_resolution_enabled,
+            "super_resolution_scale": self.super_resolution_scale,
+            "super_resolution_max_side": self.super_resolution_max_side,
         }
 
     def _empty(self, status):
@@ -545,6 +560,22 @@ def crop_region(path, xyxyn, padding):
     if box[2] <= box[0] or box[3] <= box[1]:
         return None
     return image.crop(box)
+
+
+def upscale_small_region(image, enabled=False, scale=4, max_side=100):
+    """Bicubic-upscale a region crop before CTC recognition, mirroring
+    jersey_ocr.super_resolve_small_crop for the primary OCR's own crops."""
+    if not enabled or image is None:
+        return image
+    from PIL import Image
+
+    width, height = image.size
+    if max(width, height) >= int(max_side):
+        return image
+    scale = max(1, int(scale))
+    if scale <= 1:
+        return image
+    return image.resize((width * scale, height * scale), Image.BICUBIC)
 
 
 def verified_file(path, expected_sha256):

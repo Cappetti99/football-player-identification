@@ -1,0 +1,27 @@
+base_config: gsr_jersey_pipeline_baseline_apply_v1.yaml
+
+# Arm A (SAR primary) + TVCalib calibration, for GS-HOTA (Somers et al.,
+# CVPR24): GS-HOTA's LocSim needs pitch positions within its tau=5m
+# tolerance, which the automatic field-quad fallback cannot provide
+# (~29m mean error, see docs/additional_thesis_metrics.md). TVCalib gives
+# ~1.1m median error on this same 12-sequence pilot -- see the "Un risultato
+# negativo utile: TVCalib" slide. TVCalib does not change detection/tracking
+# output (bounding boxes are unaffected), only which pitch coordinates are
+# attached to them, so DetA/AssA/HOTA/MOTA are expected to stay identical to
+# the non-TVCalib run; only GS-HOTA depends on this.
+#
+# per_sample_output.json path is sequence-specific: this file is written for
+# SNGS-082 (matches the sequence already used to verify GS-HOTA's wiring).
+# For any other sequence, point --path at
+# evaluation_outputs/tvcalib_gsr_val_10s/<sequence>/per_sample_output.json.
+calibration:
+  enabled: true
+  auto: false
+  tvcalib:
+    enabled: true
+    path: evaluation_outputs/tvcalib_gsr_val_10s/SNGS-082/per_sample_output.json
+    per_frame: true
+    coordinate_system: tvcalib_centered
+    frame_offset: 0
+    nearest_frame: true
+    max_frame_gap: 75
