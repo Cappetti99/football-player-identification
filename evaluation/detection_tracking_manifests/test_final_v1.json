@@ -1,0 +1,97 @@
+{
+  "benchmark": "gsr_test_final_v1",
+  "split": "test",
+  "selection": {
+    "seed": 20260803,
+    "size": 12,
+    "pool": 49,
+    "procedure": "random.Random(seed).sample over sorted test sequence ids",
+    "declared_before_any_test_evaluation": true
+  },
+  "sequences": [
+    {
+      "sequence": "SNGS-120",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-120/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-120/Labels-GameState.json",
+      "labels_sha256": "b2bfa7a0df5f08c578400ac080797c650353596ec6a5acec4607c5c4687a5b30"
+    },
+    {
+      "sequence": "SNGS-125",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-125/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-125/Labels-GameState.json",
+      "labels_sha256": "7cf570e91f409685330d20164429095f5c035ee1077b7f754cff6650f65f868d"
+    },
+    {
+      "sequence": "SNGS-127",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-127/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-127/Labels-GameState.json",
+      "labels_sha256": "e0bcc5c1d28f816337addcdc5b20df5649f12610e19116e0034e9437838cab6d"
+    },
+    {
+      "sequence": "SNGS-131",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-131/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-131/Labels-GameState.json",
+      "labels_sha256": "c6e15ab1d925f216eab53c0ebd559b8f9f2835762bcf35d053979e7853942be0"
+    },
+    {
+      "sequence": "SNGS-133",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-133/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-133/Labels-GameState.json",
+      "labels_sha256": "9b7228826f71b4a435ed4a0c8d0fa14f87eb03f2f3da0b8ef0e3d9c3a4efb07c"
+    },
+    {
+      "sequence": "SNGS-135",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-135/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-135/Labels-GameState.json",
+      "labels_sha256": "d0e0e2e5185dcc8113e249caa4f92401ea7ca1b36df7ad97a9c6f74349c5ad60"
+    },
+    {
+      "sequence": "SNGS-137",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-137/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-137/Labels-GameState.json",
+      "labels_sha256": "25bc5f5bdeccb4b8966a257e7d5b7b42c30060618193b95271f104d0fc49716e"
+    },
+    {
+      "sequence": "SNGS-138",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-138/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-138/Labels-GameState.json",
+      "labels_sha256": "ba48627de2863cafbf73e54a032dc12fe8882ac84c1c1867addf1c9ef54f12cb"
+    },
+    {
+      "sequence": "SNGS-139",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-139/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-139/Labels-GameState.json",
+      "labels_sha256": "fda27d0050db9641974b491aff315a0b419291463c2bdb4eeb23f3d6bb4d416d"
+    },
+    {
+      "sequence": "SNGS-149",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-149/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-149/Labels-GameState.json",
+      "labels_sha256": "4d2a9413dce528f6034b9f8f460f84acf186905bc709844d7f42baa71a0ffccc"
+    },
+    {
+      "sequence": "SNGS-192",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-192/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-192/Labels-GameState.json",
+      "labels_sha256": "d5eea724772ae712decff85b34315dba566f8876b6e7b0685ecc715b88e3ed73"
+    },
+    {
+      "sequence": "SNGS-193",
+      "split": "test",
+      "frames_dir": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-193/img1",
+      "labels": "/media/data-lie/cappetti/dataset/SoccerNet-GSR/test/SNGS-193/Labels-GameState.json",
+      "labels_sha256": "b3ab2d2f43ee6a5cdc064be3fa64eb63b0a0ce278c2fbef89dc0aedb5235746e"
+    }
+  ]
+}

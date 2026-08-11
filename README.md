@@ -244,7 +244,7 @@ Reproduce with `scripts/run_gsr_gs_hota_benchmark.py`,
   SNGS-137 it emits no team at all, and since GS-HOTA requires team, role and
   jersey to agree simultaneously, that sequence scores only on referees and is
   structurally blind to the A/B comparison: both arms return 0.0925 despite
-  arm B reading 0.609 jersey accuracy against 0.463. It is kept in the mean, so
+  arm B reading 0.609 jersey accuracy against 0.464. It is kept in the mean, so
   the reported difference is conservative by one sequence out of twelve.
 
 ## Installation
