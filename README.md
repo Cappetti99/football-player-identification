@@ -700,3 +700,6 @@ Ordered by how much the evidence in this repository points at them.
    pattern rather than a test. A learning curve over subsets, and the same
    sample size drawn from few versus many sequences, would separate quantity
    from variety.
+
+
+   [📄 Tesis](docs/Tesi_Magistrale_IngInf.pdf)
