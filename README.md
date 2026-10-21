@@ -107,10 +107,13 @@ The first team-assignment pass provides consistency information for tracklet lin
 
 The output includes an annotated video and structured artifacts explaining which identities were assigned and which tracklets remained unidentified.
 
-<!--
-Optional: add a short demo video or GIF here once it has been committed
-to the repository, for example docs/demo.gif.
--->
+## Demo video
+
+The following video shows a pilot run of the football player identification pipeline on an Inter–Atalanta broadcast clip.
+
+[▶ Watch the Inter–Atalanta demo](Inter-Atalanta_visual_profile_pilot_v1.mp4)
+
+
 
 ## Main features
 
